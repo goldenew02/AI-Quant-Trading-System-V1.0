@@ -1,0 +1,6 @@
+{
+  "name": "Aegis Ampere Quant",
+  "description": "7*24h full-stack quantitative grid trading system designed for deployment on Oracle ARM Ampere A1 (Ubuntu 24.04). Features multi-bot configurations, local or broker API interfaces, visual backtesting, risk audits, and Gemini AI copilot insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
