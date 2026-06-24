@@ -27,6 +27,10 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
     leverage: bot.leverage,
     stopLoss: bot.stopLoss || 0,
     takeProfit: bot.takeProfit || 0,
+    timezone: bot.timezone || "UTC",
+    cpuAffinity: bot.cpuAffinity || "CPU Core 0",
+    cgroupsCpuLimit: bot.cgroupsCpuLimit || "Uncapped",
+    cgroupsMemoryLimit: bot.cgroupsMemoryLimit || "Uncapped",
   });
 
   const handleSave = () => {
@@ -354,6 +358,65 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                 className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-mono focus:border-[#00FF66] focus:outline-none"
               />
             </div>
+
+            <div className="col-span-2 border-t border-[#2A2A2C]/60 pt-2.5 mt-1.5">
+              <span className="text-[9px] text-[#6FF] uppercase font-mono font-bold tracking-wider">Aegis Sandbox Isolation Controls</span>
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">CPU Affinity Pinning</label>
+              <select
+                value={editingConfig.cpuAffinity}
+                onChange={(e) => handleValueChange("cpuAffinity", e.target.value)}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="CPU Core 0">CPU Core 0 Only</option>
+                <option value="CPU Core 1">CPU Core 1 Only</option>
+                <option value="Shared Cores">Shared Cores 0 + 1</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">cgroups CPU Limit</label>
+              <select
+                value={editingConfig.cgroupsCpuLimit}
+                onChange={(e) => handleValueChange("cgroupsCpuLimit", e.target.value)}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="Uncapped">Uncapped (Shared)</option>
+                <option value="Max 30% CPU">Max 30% CPU Quota</option>
+                <option value="Max 50% CPU">Max 50% CPU Quota</option>
+                <option value="Max 75% CPU">Max 75% CPU Quota</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">cgroups Memory Limit</label>
+              <select
+                value={editingConfig.cgroupsMemoryLimit}
+                onChange={(e) => handleValueChange("cgroupsMemoryLimit", e.target.value)}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="Uncapped">Uncapped (Shared)</option>
+                <option value="Max 1G RAM">Max 1G RAM Cap</option>
+                <option value="Max 3G RAM">Max 3G RAM Cap</option>
+                <option value="Max 6G RAM">Max 6G RAM Cap</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Market Timezone</label>
+              <select
+                value={editingConfig.timezone}
+                onChange={(e) => handleValueChange("timezone", e.target.value)}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="UTC">UTC (Cryptocurrencies)</option>
+                <option value="America/New_York">EST (New York Stocks)</option>
+                <option value="Asia/Tokyo">JST (Tokyo Securities)</option>
+                <option value="Asia/Hong_Kong">HKT (Hong Kong Longbridge)</option>
+              </select>
+            </div>
           </div>
 
           <div className="flex gap-2 justify-end mt-3">
@@ -448,11 +511,18 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
             )}
 
             {/* Process Isolation Sandbox Bar */}
-            <div className="bg-[#0A0A0B] p-2 border border-[#2A2A2C] flex justify-between items-center text-[9px] text-zinc-500 font-mono mt-3 uppercase">
-              <span>PID: <span className="text-[#00FF66] font-bold">{bot.pid || 4210}</span></span>
-              <span>HEAP: <span className="text-[#00FF66] font-bold">{bot.memoryHeapMb || 95} MB</span></span>
-              <span>AFFINITY: <span className="text-[#00FF66] font-bold">{bot.cpuAffinity || "Core 0"}</span></span>
-              <span>VER: <span className="text-[#6FF] font-bold">v{bot.version || "1.0.0"}</span></span>
+            <div className="bg-[#0A0A0B] p-2 border border-[#2A2A2C] flex flex-col gap-1 text-[9px] text-zinc-500 font-mono mt-3 uppercase">
+              <div className="flex justify-between items-center border-b border-[#2A2A2C]/40 pb-1">
+                <span>PID: <span className="text-[#00FF66] font-bold">{bot.pid || 4210}</span></span>
+                <span>HEAP: <span className="text-[#00FF66] font-bold">{bot.memoryHeapMb || 95} MB</span></span>
+                <span>AFFINITY: <span className="text-[#00FF66] font-bold">{bot.cpuAffinity || "Core 0"}</span></span>
+                <span>VER: <span className="text-[#6FF] font-bold">v{bot.version || "1.0.0"}</span></span>
+              </div>
+              <div className="flex justify-between items-center text-[8px] text-zinc-600 pt-0.5">
+                <span>TZ: <span className="text-zinc-300 font-bold">{bot.timezone || "UTC"}</span></span>
+                <span>CG_CPU: <span className="text-[#00FF66] font-bold">{bot.cgroupsCpuLimit || "UNCAPPED"}</span></span>
+                <span>CG_MEM: <span className="text-[#00FF66] font-bold">{bot.cgroupsMemoryLimit || "UNCAPPED"}</span></span>
+              </div>
             </div>
           </div>
         </div>

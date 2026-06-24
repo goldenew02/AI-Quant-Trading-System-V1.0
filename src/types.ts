@@ -60,6 +60,9 @@ export interface BotConfig {
   liquidationPrice?: number;
   maintenanceMargin?: number;
   configHistory?: BotConfigVersion[];
+  timezone?: string;
+  cgroupsCpuLimit?: string;
+  cgroupsMemoryLimit?: string;
 }
 
 export interface TradeLog {

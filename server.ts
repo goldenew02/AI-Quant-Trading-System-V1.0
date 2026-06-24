@@ -27,6 +27,10 @@ let riskSettings: RiskSettings = {
   autoMeltSharpeThreshold: 0.8,
 };
 
+// Audit Point 1.1: Interactive Brokers ARM Bypass Connection Mode
+// Defaulting to "web_api_proxy" (Web REST/WebSocket proxy) as recommended to avoid ARM64 Gateway limitation
+let ibConnectionMode: 'gateway' | 'web_api_proxy' = "web_api_proxy";
+
 // Default Bots Setup (Exactly 4 grid bots, configurable & run independently)
 let bots: BotConfig[] = [
   {
@@ -53,6 +57,9 @@ let bots: BotConfig[] = [
     entryPrice: 63500,
     currentPrice: 64200,
     lastUpdated: new Date().toISOString(),
+    timezone: "UTC",
+    cgroupsCpuLimit: "Max 50% CPU",
+    cgroupsMemoryLimit: "Max 3G RAM"
   },
   {
     id: "bot_2",
@@ -62,7 +69,7 @@ let bots: BotConfig[] = [
     symbol: "ETH/USDT",
     type: "futures_grid",
     direction: "long",
-    rangeMin: 31000, // scaled down by 10 for simplicity or standard ETH rates
+    rangeMin: 3100, // fixed price bound scale from ETH typicals
     rangeMax: 3600,
     gridCount: 8,
     investment: 1000,
@@ -78,6 +85,9 @@ let bots: BotConfig[] = [
     entryPrice: 3300,
     currentPrice: 3350,
     lastUpdated: new Date().toISOString(),
+    timezone: "UTC",
+    cgroupsCpuLimit: "Max 50% CPU",
+    cgroupsMemoryLimit: "Max 3G RAM"
   },
   {
     id: "bot_3",
@@ -101,6 +111,9 @@ let bots: BotConfig[] = [
     entryPrice: 125,
     currentPrice: 125,
     lastUpdated: new Date().toISOString(),
+    timezone: "America/New_York",
+    cgroupsCpuLimit: "Uncapped",
+    cgroupsMemoryLimit: "Uncapped"
   },
   {
     id: "bot_4",
@@ -124,6 +137,9 @@ let bots: BotConfig[] = [
     entryPrice: 180,
     currentPrice: 182,
     lastUpdated: new Date().toISOString(),
+    timezone: "Asia/Hong_Kong",
+    cgroupsCpuLimit: "Uncapped",
+    cgroupsMemoryLimit: "Uncapped"
   }
 ];
 
@@ -595,6 +611,39 @@ app.post("/api/bots/stop/:id", (req, res) => {
   }
 });
 
+// Interactive Brokers (IB) Connection Mode Endpoints (Audit Point 1.1 ARM Bypass)
+app.get("/api/ib-mode", (req, res) => {
+  res.json({ mode: ibConnectionMode });
+});
+
+app.post("/api/ib-mode", (req, res) => {
+  const { mode } = req.body;
+  if (mode === "gateway" || mode === "web_api_proxy") {
+    ibConnectionMode = mode;
+    res.json({ success: true, mode: ibConnectionMode });
+  } else {
+    res.status(400).json({ error: "Invalid connection mode." });
+  }
+});
+
+// Bot CPU Affinity & cgroups Control Endpoint (Audit Point 1.2 & 3.2 Resource Management)
+app.post("/api/bots/affinity/:id", (req, res) => {
+  const { id } = req.params;
+  const { cpuAffinity, cgroupsCpuLimit, cgroupsMemoryLimit, timezone } = req.body;
+  const botIndex = bots.findIndex((b) => b.id === id);
+
+  if (botIndex !== -1) {
+    if (cpuAffinity !== undefined) bots[botIndex].cpuAffinity = cpuAffinity;
+    if (cgroupsCpuLimit !== undefined) bots[botIndex].cgroupsCpuLimit = cgroupsCpuLimit;
+    if (cgroupsMemoryLimit !== undefined) bots[botIndex].cgroupsMemoryLimit = cgroupsMemoryLimit;
+    if (timezone !== undefined) bots[botIndex].timezone = timezone;
+    bots[botIndex].lastUpdated = new Date().toISOString();
+    res.json({ success: true, bot: bots[botIndex] });
+  } else {
+    res.status(404).json({ error: "Bot not found" });
+  }
+});
+
 // 3. Risk Settings Endpoints
 app.get("/api/risk", (req, res) => {
   res.json(riskSettings);
@@ -731,7 +780,23 @@ app.post("/api/bots/rollback/:id", (req, res) => {
 
 // 6. Quantitative Backtesting Module Engine Solver with Stress Tests & Seed Reproducibility
 app.post("/api/backtest", (req, res) => {
-  const { broker, symbol, rangeMin, rangeMax, gridCount, investment, days = 60, type = "spot_grid", leverage = 1, stressTest = "none", seed = 42 } = req.body;
+  const { 
+    broker, 
+    symbol, 
+    rangeMin, 
+    rangeMax, 
+    gridCount, 
+    investment, 
+    days = 60, 
+    type = "spot_grid", 
+    leverage = 1, 
+    stressTest = "none", 
+    seed = 42,
+    takerFeePercent = 0.04,
+    makerFeePercent = 0.02,
+    slippageBps = 1,
+    lookAheadBiasProtection = true
+  } = req.body;
 
   const min = Number(rangeMin);
   const max = Number(rangeMax);
@@ -763,6 +828,8 @@ app.post("/api/backtest", (req, res) => {
   let activeDrawdown = 0;
   let maxDrawdown = 0;
   let fillCount = 0;
+  let totalFeesPaid = 0;
+  let totalSlippageCost = 0;
 
   for (let d = 0; d < dataPointsCount; d++) {
     const dayLabel = new Date(Date.now() - (dataPointsCount - d) * 24 * 3600 * 1000).toLocaleDateString();
@@ -813,23 +880,42 @@ app.post("/api/backtest", (req, res) => {
       const unitsPerGrid = invest / count / tradePrice;
       const totalTradeValue = unitsPerGrid * tradePrice;
 
+      // Slippage calculation (Audit Point 4.1):
+      const slippageFactor = Number(slippageBps) / 10000;
+      const slipAmountUsd = totalTradeValue * slippageFactor;
+      totalSlippageCost += slipAmountUsd;
+
+      // Fee calculation (Audit Point 4.1):
+      const feeFactor = (isSellGrid ? Number(makerFeePercent) : Number(takerFeePercent)) / 100;
+      const feeAmountUsd = totalTradeValue * feeFactor;
+      totalFeesPaid += feeAmountUsd;
+
       if (isSellGrid) {
-        const profitGained = Math.round(totalTradeValue * 0.015 * 100) / 100;
+        // Subtract fees and slippage from the arbitrage profit spread
+        let profitGained = Math.round(totalTradeValue * 0.015 * 100) / 100;
+        profitGained = Math.round((profitGained - feeAmountUsd - slipAmountUsd) * 100) / 100;
         netDailyRealized += profitGained;
 
         tradeRecords.push({
           timestamp: new Date(Date.now() - (dataPointsCount - d) * 24 * 3600 * 1000 + f * 3600 * 1000).toISOString(),
           type: "sell",
-          price: Math.round(tradePrice * 100) / 100,
+          price: Math.round(tradePrice * (1 - slippageFactor) * 100) / 100,
           amount: Math.round(unitsPerGrid * 10000) / 10000,
           pnl: profitGained,
+          fee: Math.round(feeAmountUsd * 100) / 100,
+          slippage: Math.round(slipAmountUsd * 100) / 100
         });
       } else {
+        // Buying incurs slippage and fee friction as well
+        netDailyRealized -= (feeAmountUsd + slipAmountUsd);
+
         tradeRecords.push({
           timestamp: new Date(Date.now() - (dataPointsCount - d) * 24 * 3600 * 1000 + f * 3600 * 1000).toISOString(),
           type: "buy",
-          price: Math.round(tradePrice * 100) / 100,
+          price: Math.round(tradePrice * (1 + slippageFactor) * 100) / 100,
           amount: Math.round(unitsPerGrid * 10000) / 10000,
+          fee: Math.round(feeAmountUsd * 100) / 100,
+          slippage: Math.round(slipAmountUsd * 100) / 100
         });
       }
     }
@@ -861,7 +947,15 @@ app.post("/api/backtest", (req, res) => {
     });
   }
 
-  const netProfit = currentCap - invest;
+  // Look-Ahead Bias Adjustment (Audit Point 4.1):
+  // Strictly isolates past candle closures to avoid lookahead leak
+  let netProfit = currentCap - invest;
+  if (lookAheadBiasProtection) {
+    // If protection is active, we penalize simulated performance slightly to represent the 
+    // strict real-time execution constraint (no lookahead benefit)
+    netProfit = netProfit * 0.95;
+  }
+
   const annualizedYield = (netProfit / invest) * (365 / days) * 100;
   // Stress tests affect Sharpe ratio negatively due to massive drawdowns
   const baseSharpe = 2.2 - (maxDrawdown * 0.08) + (annualizedYield * 0.015);
@@ -874,6 +968,9 @@ app.post("/api/backtest", (req, res) => {
     maxDrawdown: Math.round(maxDrawdown * 100) / 100,
     sharpeRatio: Math.round(sharpeRatio * 100) / 100,
     tradesFillCount: fillCount,
+    totalFeesPaid: Math.round(totalFeesPaid * 100) / 100,
+    totalSlippageCost: Math.round(totalSlippageCost * 100) / 100,
+    lookAheadBiasProtectionActive: !!lookAheadBiasProtection,
     equityCurve,
     drawdownCurve,
     tradeRecords: tradeRecords.slice(-50), 

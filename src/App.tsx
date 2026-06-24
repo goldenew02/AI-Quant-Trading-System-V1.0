@@ -31,6 +31,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [lastBacktestResult, setLastBacktestResult] = useState<any | null>(null);
   const [selectedBotForAi, setSelectedBotForAi] = useState<string>("bot_1");
+  const [ibMode, setIbMode] = useState<"gateway" | "web_api_proxy">("web_api_proxy");
 
   // Fetch Bots state from Backend on boot & interval
   const fetchBots = async () => {
@@ -46,9 +47,38 @@ export default function App() {
     }
   };
 
+  // Fetch IB connection mode on mount
+  const fetchIbMode = async () => {
+    try {
+      const res = await fetch("/api/ib-mode");
+      if (res.ok) {
+        const data = await res.json();
+        setIbMode(data.mode);
+      }
+    } catch (err) {
+      console.error("Error fetching IB mode:", err);
+    }
+  };
+
+  const handleUpdateIbMode = async (mode: "gateway" | "web_api_proxy") => {
+    try {
+      const res = await fetch("/api/ib-mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setIbMode(data.mode);
+      }
+    } catch (err) {
+      console.error("Error updating IB mode:", err);
+    }
+  };
+
   useEffect(() => {
     setLoading(true);
-    fetchBots().then(() => setLoading(false));
+    Promise.all([fetchBots(), fetchIbMode()]).then(() => setLoading(false));
 
     // Polling active bot prices & trade counters from simulated background environment every 4 seconds
     const interval = setInterval(fetchBots, 4000);
@@ -388,13 +418,40 @@ export default function App() {
                     </div>
 
                     <div className="bg-[#0A0A0B] p-4 rounded-none border border-[#2A2A2C]">
-                      <div className="flex justify-between items-center mb-1">
+                      <div className="flex justify-between items-center mb-1 pb-1 border-b border-[#2A2A2C]/50">
                         <span className="font-bold text-white uppercase text-[11px]">Interactive Brokers Node</span>
-                        <span className="text-[9px] bg-blue-950/20 text-blue-400 border border-blue-900 px-1.5 py-0.2 rounded-none font-bold uppercase">
-                          SANDBOX_OK
-                        </span>
+                        <select
+                          value={ibMode}
+                          onChange={(e) => handleUpdateIbMode(e.target.value as "gateway" | "web_api_proxy")}
+                          className="text-[9px] bg-[#141416] text-[#00FF66] border border-[#2A2A2C] px-1.5 py-0.5 rounded-none font-mono uppercase font-black focus:outline-none focus:border-[#00FF66]"
+                        >
+                          <option value="web_api_proxy">Proxy (ARM)</option>
+                          <option value="gateway">Gateway (x86)</option>
+                        </select>
                       </div>
-                      <p className="text-[10px] text-[#666666] uppercase mt-1">Local Docker router link authenticated. Full multi-currency cross-margining active.</p>
+                      <div className="mt-2 text-[10px]">
+                        {ibMode === "web_api_proxy" ? (
+                          <>
+                            <div className="flex items-center gap-1 text-[#00FF66] font-bold mb-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-[#00FF66] animate-pulse"></span>
+                              <span>ARM64 WEB PROXY (ACTIVE)</span>
+                            </div>
+                            <p className="text-[#666666] uppercase leading-tight">
+                              Bypasses local x86 TWS Gateway limitations using ARM64-native REST proxy. Highly recommended for virtualization.
+                            </p>
+                          </>
+                        ) : (
+                          <>
+                            <div className="flex items-center gap-1 text-amber-500 font-bold mb-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                              <span>LOCAL TWS GATEWAY (EMULATED)</span>
+                            </div>
+                            <p className="text-[#666666] uppercase leading-tight">
+                              Runs standard x86 gateway. Under ARM64, this forces slow binary translation layer emulation. Potential latency drift.
+                            </p>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>

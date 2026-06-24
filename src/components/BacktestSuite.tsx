@@ -19,6 +19,10 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
     leverage: "5",
     stressTest: "none",
     seed: "42",
+    takerFeePercent: "0.04",
+    makerFeePercent: "0.02",
+    slippageBps: "1",
+    lookAheadBiasProtection: true,
   });
 
   const [loading, setLoading] = useState(false);
@@ -46,6 +50,10 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
           days: Number(config.days),
           leverage: Number(config.leverage),
           seed: Number(config.seed),
+          takerFeePercent: Number(config.takerFeePercent),
+          makerFeePercent: Number(config.makerFeePercent),
+          slippageBps: Number(config.slippageBps),
+          lookAheadBiasProtection: config.lookAheadBiasProtection === true || config.lookAheadBiasProtection === "true",
         }),
       });
 
@@ -331,6 +339,63 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
           />
         </div>
 
+        <div className="col-span-1 md:col-span-4 grid grid-cols-1 md:grid-cols-4 gap-4 bg-[#0A0A0B] p-4 border border-[#2A2A2C] rounded-none">
+          <div className="col-span-1 md:col-span-4 border-b border-[#2A2A2C] pb-2">
+            <span className="text-[10px] text-[#6FF] uppercase font-mono font-bold tracking-wider">Audit Point 4.1 Friction Modelling (Slippage & Fees)</span>
+          </div>
+
+          <div>
+            <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Maker Fee (%)</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={config.makerFeePercent}
+              onChange={(e) => handleInputChange("makerFeePercent", e.target.value)}
+              className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs focus:outline-none focus:border-[#00FF66] font-mono"
+              placeholder="0.02"
+            />
+          </div>
+
+          <div>
+            <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Taker Fee (%)</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={config.takerFeePercent}
+              onChange={(e) => handleInputChange("takerFeePercent", e.target.value)}
+              className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs focus:outline-none focus:border-[#00FF66] font-mono"
+              placeholder="0.04"
+            />
+          </div>
+
+          <div>
+            <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Slippage Tolerance (BPS)</label>
+            <input
+              type="number"
+              step="1"
+              min="0"
+              value={config.slippageBps}
+              onChange={(e) => handleInputChange("slippageBps", e.target.value)}
+              className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs focus:outline-none focus:border-[#00FF66] font-mono"
+              placeholder="1"
+            />
+          </div>
+
+          <div>
+            <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Look-Ahead Bias Protection</label>
+            <select
+              value={config.lookAheadBiasProtection ? "true" : "false"}
+              onChange={(e) => handleInputChange("lookAheadBiasProtection", e.target.value === "true" ? "true" : "false")}
+              className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs focus:outline-none focus:border-[#00FF66] font-sans"
+            >
+              <option value="true">Active (严格时间隔离)</option>
+              <option value="false">Disabled (未隔离 - 潜在回测偏置)</option>
+            </select>
+          </div>
+        </div>
+
         {config.type === "futures_grid" && (
           <div className="col-span-1 md:col-span-4 bg-[#0A0A0B] p-4 border border-[#2A2A2C] rounded-none">
             <label className="block text-[10px] text-[#666666] uppercase font-mono mb-2 font-bold">
@@ -414,6 +479,24 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
                 {result.tradesFillCount} Tx
               </div>
               <span className="text-[10px] text-[#666666] font-mono block mt-1 uppercase">CROSS MATCHES</span>
+            </div>
+          </div>
+
+          {/* Audit Friction Statistics Panel (Audit Point 4.1) */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border border-[#2A2A2C]/60 bg-[#0A0A0B]/50 p-3">
+            <div className="flex justify-between items-center px-2 text-[11px] font-mono">
+              <span className="text-[#666666] uppercase text-[9px] tracking-wider">Total Fees Paid (Est)</span>
+              <span className="text-amber-500 font-bold">${result.totalFeesPaid ? result.totalFeesPaid.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "0.00"} USD</span>
+            </div>
+            <div className="flex justify-between items-center px-2 text-[11px] font-mono border-y md:border-y-0 md:border-x border-[#2A2A2C]/60">
+              <span className="text-[#666666] uppercase text-[9px] tracking-wider">Est. Slippage Slippage Cost</span>
+              <span className="text-amber-500 font-bold">${result.totalSlippageCost ? result.totalSlippageCost.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "0.00"} USD</span>
+            </div>
+            <div className="flex justify-between items-center px-2 text-[11px] font-mono">
+              <span className="text-[#666666] uppercase text-[9px] tracking-wider">Look-Ahead Isolation Guard</span>
+              <span className={result.lookAheadBiasProtectionActive ? "text-[#00FF66] font-bold" : "text-rose-500 font-bold"}>
+                {result.lookAheadBiasProtectionActive ? "🛡️ ACTIVE (CLEAN)" : "⚠️ DISABLED (LEAKED)"}
+              </span>
             </div>
           </div>
 
