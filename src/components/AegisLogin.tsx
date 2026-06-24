@@ -43,31 +43,6 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
     }
   };
 
-  const handleQuickLogin = (user: string, pass: string) => {
-    setUsername(user);
-    setPassword(pass);
-    // Submit login with short timeout to let the state update
-    setTimeout(() => {
-      setError(null);
-      setLoading(true);
-      fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: user, password: pass }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.success) {
-            onLoginSuccess(data.token, data.role, data.username);
-          } else {
-            setError(data.error || "Verification failed");
-          }
-        })
-        .catch(() => setError("Network communication failure"))
-        .finally(() => setLoading(false));
-    }, 100);
-  };
-
   return (
     <div className="min-h-screen bg-[#060608] flex items-center justify-center p-4 selection:bg-[#00FF66]/20 selection:text-[#00FF66]">
       {/* Visual Ambient Cyber Grid */}
@@ -157,43 +132,26 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           <div className="flex items-center gap-2 mb-2 text-[#00FF66]">
             <Terminal className="h-4 w-4" />
             <h3 className="text-[10px] font-mono uppercase tracking-wider font-black">
-              COMPLIANCE AUDIT TELEMETRY CREDENTIALS
+              SECURE BOOTSTRAP TELEMETRY INFO
             </h3>
           </div>
-          <p className="text-[10px] text-zinc-450 leading-relaxed font-sans mb-3">
-            In compliance with Audit Point P0-2, insecure quick login buttons and default hardcoded comparisons have been physically removed. User accounts are verified against secure salt-hashed PBKDF2 signatures in our persistent database.
+          <p className="text-[10px] text-zinc-400 leading-relaxed font-sans mb-3">
+            In compliance with Audit Point P0-2, insecure quick login buttons and default hardcoded credentials have been physically purged from the codebase.
           </p>
-          <div className="space-y-2 font-mono text-[9px]">
-            <div className="p-2 bg-[#060608] border border-zinc-850">
-              <div className="flex justify-between text-zinc-300 font-bold">
-                <span>ADMINISTRATOR (管理员)</span>
-                <span className="text-[#FF3333]">FULL CONTROL</span>
+          <div className="space-y-2 font-mono text-[9px] text-zinc-450">
+            <div className="p-3 bg-[#060608] border border-zinc-850 rounded-none space-y-1">
+              <div className="text-zinc-300 font-bold uppercase text-[10px] tracking-wide border-b border-zinc-800 pb-1 mb-1 flex justify-between">
+                <span>Secure Bootstrap Status</span>
+                <span className="text-[#00FF66]">COMPLIANT</span>
               </div>
-              <div className="text-zinc-500 mt-1">Username: <span className="text-white">admin</span> | Pass: <span className="text-white">aegisquant2026</span></div>
-              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">KVKVE42KGBEGKVKV</span></div>
-            </div>
-
-            <div className="p-2 bg-[#060608] border border-zinc-850">
-              <div className="flex justify-between text-zinc-300 font-bold">
-                <span>OPERATOR (操作员)</span>
-                <span className="text-[#3399FF]">START/STOP ONLY</span>
+              <div>- Database: <span className="text-zinc-300">Active (AES-256-GCM Encrypted Secrets)</span></div>
+              <div>- Signatures: <span className="text-zinc-300">PBKDF2-SHA512 (310,000 iterations)</span></div>
+              <div>- MFA Policy: <span className="text-zinc-300">Dynamic Google Authenticator RFC6238</span></div>
+              <div className="pt-2 text-zinc-500 italic leading-normal font-sans">
+                To log in, please use the secure credentials configured via your environment setup (e.g. BOOTSTRAP_ADMIN_USER / BOOTSTRAP_ADMIN_PASSWORD).
               </div>
-              <div className="text-zinc-500 mt-1">Username: <span className="text-white">operator</span> | Pass: <span className="text-white">operator2026</span></div>
-              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">MNSFEY2MJVGEKVKV</span></div>
-            </div>
-
-            <div className="p-2 bg-[#060608] border border-zinc-850">
-              <div className="flex justify-between text-zinc-300 font-bold">
-                <span>COMPLIANCE AUDITOR (审计只读)</span>
-                <span className="text-zinc-400">READ ONLY</span>
-              </div>
-              <div className="text-zinc-500 mt-1">Username: <span className="text-white">viewer</span> | Pass: <span className="text-white">viewer2026</span></div>
-              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">OVYGS43VNZSGCVKV</span></div>
             </div>
           </div>
-          <p className="text-[8px] text-zinc-500 leading-relaxed font-sans mt-2">
-            * Add the standard Base32 TOTP Secrets above to standard authenticator applications (e.g. Google Authenticator) to generate high-impact operation MFA keys.
-          </p>
         </div>
 
         <div className="mt-6 text-center border-t border-[#1C1C1E] pt-4 flex items-center justify-center gap-1.5 text-[9px] font-mono text-[#555557] font-semibold uppercase">

@@ -29,9 +29,10 @@ import LiveMonitor from "./components/LiveMonitor";
 import BacktestSuite from "./components/BacktestSuite";
 import AegisLogin from "./components/AegisLogin";
 import SecurityLogs from "./components/SecurityLogs";
+import UserAccountCenter from "./components/UserAccountCenter";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs" | "security_logs">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs" | "security_logs" | "profile">("dashboard");
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastBacktestResult, setLastBacktestResult] = useState<any | null>(null);
@@ -427,6 +428,19 @@ export default function App() {
             <Shield className="h-4 w-4 text-[#00FF66]" />
             SECURITY LEDGER (数字安全审计)
           </button>
+
+          <button
+            onClick={() => setActiveTab("profile")}
+            className={`py-3.5 px-5 rounded-none font-black shrink-0 transition flex items-center gap-2 cursor-pointer touch-manipulation min-h-[44px] uppercase font-display tracking-wider border-b-2 text-xs select-none ${
+              activeTab === "profile"
+                ? "bg-[#0A0A0B] text-[#00FF66] border-b-[#00FF66] border border-[#2A2A2C] border-b-2"
+                : "text-[#666666] hover:text-white border border-transparent"
+            }`}
+            id="tab-profile"
+          >
+            <Fingerprint className="h-4 w-4 text-[#00FF66]" />
+            ACCESS CONTROL (权限凭证)
+          </button>
         </div>
       </nav>
 
@@ -609,6 +623,12 @@ export default function App() {
             {activeTab === "security_logs" && (
               <div className="space-y-6">
                 <SecurityLogs secureFetch={secureFetch} />
+              </div>
+            )}
+
+            {activeTab === "profile" && (
+              <div className="space-y-6">
+                <UserAccountCenter secureFetch={secureFetch} currentRole={role!} currentUsername={username!} />
               </div>
             )}
           </>

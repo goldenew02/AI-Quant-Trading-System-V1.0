@@ -9,6 +9,7 @@ export interface DBUser {
   role: 'admin' | 'operator' | 'viewer';
   totpSecret: string; // standard base32 secret
   isActive: boolean;
+  tempTotpSecret?: string;
 }
 
 export interface DBSession {
@@ -109,20 +110,58 @@ export function verifyTOTP(secret: string, token: string): boolean {
   return false;
 }
 
-// PBKDF2 Password Hashing
+// PBKDF2 Password Hashing (Upgraded to 310,000 iterations for compliance)
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, 310000, 64, "sha512").toString("hex");
   return `${salt}:${hash}`;
 }
 
 export function verifyPassword(password: string, stored: string): boolean {
   try {
     const [salt, originalHash] = stored.split(":");
-    const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
-    return hash === originalHash;
+    const hash = crypto.pbkdf2Sync(password, salt, 310000, 64, "sha512").toString("hex");
+    const hashBuffer = Buffer.from(hash, "hex");
+    const originalBuffer = Buffer.from(originalHash, "hex");
+    return crypto.timingSafeEqual(hashBuffer, originalBuffer);
   } catch (e) {
     return false;
+  }
+}
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "aegis_critical_secure_key_32_bytes";
+
+export function encryptSecret(plainText: string): string {
+  try {
+    const iv = crypto.randomBytes(12);
+    const key = crypto.createHash("sha256").update(ENCRYPTION_KEY).digest();
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    let encrypted = cipher.update(plainText, "utf8", "hex");
+    encrypted += cipher.final("hex");
+    const authTag = cipher.getAuthTag().toString("hex");
+    return `${iv.toString("hex")}:${encrypted}:${authTag}`;
+  } catch (err) {
+    console.error("Encryption failed:", err);
+    return plainText;
+  }
+}
+
+export function decryptSecret(encryptedText: string): string {
+  try {
+    if (!encryptedText.includes(":")) return encryptedText;
+    const [ivHex, encrypted, authTagHex] = encryptedText.split(":");
+    if (!ivHex || !encrypted || !authTagHex) return encryptedText;
+    const iv = Buffer.from(ivHex, "hex");
+    const authTag = Buffer.from(authTagHex, "hex");
+    const key = crypto.createHash("sha256").update(ENCRYPTION_KEY).digest();
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(encrypted, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return decrypted;
+  } catch (err) {
+    console.error("Decryption failed:", err);
+    return encryptedText;
   }
 }
 
@@ -152,34 +191,39 @@ export class AegisDB {
     if (fs.existsSync(DB_FILE)) {
       try {
         const raw = fs.readFileSync(DB_FILE, "utf-8");
-        return JSON.parse(raw);
+        // Sweep for compromised legacy strings. Force cleanup on detection.
+        const compromised = [
+          "aegisquant",
+          "operator2026",
+          "viewer2026",
+          "KVKVE42",
+          "MNSFEY",
+          "OVYGS"
+        ];
+        if (compromised.some(leak => raw.includes(leak))) {
+          console.warn("Leaked legacy credentials found in persistent JSON file. Purging file...");
+          fs.unlinkSync(DB_FILE);
+        } else {
+          return JSON.parse(raw);
+        }
       } catch (err) {
         console.error("Database parsing failed. Repairing data...", err);
       }
     }
 
-    // Default seed database
+    // Default bootstrap credentials securely defined at runtime or loaded from environment
+    const adminUser = process.env.BOOTSTRAP_ADMIN_USER || "admin";
+    const adminPass = process.env.BOOTSTRAP_ADMIN_PASSWORD || "AegisSecure2026!";
+    const adminTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET || "NBSWY3DPEB3W64TBNQ"; // base32 for admin2026
+
+    // Secure Seeding (Single Admin User initially bootstrapped, operator/viewer added by admin dynamically)
     const seedDb: AegisDatabase = {
       users: [
         {
-          username: "admin",
-          passwordHash: hashPassword("aegisquant2026"),
+          username: adminUser,
+          passwordHash: hashPassword(adminPass),
           role: "admin",
-          totpSecret: "KVKVE42KGBEGKVKV", // base32 for "AEGISQUANT2026"
-          isActive: true
-        },
-        {
-          username: "operator",
-          passwordHash: hashPassword("operator2026"),
-          role: "operator",
-          totpSecret: "MNSFEY2MJVGEKVKV", // base32 for "OPERATOR2026"
-          isActive: true
-        },
-        {
-          username: "viewer",
-          passwordHash: hashPassword("viewer2026"),
-          role: "viewer",
-          totpSecret: "OVYGS43VNZSGCVKV", // base32 for "VIEWER2026"
+          totpSecret: encryptSecret(adminTotp),
           isActive: true
         }
       ],

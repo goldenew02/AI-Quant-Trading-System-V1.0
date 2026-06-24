@@ -65,38 +65,13 @@ export default function RiskControl() {
     fetchRiskSettings();
   }, []);
 
+  const [mfaActionType, setMfaActionType] = useState<'SAVE' | 'TOGGLE_KILL_SWITCH'>('SAVE');
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    try {
-      setSaving(true);
-      setMessage(null);
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/risk", {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify(settings),
-      });
-      const contentType = res.headers.get("content-type");
-      if (res.ok && contentType && contentType.includes("application/json")) {
-        const data = await res.json();
-        setSettings({
-          ...settings,
-          ...data.settings
-        });
-        setMessage({ text: "✓ 量化风险限额与熔断参数已部署到各个API边缘节点。", isError: false });
-        setTimeout(() => setMessage(null), 4000);
-      } else {
-        setMessage({ text: "错误: 无法保存底层风控配置。", isError: true });
-      }
-    } catch (err) {
-      console.error(err);
-      setMessage({ text: "错误: 无法连接至风控后端服务。", isError: true });
-    } finally {
-      setSaving(false);
-    }
+    setMfaActionType('SAVE');
+    setMfaCode("");
+    setShowMfaModal(true);
   };
 
   const handleInputChange = (field: keyof RiskSettings, value: any) => {
@@ -108,6 +83,7 @@ export default function RiskControl() {
 
   // Toggle switch trigger with MFA simulation
   const handleToggleKillSwitchClick = () => {
+    setMfaActionType('TOGGLE_KILL_SWITCH');
     setMfaAction(!settings.globalKillSwitch);
     setMfaCode("");
     setShowMfaModal(true);
@@ -115,44 +91,65 @@ export default function RiskControl() {
 
   const handleVerifyMfaAndToggle = async () => {
     try {
+      setSaving(true);
       const token = localStorage.getItem("aegis_token");
+      
+      // Step 1: Verify TOTP and obtain the transient high-impact action token
       const res = await fetch("/api/auth/verify-totp", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ code: mfaCode, action: "TOGGLE_GLOBAL_KILL_SWITCH" }),
+        body: JSON.stringify({ 
+          code: mfaCode, 
+          action: mfaActionType === 'SAVE' ? "SAVE_RISK_LIMITS" : "TOGGLE_GLOBAL_KILL_SWITCH" 
+        }),
       });
       const data = await res.json();
-      if (res.ok && data.success) {
-        const targetKillSwitch = mfaAction;
-        const updatedSettings = { ...settings, globalKillSwitch: targetKillSwitch };
-        setSettings(updatedSettings);
+      if (!res.ok || !data.success) {
+        alert(data.error || "MFA validation failed. Unauthorized modification blocked.");
+        return;
+      }
 
-        const saveRes = await fetch("/api/risk", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`
-          },
-          body: JSON.stringify(updatedSettings),
+      // Step 2: Call post-trade /api/risk passing the actionToken
+      const updatedSettings = mfaActionType === 'TOGGLE_KILL_SWITCH' 
+        ? { ...settings, globalKillSwitch: mfaAction }
+        : settings;
+
+      const saveRes = await fetch("/api/risk", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          ...updatedSettings,
+          actionToken: data.actionToken
+        }),
+      });
+
+      const saveData = await saveRes.json();
+      if (saveRes.ok && saveData.success) {
+        setSettings({
+          ...settings,
+          ...saveData.settings
         });
-
-        if (saveRes.ok) {
-          setShowMfaModal(false);
-          setMessage({ text: targetKillSwitch ? "✓ 警告：全局一键熔断已生效！所有成交通道已阻断。" : "✓ 全局熔断已解除。系统恢复正常对冲交易。", isError: false });
-          setTimeout(() => setMessage(null), 5000);
+        setShowMfaModal(false);
+        if (mfaActionType === 'TOGGLE_KILL_SWITCH') {
+          setMessage({ text: mfaAction ? "✓ 警告：全局一键熔断已生效！所有成交通道已阻断。" : "✓ 全局熔断已解除。系统恢复正常对冲交易。", isError: false });
         } else {
-          const saveErr = await saveRes.json();
-          alert(saveErr.error || "MFA authorized but failed to persist risk settings.");
+          setMessage({ text: "✓ 量化风险限额与熔断参数已部署到各个API边缘节点并生效。", isError: false });
         }
+        setTimeout(() => setMessage(null), 5000);
       } else {
-        alert(data.error || "MFA validation failed. Unauthorized switch.");
+        alert(saveData.error || "MFA authorized but failed to persist risk settings.");
       }
     } catch (err) {
       console.error(err);
       alert("MFA verification connection error.");
+    } finally {
+      setSaving(false);
     }
   };
 
