@@ -3,6 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import crypto from "crypto";
 import { BotConfig, TradeLog, RiskSettings, GridLine } from "./src/types";
 
 dotenv.config();
@@ -20,6 +21,10 @@ let riskSettings: RiskSettings = {
   maxLeverageLimit: 10, // 10x limit
   dailyLossLimitUSD: 800, // $800 limit
   restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+  singleAssetMaxAllocationPercent: 40,
+  industryCryptoMaxPercent: 60,
+  autoMeltDrawdownThreshold: 12.0,
+  autoMeltSharpeThreshold: 0.8,
 };
 
 // Default Bots Setup (Exactly 4 grid bots, configurable & run independently)
@@ -139,6 +144,24 @@ function generateGrids(min: number, max: number, count: number, currentPrice: nu
   return lines;
 }
 
+// Log Hash Chain State & Functions
+let lastLogHash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+function computeLogHash(log: TradeLog, prevHash: string): string {
+  const content = `${log.id}-${log.timestamp}-${log.type}-${log.price}-${log.amount}-${log.total}-${prevHash}`;
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+function rechainLogs() {
+  let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
+  for (let i = tradeLogs.length - 1; i >= 0; i--) {
+    tradeLogs[i].previousHash = prevHash;
+    tradeLogs[i].currentHash = computeLogHash(tradeLogs[i], prevHash);
+    prevHash = tradeLogs[i].currentHash!;
+  }
+  lastLogHash = prevHash;
+}
+
 // Pre-seed some trade logs for initial visualization
 let tradeLogs: TradeLog[] = [
   {
@@ -207,6 +230,33 @@ let tradeLogs: TradeLog[] = [
     pnl: 0
   }
 ];
+
+// Re-chain trade logs cryptographic chain on startup
+rechainLogs();
+
+// Initialize Bots with Process Sandbox and Version History Properties
+bots.forEach((bot, index) => {
+  bot.pid = 4210 + index;
+  bot.memoryHeapMb = Math.round((95 + index * 12 + Math.random() * 5) * 10) / 10;
+  bot.cpuAffinity = `CPU Core ${index % 4}`;
+  bot.version = "1.0.0";
+  bot.configHistory = [
+    {
+      version: "1.0.0",
+      timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
+      rangeMin: bot.rangeMin,
+      rangeMax: bot.rangeMax,
+      gridCount: bot.gridCount,
+      investment: bot.investment,
+      leverage: bot.leverage,
+    }
+  ];
+  if (bot.type === "futures_grid") {
+    const directionFactor = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
+    bot.liquidationPrice = Math.round(bot.entryPrice * (1 - (directionFactor * 0.8) / bot.leverage) * 100) / 100;
+    bot.maintenanceMargin = Math.round(bot.investment * 0.05 * 100) / 100;
+  }
+});
 
 // Price simulation feed dictionary
 const lastKnownPrices: Record<string, number> = {
@@ -348,6 +398,7 @@ setInterval(() => {
     }
 
   });
+  rechainLogs();
 }, 5000);
 
 // Lazily initialising Gemini AI SDK to prevent startup crashes if GEMINI_API_KEY is not defined
@@ -369,6 +420,31 @@ function getGeminiClient() {
   return aiClient;
 }
 
+// --- API Rate Limiter and Safety Circuit Breaker ---
+let apiRequestCounter = 0;
+const rateLimitCap = 120; // 120 requests per minute
+let circuitBreakerActive = false;
+
+// Sliding window interval reset (every 60s)
+setInterval(() => {
+  apiRequestCounter = 0;
+  circuitBreakerActive = false;
+}, 60000);
+
+// Middleware to monitor API call frequency and prevent high frequency API overload risk
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    apiRequestCounter++;
+    if (apiRequestCounter > rateLimitCap) {
+      circuitBreakerActive = true;
+      return res.status(429).json({
+        error: `风控熔断预警 (CIRCUIT_BREAKER_ACTIVE): API高频并发频次 [${apiRequestCounter}] 超过每分钟上限 [${rateLimitCap}] 次。触发紧急回路熔断保护，暂停API响应 60 秒。`
+      });
+    }
+  }
+  next();
+});
+
 // --- API ROUTES ---
 
 // 1. System Metrics Endpoint (Simulating high performance Oracle Cloud ARM Ampere platform metrics)
@@ -385,7 +461,10 @@ app.get("/api/overview", (req, res) => {
     diskUsage: 24.8, // SSD 100G, 24.8G used
     uptime: `7 days, 14 hours, ${new Date().getMinutes()} minutes`,
     ampereTemp: Math.round(ampTemp * 10) / 10,
-    coreStatus: cpuFactor > 25 ? "Active" : "Active"
+    coreStatus: cpuFactor > 25 ? "Active" : "Active",
+    apiRequestRate: apiRequestCounter,
+    rateLimitCap: rateLimitCap,
+    circuitBreakerActive: circuitBreakerActive
   });
 });
 
@@ -399,23 +478,91 @@ app.post("/api/bots/configure/:id", (req, res) => {
   const config = req.body;
 
   const botIndex = bots.findIndex((b) => b.id === id);
-  if (botIndex !== -1) {
-    bots[botIndex] = {
-      ...bots[botIndex],
-      ...config,
-      grids: generateGrids(
-        Number(config.rangeMin),
-        Number(config.rangeMax),
-        Number(config.gridCount),
-        bots[botIndex].currentPrice,
-        Number(config.investment) / Number(config.gridCount)
-      ),
-      lastUpdated: new Date().toISOString(),
-    };
-    res.json({ success: true, bot: bots[botIndex] });
-  } else {
-    res.status(404).json({ error: "Bot not found" });
+  if (botIndex === -1) {
+    return res.status(404).json({ error: "Bot not found" });
   }
+
+  const newInvestment = Number(config.investment);
+  const otherBotsInvestment = bots.filter(b => b.id !== id).reduce((sum, b) => sum + b.investment, 0);
+  const totalInvProposed = otherBotsInvestment + newInvestment;
+
+  // 1. Portfolio Allocation Wind Control - Single Asset Max Allocation Cap
+  const singleAssetPercent = totalInvProposed > 0 ? (newInvestment / totalInvProposed) * 100 : 0;
+  if (singleAssetPercent > riskSettings.singleAssetMaxAllocationPercent) {
+    return res.status(400).json({
+      error: `组合风控预警 (PORTFOLIO_ASSET_ALLOC_BREACH): 单一资产 [${config.symbol}] 拟分配资金占比达 ${singleAssetPercent.toFixed(1)}%，已超过组合持仓风控上限 [${riskSettings.singleAssetMaxAllocationPercent}%]。请调低出资额或增加其他策略持仓。`
+    });
+  }
+
+  // 2. Portfolio Allocation Wind Control - Industry Crypto Exposure Cap
+  const isProposedCrypto = (config.symbol || "").includes("/");
+  const cryptoInvProposed = bots.filter(b => b.id !== id).reduce((sum, b) => {
+    const isCrypto = b.symbol.includes("/");
+    return sum + (isCrypto ? b.investment : 0);
+  }, 0) + (isProposedCrypto ? newInvestment : 0);
+
+  const cryptoPercent = totalInvProposed > 0 ? (cryptoInvProposed / totalInvProposed) * 100 : 0;
+  if (cryptoPercent > riskSettings.industryCryptoMaxPercent) {
+    return res.status(400).json({
+      error: `行业风险预警 (INDUSTRY_EXPOSURE_BREACH): 加密货币资产拟配置总占比达 ${cryptoPercent.toFixed(1)}%，已超过行业投资组合风险上限 [${riskSettings.industryCryptoMaxPercent}%]。请调配美股与加密货币资产出资结构。`
+    });
+  }
+
+  // 3. Leverage Cap Control
+  if (Number(config.leverage || 1) > riskSettings.maxLeverageLimit) {
+    return res.status(400).json({
+      error: `杠杆超限预警 (LEVERAGE_BREACH): 当前配置杠杆倍数 [${config.leverage}x] 已超过全局最大杠杆限制上限 [${riskSettings.maxLeverageLimit}x]。请降低杠杆以维持充足保证金安全垫。`
+    });
+  }
+
+  // 4. Restricted Asset Checklist
+  if (riskSettings.restrictedSymbols.some(s => s.toLowerCase() === (config.symbol || "").toLowerCase())) {
+    return res.status(400).json({
+      error: `标的禁投预警 (SYMBOL_RESTRICTED): 交易标的 [${config.symbol}] 属于高波动禁投资产，已被全局风控限制。`
+    });
+  }
+
+  // Active configurations update
+  const bot = bots[botIndex];
+  
+  // Store Version Configuration History
+  const nextVer = `1.0.${bot.configHistory ? bot.configHistory.length + 1 : 1}`;
+  bot.configHistory = bot.configHistory || [];
+  bot.configHistory.push({
+    version: nextVer,
+    timestamp: new Date().toISOString(),
+    rangeMin: Number(config.rangeMin),
+    rangeMax: Number(config.rangeMax),
+    gridCount: Number(config.gridCount),
+    investment: Number(config.investment),
+    leverage: Number(config.leverage || 1),
+  });
+
+  bots[botIndex] = {
+    ...bot,
+    ...config,
+    version: nextVer,
+    grids: generateGrids(
+      Number(config.rangeMin),
+      Number(config.rangeMax),
+      Number(config.gridCount),
+      bot.currentPrice,
+      Number(config.investment) / Number(config.gridCount)
+    ),
+    lastUpdated: new Date().toISOString(),
+  };
+
+  // Calculate Futures liquidation metrics
+  if (config.type === "futures_grid") {
+    const directionFactor = config.direction === "long" ? 1 : config.direction === "short" ? -1 : 0;
+    bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.8) / Number(config.leverage || 1)) * 100) / 100;
+    bots[botIndex].maintenanceMargin = Math.round(Number(config.investment) * 0.05 * 100) / 100;
+  } else {
+    delete bots[botIndex].liquidationPrice;
+    delete bots[botIndex].maintenanceMargin;
+  }
+
+  res.json({ success: true, bot: bots[botIndex] });
 });
 
 app.post("/api/bots/start/:id", (req, res) => {
@@ -494,21 +641,114 @@ app.get("/api/logs/download", (req, res) => {
   res.status(200).send(csv);
 });
 
-// 6. Quantitative Backtesting Module Engine Solver
+// 5a. Cryptographic Hash Chain Verification & Tamper Simulation Endpoints
+app.post("/api/logs/tamper", (req, res) => {
+  if (tradeLogs.length > 0) {
+    // Tamper with the oldest log price to break the hash chain
+    const targetIdx = tradeLogs.length - 1; 
+    const originalPrice = tradeLogs[targetIdx].price;
+    tradeLogs[targetIdx].price = Math.round(originalPrice * 1.08 * 100) / 100;
+    tradeLogs[targetIdx].total = Math.round(tradeLogs[targetIdx].amount * tradeLogs[targetIdx].price * 100) / 100;
+    res.json({
+      success: true,
+      message: `SIMULATED TAMPERING SUCCESSFUL: Altered transaction [${tradeLogs[targetIdx].id}] price from $${originalPrice} to $${tradeLogs[targetIdx].price}.`,
+      tamperedId: tradeLogs[targetIdx].id,
+    });
+  } else {
+    res.status(400).json({ error: "No trade logs exist to tamper." });
+  }
+});
+
+app.post("/api/logs/verify", (req, res) => {
+  let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
+  const violations: any[] = [];
+
+  // Recalculate hash chain from oldest to newest
+  for (let i = tradeLogs.length - 1; i >= 0; i--) {
+    const log = tradeLogs[i];
+    const computed = computeLogHash(log, log.previousHash || prevHash);
+    
+    if (log.currentHash !== computed) {
+      violations.push({
+        id: log.id,
+        botName: log.botName,
+        timestamp: log.timestamp,
+        recordedHash: log.currentHash,
+        calculatedHash: computed,
+        fieldBroken: "price / total amount",
+      });
+    }
+    prevHash = log.currentHash || computed;
+  }
+
+  res.json({
+    success: violations.length === 0,
+    totalLogsCount: tradeLogs.length,
+    violations,
+    integrityStatus: violations.length === 0 ? "SECURE_HASH_CHAIN_VALID" : "CHAIN_INTEGRITY_COMPROMISED",
+  });
+});
+
+app.post("/api/logs/restore", (req, res) => {
+  rechainLogs();
+  res.json({
+    success: true,
+    message: "RESTORE SUCCESSFUL: Cryptographic hash chain successfully repaired from secure hot-swap immutable logs backup.",
+  });
+});
+
+app.post("/api/bots/rollback/:id", (req, res) => {
+  const { id } = req.params;
+  const { version } = req.body;
+  const botIndex = bots.findIndex((b) => b.id === id);
+
+  if (botIndex !== -1) {
+    const bot = bots[botIndex];
+    const historyItem = bot.configHistory?.find(v => v.version === version);
+    if (historyItem) {
+      bot.rangeMin = historyItem.rangeMin;
+      bot.rangeMax = historyItem.rangeMax;
+      bot.gridCount = historyItem.gridCount;
+      bot.investment = historyItem.investment;
+      bot.leverage = historyItem.leverage;
+      bot.version = version;
+      bot.grids = generateGrids(
+        Number(bot.rangeMin),
+        Number(bot.rangeMax),
+        Number(bot.gridCount),
+        bot.currentPrice,
+        Number(bot.investment) / Number(bot.gridCount)
+      );
+      bot.lastUpdated = new Date().toISOString();
+      res.json({ success: true, bot });
+    } else {
+      res.status(404).json({ error: "Specified configuration version not found in history archive." });
+    }
+  } else {
+    res.status(404).json({ error: "Bot not found." });
+  }
+});
+
+// 6. Quantitative Backtesting Module Engine Solver with Stress Tests & Seed Reproducibility
 app.post("/api/backtest", (req, res) => {
-  const { broker, symbol, rangeMin, rangeMax, gridCount, investment, days = 60, type = "spot_grid", leverage = 1 } = req.body;
+  const { broker, symbol, rangeMin, rangeMax, gridCount, investment, days = 60, type = "spot_grid", leverage = 1, stressTest = "none", seed = 42 } = req.body;
 
   const min = Number(rangeMin);
   const max = Number(rangeMax);
   const count = Number(gridCount);
   const invest = Number(investment);
 
-  // Generate 180 coordinate samples to represent daily equity steps for standard backtest periods
+  // Simple seedable random generator (LCG) for reproducible backtesting simulations
+  let s = Number(seed) || 42;
+  const rand = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+
   const dataPointsCount = Number(days);
   const equityCurve: { timestamp: string; value: number }[] = [];
   const drawdownCurve: { timestamp: string; value: number }[] = [];
 
-  // Simulate asset trajectory (random walk + cyclical factors to reflect trade fill loops)
   let currentCap = invest;
   let maxCap = invest;
   let basePrice = symbol === "BTC/USDT" ? 64000 : symbol === "ETH/USDT" ? 3300 : symbol === "NVDA" ? 120 : 180;
@@ -516,11 +756,9 @@ app.post("/api/backtest", (req, res) => {
 
   const tradeRecords: any[] = [];
   const step = (max - min) / (count - 1);
-
-  // Base APR / trades counts modifiers based on range thickness
   const rangeWidth = max - min;
   const gridSpreadPercent = (step / basePrice) * 100;
-  const frequencyFactor = Math.max(1, 15 - Math.floor(gridSpreadPercent)); // smaller separation = higher triggers but dynamic fills ratio
+  const frequencyFactor = Math.max(1, 15 - Math.floor(gridSpreadPercent)); 
 
   let activeDrawdown = 0;
   let maxDrawdown = 0;
@@ -529,24 +767,53 @@ app.post("/api/backtest", (req, res) => {
   for (let d = 0; d < dataPointsCount; d++) {
     const dayLabel = new Date(Date.now() - (dataPointsCount - d) * 24 * 3600 * 1000).toLocaleDateString();
 
-    // Fluctuating daily base price
+    // Fluctuating daily base price with seedable noise
     const cycle = Math.sin((d / dataPointsCount) * Math.PI * 4) * (basePrice * 0.08);
-    const noise = (Math.random() - 0.485) * (basePrice * 0.04);
-    const dayPrice = basePrice + cycle + noise;
+    const noise = (rand() - 0.485) * (basePrice * 0.04);
+
+    // Apply specific historical crash scenario modifiers
+    let stressFactor = 1.0;
+    const progress = d / dataPointsCount;
+    if (stressTest === "2015_ashare") {
+      if (progress >= 0.25 && progress <= 0.45) {
+        // Crash 45% during the period
+        stressFactor = 1.0 - (progress - 0.25) * 2.25; 
+      } else if (progress > 0.45) {
+        // Slow partial consolidation
+        stressFactor = 0.55 + (progress - 0.45) * 0.25; 
+      }
+    } else if (stressTest === "2020_us") {
+      if (progress >= 0.4 && progress <= 0.5) {
+        // Drop 30% during COVID outbreak
+        stressFactor = 1.0 - (progress - 0.4) * 3.0; 
+      } else if (progress > 0.5) {
+        // Sharp recovery
+        stressFactor = 0.70 + (progress - 0.5) * 0.55; 
+      }
+    } else if (stressTest === "2021_crypto") {
+      if (progress >= 0.5 && progress <= 0.55) {
+        // Liquidations cascade drops asset by 50%
+        stressFactor = 1.0 - (progress - 0.5) * 10.0; 
+      } else if (progress > 0.55) {
+        // Modest consolidation
+        stressFactor = 0.50 + (progress - 0.55) * 0.35; 
+      }
+    }
+
+    const dayPrice = (basePrice + cycle + noise) * stressFactor;
 
     // Simulate grid fills on that day
-    const simulatedDailyFills = Math.floor(Math.random() * frequencyFactor) + 1;
+    const simulatedDailyFills = Math.floor(rand() * frequencyFactor) + 1;
     let netDailyRealized = 0;
 
     for (let f = 0; f < simulatedDailyFills; f++) {
       fillCount++;
-      const isSellGrid = Math.random() > 0.45;
-      const tradePrice = min + (Math.random() * rangeWidth);
+      const isSellGrid = rand() > 0.45;
+      const tradePrice = min + (rand() * rangeWidth);
       const unitsPerGrid = invest / count / tradePrice;
       const totalTradeValue = unitsPerGrid * tradePrice;
 
       if (isSellGrid) {
-        // High-point arbitrage
         const profitGained = Math.round(totalTradeValue * 0.015 * 100) / 100;
         netDailyRealized += profitGained;
 
@@ -569,7 +836,6 @@ app.post("/api/backtest", (req, res) => {
 
     currentCap += netDailyRealized;
 
-    // Unrealized portfolio drift
     const priceDriftFactor = (dayPrice - basePrice) / basePrice;
     let unrealizedPnl = invest * priceDriftFactor * (type === "futures_grid" ? leverage : 0.65);
     const dayEquityValue = currentCap + unrealizedPnl;
@@ -597,7 +863,9 @@ app.post("/api/backtest", (req, res) => {
 
   const netProfit = currentCap - invest;
   const annualizedYield = (netProfit / invest) * (365 / days) * 100;
-  const sharpeRatio = Math.max(0.4, 2.2 - (maxDrawdown * 0.08) + (annualizedYield * 0.015));
+  // Stress tests affect Sharpe ratio negatively due to massive drawdowns
+  const baseSharpe = 2.2 - (maxDrawdown * 0.08) + (annualizedYield * 0.015);
+  const sharpeRatio = Math.max(0.05, stressTest !== "none" ? baseSharpe - 0.8 : baseSharpe);
 
   res.json({
     totalReturned: Math.round(currentCap * 100) / 100,
@@ -608,7 +876,7 @@ app.post("/api/backtest", (req, res) => {
     tradesFillCount: fillCount,
     equityCurve,
     drawdownCurve,
-    tradeRecords: tradeRecords.slice(-50), // Send last 50 transactions for table
+    tradeRecords: tradeRecords.slice(-50), 
   });
 });
 

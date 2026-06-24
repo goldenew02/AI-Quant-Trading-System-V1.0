@@ -17,6 +17,16 @@ export interface GridLine {
   amount: number;
 }
 
+export interface BotConfigVersion {
+  version: string;
+  timestamp: string;
+  rangeMin: number;
+  rangeMax: number;
+  gridCount: number;
+  investment: number;
+  leverage: number;
+}
+
 export interface BotConfig {
   id: string; // "bot_1", "bot_2", "bot_3", "bot_4"
   name: string;
@@ -41,6 +51,15 @@ export interface BotConfig {
   entryPrice: number;
   currentPrice: number;
   lastUpdated: string;
+  
+  // Audit Enhancements
+  pid?: number;
+  memoryHeapMb?: number;
+  cpuAffinity?: string;
+  version?: string;
+  liquidationPrice?: number;
+  maintenanceMargin?: number;
+  configHistory?: BotConfigVersion[];
 }
 
 export interface TradeLog {
@@ -55,6 +74,12 @@ export interface TradeLog {
   amount: number;
   total: number;
   pnl?: number; // realized PnL
+  
+  // Audit Enhancements
+  ruleTriggerCode?: string;
+  apiRateStatus?: string;
+  previousHash?: string;
+  currentHash?: string;
 }
 
 export interface RiskSettings {
@@ -64,6 +89,12 @@ export interface RiskSettings {
   maxLeverageLimit: number; // e.g., 20
   dailyLossLimitUSD: number; // e.g., 1000
   restrictedSymbols: string[]; // comma separated symbols to disable
+  
+  // Portfolio Layer Enhancements
+  singleAssetMaxAllocationPercent: number; // e.g. 40%
+  industryCryptoMaxPercent: number; // e.g. 60%
+  autoMeltDrawdownThreshold: number; // e.g. 12%
+  autoMeltSharpeThreshold: number; // e.g. 0.8
 }
 
 export interface systemOverview {
@@ -73,4 +104,10 @@ export interface systemOverview {
   uptime: string;
   ampereTemp: number; // simulated temperature on ARM
   coreStatus: 'Active' | 'Throttled' | 'Idle';
+  
+  // API Frequency & Breaker Enhancements
+  apiRequestRate: number;
+  rateLimitCap: number;
+  circuitBreakerActive: boolean;
 }
+

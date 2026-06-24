@@ -17,12 +17,15 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
     investment: "5000",
     days: "60",
     leverage: "5",
+    stressTest: "none",
+    seed: "42",
   });
 
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any | null>(null);
   const [aiReport, setAiReport] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [pastRuns, setPastRuns] = useState<any[]>([]);
 
   const handleRunBacktest = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -34,13 +37,31 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       const res = await fetch("/api/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify({
+          ...config,
+          rangeMin: Number(config.rangeMin),
+          rangeMax: Number(config.rangeMax),
+          gridCount: Number(config.gridCount),
+          investment: Number(config.investment),
+          days: Number(config.days),
+          leverage: Number(config.leverage),
+          seed: Number(config.seed),
+        }),
       });
 
-      if (res.ok) {
+      const contentType = res.headers.get("content-type");
+      if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
         setResult(data);
         onBacktestComplete(data);
+        
+        // Save to past runs history list
+        const runRecord = {
+          timestamp: new Date().toLocaleTimeString(),
+          config: { ...config },
+          result: data
+        };
+        setPastRuns(prev => [runRecord, ...prev]);
       }
     } catch (err) {
       console.error(err);
@@ -64,19 +85,22 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
 交易标的: ${config.symbol}
 网格区间: [${config.rangeMin} - ${config.rangeMax}], 格数: ${config.gridCount}
 投入资金: $${config.investment}
-回测周期: ${config.days} 天, 类型: ${config.type}
+回测周期: ${config.days} 天, 类型: ${config.type}, 杠杆: ${config.leverage}x
+压力测试模式: ${config.stressTest}
+随机种子: ${config.seed}
 输出结果：
 净收益: $${result.netProfit} (${(result.netProfit / Number(config.investment) * 100).toFixed(2)}%)
 年化预期收益率: ${result.annualizedYield}%
 夏普比率 (Sharpe Ratio): ${result.sharpeRatio}
 最大区间偏离回撤 (Max Drawdown): ${result.maxDrawdown}%
 对冲撮合次数: ${result.tradesFillCount} 次。
-请帮我从定量与定性角度，给出一份专业的网格模型审计与配置纠偏报告。`,
+请帮我从定量与定性角度，给出一份专业的网格模型审计、压力场景波动与配置纠偏报告。`,
           backtestResult: result,
         }),
       });
 
-      if (res.ok) {
+      const contentType = res.headers.get("content-type");
+      if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
         setAiReport(data.analysis);
       }
@@ -95,7 +119,6 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
     }));
   };
 
-  // Format model recommendation templates
   const applyPreset = (symbol: string) => {
     if (symbol === "BTC/USDT") {
       setConfig({
@@ -108,6 +131,8 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         investment: "3000",
         days: "60",
         leverage: "1",
+        stressTest: "none",
+        seed: "42",
       });
     } else if (symbol === "NVDA") {
       setConfig({
@@ -120,6 +145,8 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         investment: "5000",
         days: "90",
         leverage: "1",
+        stressTest: "none",
+        seed: "42",
       });
     } else if (symbol === "ETH/USDT") {
       setConfig({
@@ -132,6 +159,8 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         investment: "1500",
         days: "45",
         leverage: "5",
+        stressTest: "2021_crypto",
+        seed: "99",
       });
     }
   };
@@ -141,13 +170,13 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-6 pb-4 border-b border-[#2A2A2C]">
         <div>
           <span className="text-[10px] uppercase tracking-[0.25em] text-[#666666] font-bold block mb-1">
-            Backtest Simulation Lab
+            Backtest Simulation Lab & Stress Tester
           </span>
           <h2 className="text-2xl font-black tracking-tighter uppercase italic text-white font-display">
             Aegis Simulation Engine
           </h2>
           <p className="text-xs text-[#666666] mt-1 font-mono uppercase">
-            Run quantitative stress-testing benchmarks on high-frequency indices before active token provisioning.
+            Evaluate high-frequency portfolio models under historical stress scenarios with deterministic seeding.
           </p>
         </div>
 
@@ -173,7 +202,7 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         </div>
       </div>
 
-      <form onSubmit={handleRunBacktest} className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6" id="form-backtest">
+      <form onSubmit={handleRunBacktest} className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6" id="form-backtest">
         <div>
           <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Broker Engine</label>
           <select
@@ -227,7 +256,7 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         </div>
 
         <div>
-          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Active Grid Pricing Limits [Min - Max]</label>
+          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Grid Bounds [Min - Max]</label>
           <div className="grid grid-cols-2 gap-2">
             <input
               type="number"
@@ -249,7 +278,7 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
         </div>
 
         <div>
-          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Layers Count & Duration Cycle</label>
+          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Layers Count & Days Cycle</label>
           <div className="grid grid-cols-2 gap-2">
             <input
               type="number"
@@ -265,16 +294,45 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
               className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs select-none focus:outline-none focus:border-[#00FF66] font-mono"
               id="backtest-days"
             >
-              <option value="30">30 DAYS (FAST)</option>
-              <option value="60">60 DAYS (NORMAL)</option>
-              <option value="90">90 DAYS (QUARTER)</option>
-              <option value="180">180 DAYS (MAXIMUM)</option>
+              <option value="30">30 Days</option>
+              <option value="60">60 Days</option>
+              <option value="90">90 Days</option>
+              <option value="180">180 Days</option>
+              <option value="365">1 Year (365d)</option>
+              <option value="730">2 Years (730d)</option>
+              <option value="1095">3 Years (1095d)</option>
             </select>
           </div>
         </div>
 
+        <div>
+          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Scenario Stress Test (压力测试场景)</label>
+          <select
+            value={config.stressTest}
+            onChange={(e) => handleInputChange("stressTest", e.target.value)}
+            className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs select-none focus:outline-none focus:border-[#00FF66] font-mono"
+            id="backtest-stresstest"
+          >
+            <option value="none">None (Standard Market)</option>
+            <option value="2015_ashare">2015 A-Share Meltdown (15年千股跌停)</option>
+            <option value="2020_us">2020 US COVID Crash (20年多次熔断)</option>
+            <option value="2021_crypto">2021 Crypto Liquidation Crash (519暴跌)</option>
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-[10px] text-[#666666] uppercase font-mono mb-1 font-bold">Deterministic Seed (随机数种子)</label>
+          <input
+            type="number"
+            value={config.seed}
+            onChange={(e) => handleInputChange("seed", e.target.value)}
+            className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-2 px-3 text-white text-xs focus:outline-none focus:border-[#00FF66] font-mono"
+            id="backtest-seed"
+          />
+        </div>
+
         {config.type === "futures_grid" && (
-          <div className="md:col-span-3 bg-[#0A0A0B] p-4 border border-[#2A2A2C] rounded-none">
+          <div className="col-span-1 md:col-span-4 bg-[#0A0A0B] p-4 border border-[#2A2A2C] rounded-none">
             <label className="block text-[10px] text-[#666666] uppercase font-mono mb-2 font-bold">
               Contract Leverage Multiplier Ratio (1x - 20x)
             </label>
@@ -295,7 +353,7 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
           </div>
         )}
 
-        <div className="md:col-span-3 flex justify-end">
+        <div className="col-span-1 md:col-span-4 flex justify-end">
           <button
             type="submit"
             disabled={loading}
@@ -477,6 +535,50 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
                 </button>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Simulation execution history logs list */}
+      {pastRuns.length > 0 && (
+        <div className="mt-8 pt-6 border-t border-[#2A2A2C]" id="backtest-history-logs">
+          <h4 className="text-[10px] font-bold text-[#666666] mb-4 uppercase font-mono tracking-wider">
+            PREVIOUS RUNS HISTORY LOG (历史回测记录)
+          </h4>
+          <div className="space-y-3">
+            {pastRuns.map((run, idx) => (
+              <div key={idx} className="bg-[#0A0A0B] p-4 border border-[#2A2A2C] flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 font-mono text-xs">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[#00FF66] font-black">{run.config.symbol}</span>
+                    <span className="text-[10px] bg-zinc-800 text-zinc-300 px-1.5 py-0.2 rounded-none">{run.config.broker} ({run.config.days} Days)</span>
+                    <span className="text-[9px] text-[#666666]">{run.timestamp}</span>
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-1 uppercase">
+                    Grids: {run.config.gridCount} | Inv: ${run.config.investment} | Lev: {run.config.leverage}x | Stress: {run.config.stressTest} | Seed: {run.config.seed}
+                  </div>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="text-right col-span-1">
+                    <span className="text-zinc-550 text-[9px] block">PNL RETURN</span>
+                    <span className="text-[#00FF66] font-black italic">+${run.result.netProfit.toLocaleString()} (+{(run.result.netProfit / Number(run.config.investment) * 100).toFixed(2)}%)</span>
+                  </div>
+                  <div className="text-right col-span-1">
+                    <span className="text-zinc-550 text-[9px] block">SHARPE RATIO</span>
+                    <span className="text-white font-black">{run.result.sharpeRatio}</span>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setResult(run.result);
+                      setConfig(run.config);
+                    }}
+                    className="bg-[#2A2A2C] hover:bg-neutral-800 text-white text-[10px] font-bold py-1.5 px-3 rounded-none uppercase cursor-pointer"
+                  >
+                    View Result
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}

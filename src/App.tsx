@@ -36,7 +36,8 @@ export default function App() {
   const fetchBots = async () => {
     try {
       const res = await fetch("/api/bots");
-      if (res.ok) {
+      const contentType = res.headers.get("content-type");
+      if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
         setBots(data);
       }
@@ -60,8 +61,13 @@ export default function App() {
       if (res.ok) {
         fetchBots();
       } else {
-        const data = await res.json();
-        alert(data.error || "无法启动网格机器人交易对。");
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await res.json();
+          alert(data.error || "无法启动网格机器人交易对。");
+        } else {
+          alert("无法启动网格机器人交易对。");
+        }
       }
     } catch (err) {
       console.error(err);

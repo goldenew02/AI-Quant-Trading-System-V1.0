@@ -12,6 +12,8 @@ interface BotCardProps {
 
 export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardProps) {
   const [isConfiguring, setIsConfiguring] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [rollingId, setRollingId] = useState<string | null>(null);
   const [editingConfig, setEditingConfig] = useState({
     name: bot.name,
     broker: bot.broker,
@@ -39,6 +41,31 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
       takeProfit: editingConfig.takeProfit ? Number(editingConfig.takeProfit) : undefined,
     });
     setIsConfiguring(false);
+  };
+
+  const handleRollback = async (version: string) => {
+    try {
+      setRollingId(version);
+      const res = await fetch(`/api/bots/rollback/${bot.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        onConfigure(bot.id, data.bot);
+        setShowHistory(false);
+        alert(`成功：网格机器人已回滚至配置版本 ${version}！`);
+      } else {
+        const data = await res.json();
+        alert(data.error || "回滚失败");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("回滚参数通讯故障，请重试");
+    } finally {
+      setRollingId(null);
+    }
   };
 
   const handleValueChange = (field: string, value: any) => {
@@ -102,11 +129,11 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
           </div>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex gap-1.5">
           <button
             onClick={() => setIsConfiguring(!isConfiguring)}
-            disabled={bot.status === "running"}
-            className="border border-white/20 select-none text-white hover:border-white/50 text-[10px] font-bold py-2 px-3 uppercase rounded-none transition tracking-wider flex items-center gap-1.5 cursor-pointer disabled:opacity-20"
+            disabled={bot.status === "running" || showHistory}
+            className="border border-white/20 select-none text-white hover:border-white/50 text-[10px] font-bold py-2 px-2.5 uppercase rounded-none transition tracking-wider flex items-center gap-1.5 cursor-pointer disabled:opacity-20"
             title="策略配置"
             id={`btn-configure-${bot.id}`}
           >
@@ -114,10 +141,21 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
             Config
           </button>
 
+          <button
+            onClick={() => setShowHistory(!showHistory)}
+            disabled={isConfiguring}
+            className="border border-white/20 select-none text-zinc-400 hover:text-white hover:border-white/50 text-[10px] font-bold py-2 px-2.5 uppercase rounded-none transition tracking-wider flex items-center gap-1.5 cursor-pointer disabled:opacity-20"
+            title="配置版本历史"
+            id={`btn-history-${bot.id}`}
+          >
+            <Layers className="h-3 w-3 text-[#6FF]" />
+            History
+          </button>
+
           {bot.status === "running" ? (
             <button
               onClick={() => onStop(bot.id)}
-              className="bg-[#FF3333] hover:bg-[#CC2222] text-white text-[10px] font-bold py-2 px-3.5 uppercase rounded-none tracking-wider transition flex items-center gap-1.5 cursor-pointer"
+              className="bg-[#FF3333] hover:bg-[#CC2222] text-white text-[10px] font-bold py-2 px-3 uppercase rounded-none tracking-wider transition flex items-center gap-1.5 cursor-pointer"
               id={`btn-stop-${bot.id}`}
             >
               <Square className="h-3 w-3 fill-white" />
@@ -126,7 +164,7 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
           ) : (
             <button
               onClick={() => onStart(bot.id)}
-              className="bg-[#00FF66] hover:bg-[#00CC55] text-black text-[10px] font-bold py-2 px-3.5 uppercase rounded-none tracking-wider transition flex items-center gap-1.5 cursor-pointer"
+              className="bg-[#00FF66] hover:bg-[#00CC55] text-black text-[10px] font-bold py-2 px-3 uppercase rounded-none tracking-wider transition flex items-center gap-1.5 cursor-pointer"
               id={`btn-start-${bot.id}`}
             >
               <Play className="h-3 w-3 fill-black" />
@@ -135,6 +173,41 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
           )}
         </div>
       </div>
+
+      {showHistory && (
+        <div className="bg-[#0A0A0B] p-4 border border-[#2A2A2C] text-xs mt-4 rounded-none mb-4" id={`history-panel-${bot.id}`}>
+          <h4 className="font-bold text-[#E0E0E0] pb-2 border-b border-[#2A2A2C] mb-2 font-mono uppercase tracking-wider flex justify-between items-center text-[10px]">
+            <span>Version History Archive (参数历史)</span>
+            <span className="text-[8px] bg-zinc-800 text-[#6FF] px-1.5 py-0.5 font-bold">ROLLBACK CONTROL</span>
+          </h4>
+          {bot.configHistory && bot.configHistory.length > 0 ? (
+            <div className="space-y-2 max-h-[150px] overflow-y-auto pr-1">
+              {[...bot.configHistory].reverse().map((ver) => (
+                <div key={ver.version} className="bg-[#141416] p-2 border border-[#2A2A2C] flex justify-between items-center font-mono">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[#6FF] font-black">v{ver.version}</span>
+                      <span className="text-[8px] text-[#666666]">{new Date(ver.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="text-[9px] text-zinc-400 mt-0.5">
+                      R: ${ver.rangeMin}-${ver.rangeMax} | G: {ver.gridCount} | Lev: {ver.leverage}x | Inv: ${ver.investment}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleRollback(ver.version)}
+                    disabled={rollingId === ver.version || bot.version === ver.version || bot.status === "running"}
+                    className="bg-[#2A2A2C] hover:bg-[#6FF] hover:text-black disabled:opacity-20 text-white text-[8px] font-bold py-1 px-2 rounded-none uppercase transition cursor-pointer"
+                  >
+                    {bot.version === ver.version ? "CURRENT" : "RESTORE"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-[10px] text-zinc-550 font-mono uppercase">No configuration versions logged.</p>
+          )}
+        </div>
+      )}
 
       {isConfiguring ? (
         <div className="bg-[#0A0A0B] p-4 border border-[#2A2A2C] text-xs gap-3 flex flex-col mt-4 rounded-none" id={`config-panel-${bot.id}`}>
@@ -358,6 +431,28 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                 <span className="text-[#E0E0E0] font-mono uppercase text-[10px] tracking-tight">{getStatusLabel(bot.status)}</span>
                 <span className="text-[#666666]">({bot.tradesCount} Tx)</span>
               </div>
+            </div>
+
+            {/* Futures specific liquidation & margin indicators */}
+            {bot.type === "futures_grid" && (
+              <div className="grid grid-cols-2 gap-2 mt-2 pt-2 border-t border-[#2A2A2C]/40 text-[10px]">
+                <div className="bg-rose-950/20 border border-rose-900/30 p-2 rounded-none">
+                  <span className="text-[8px] text-[#FF3333] uppercase block font-bold">EST. LIQUIDATION PRICE</span>
+                  <span className="text-white font-black block mt-0.5">${bot.liquidationPrice?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                </div>
+                <div className="bg-amber-950/20 border border-amber-900/30 p-2 rounded-none">
+                  <span className="text-[8px] text-amber-500 block font-bold">MAINTENANCE MARGIN</span>
+                  <span className="text-white font-black block mt-0.5">${bot.maintenanceMargin?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Process Isolation Sandbox Bar */}
+            <div className="bg-[#0A0A0B] p-2 border border-[#2A2A2C] flex justify-between items-center text-[9px] text-zinc-500 font-mono mt-3 uppercase">
+              <span>PID: <span className="text-[#00FF66] font-bold">{bot.pid || 4210}</span></span>
+              <span>HEAP: <span className="text-[#00FF66] font-bold">{bot.memoryHeapMb || 95} MB</span></span>
+              <span>AFFINITY: <span className="text-[#00FF66] font-bold">{bot.cpuAffinity || "Core 0"}</span></span>
+              <span>VER: <span className="text-[#6FF] font-bold">v{bot.version || "1.0.0"}</span></span>
             </div>
           </div>
         </div>
