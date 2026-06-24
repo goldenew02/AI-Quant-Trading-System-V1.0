@@ -13,7 +13,10 @@ import {
   LineChart,
   ShieldAlert,
   Moon,
-  Laptop
+  Laptop,
+  Shield,
+  LogOut,
+  Fingerprint
 } from "lucide-react";
 
 import { BotConfig } from "./types";
@@ -24,19 +27,76 @@ import AuditCopilot from "./components/AuditCopilot";
 import BotCard from "./components/BotCard";
 import LiveMonitor from "./components/LiveMonitor";
 import BacktestSuite from "./components/BacktestSuite";
+import AegisLogin from "./components/AegisLogin";
+import SecurityLogs from "./components/SecurityLogs";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs" | "security_logs">("dashboard");
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastBacktestResult, setLastBacktestResult] = useState<any | null>(null);
   const [selectedBotForAi, setSelectedBotForAi] = useState<string>("bot_1");
   const [ibMode, setIbMode] = useState<"gateway" | "web_api_proxy">("web_api_proxy");
 
+  // JWT auth states
+  const [token, setToken] = useState<string | null>(localStorage.getItem("aegis_token"));
+  const [username, setUsername] = useState<string | null>(localStorage.getItem("aegis_username"));
+  const [role, setRole] = useState<'admin' | 'operator' | 'viewer' | null>(localStorage.getItem("aegis_role") as any);
+
+  const handleLoginSuccess = (newToken: string, newRole: 'admin' | 'operator' | 'viewer', newUsername: string) => {
+    setToken(newToken);
+    setRole(newRole);
+    setUsername(newUsername);
+    localStorage.setItem("aegis_token", newToken);
+    localStorage.setItem("aegis_username", newUsername);
+    localStorage.setItem("aegis_role", newRole);
+  };
+
+  const handleLogout = async () => {
+    try {
+      if (token) {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${token}` }
+        });
+      }
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
+    setToken(null);
+    setUsername(null);
+    setRole(null);
+    localStorage.removeItem("aegis_token");
+    localStorage.removeItem("aegis_username");
+    localStorage.removeItem("aegis_role");
+  };
+
+  const secureFetch = async (url: string, options: RequestInit = {}) => {
+    const headers = {
+      ...(options.headers || {}),
+    } as any;
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    const res = await fetch(url, {
+      ...options,
+      headers,
+    });
+    if (res.status === 401) {
+      setToken(null);
+      setUsername(null);
+      setRole(null);
+      localStorage.removeItem("aegis_token");
+      localStorage.removeItem("aegis_username");
+      localStorage.removeItem("aegis_role");
+    }
+    return res;
+  };
+
   // Fetch Bots state from Backend on boot & interval
   const fetchBots = async () => {
     try {
-      const res = await fetch("/api/bots");
+      const res = await secureFetch("/api/bots");
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
@@ -50,7 +110,7 @@ export default function App() {
   // Fetch IB connection mode on mount
   const fetchIbMode = async () => {
     try {
-      const res = await fetch("/api/ib-mode");
+      const res = await secureFetch("/api/ib-mode");
       if (res.ok) {
         const data = await res.json();
         setIbMode(data.mode);
@@ -62,7 +122,7 @@ export default function App() {
 
   const handleUpdateIbMode = async (mode: "gateway" | "web_api_proxy") => {
     try {
-      const res = await fetch("/api/ib-mode", {
+      const res = await secureFetch("/api/ib-mode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),
@@ -77,17 +137,18 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!token) return;
     setLoading(true);
     Promise.all([fetchBots(), fetchIbMode()]).then(() => setLoading(false));
 
     // Polling active bot prices & trade counters from simulated background environment every 4 seconds
     const interval = setInterval(fetchBots, 4000);
     return () => clearInterval(interval);
-  }, []);
+  }, [token]);
 
   const handleStartBot = async (id: string) => {
     try {
-      const res = await fetch(`/api/bots/start/${id}`, { method: "POST" });
+      const res = await secureFetch(`/api/bots/start/${id}`, { method: "POST" });
       if (res.ok) {
         fetchBots();
       } else {
@@ -106,9 +167,17 @@ export default function App() {
 
   const handleStopBot = async (id: string) => {
     try {
-      const res = await fetch(`/api/bots/stop/${id}`, { method: "POST" });
+      const res = await secureFetch(`/api/bots/stop/${id}`, { method: "POST" });
       if (res.ok) {
         fetchBots();
+      } else {
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await res.json();
+          alert(data.error || "无法停止网格机器人。");
+        } else {
+          alert("无法停止网格机器人。");
+        }
       }
     } catch (err) {
       console.error(err);
@@ -117,13 +186,21 @@ export default function App() {
 
   const handleConfigureBot = async (id: string, config: any) => {
     try {
-      const res = await fetch(`/api/bots/configure/${id}`, {
+      const res = await secureFetch(`/api/bots/configure/${id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
       });
       if (res.ok) {
         fetchBots();
+      } else {
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await res.json();
+          alert(data.error || "配置网格机器人失败。");
+        } else {
+          alert("配置网格机器人失败。");
+        }
       }
     } catch (err) {
       console.error(err);
@@ -136,6 +213,10 @@ export default function App() {
   const totalUnrealizedProfit = bots.reduce((sum, b) => sum + b.unrealizedProfitUsd, 0);
   const activeBotsCount = bots.filter((b) => b.status === "running").length;
   const portfolioReturnPercent = totalInvestment > 0 ? (totalRealizedProfit / totalInvestment) * 100 : 0;
+
+  if (!token || !role) {
+    return <AegisLogin onLoginSuccess={handleLoginSuccess} />;
+  }
 
   return (
     <div className="min-h-screen bg-[#0A0A0B] text-[#E0E0E0] flex flex-col font-sans selection:bg-[#00FF66]/30 selection:text-[#00FF66]">
@@ -161,6 +242,15 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
+            {/* User display */}
+            <div className="bg-[#0A0A0B] border border-[#2A2A2C] p-2 px-3 rounded-none text-[10px] font-mono flex items-center gap-1.5 font-black uppercase text-zinc-300">
+              <Fingerprint className="h-3.5 w-3.5 text-[#00FF66]" />
+              <span>{username}</span>
+              <span className={`text-[8px] px-1 py-0.2 rounded-none ${role === 'admin' ? 'bg-[#FF3333]/15 text-[#FF3333] border border-[#FF3333]/30' : role === 'operator' ? 'bg-[#3399FF]/15 text-[#3399FF] border border-[#3399FF]/30' : 'bg-zinc-800 text-zinc-400'}`}>
+                {role}
+              </span>
+            </div>
+
             {/* Status light */}
             <div className="bg-[#0A0A0B] border border-[#2A2A2C] p-2 px-3 rounded-none text-[10px] font-mono flex items-center gap-2 font-black uppercase">
               <span className="relative flex h-2 w-2">
@@ -176,6 +266,15 @@ export default function App() {
               <span className="text-zinc-500">HOST LOAD:</span>
               <span className="text-[#00FF66]">{activeBotsCount * 4 + 8}% CPU</span>
             </div>
+
+            {/* Logout button */}
+            <button
+              onClick={handleLogout}
+              className="bg-[#FF3333]/10 hover:bg-[#FF3333]/20 text-[#FF3333] border border-[#FF3333]/30 p-2 px-3 rounded-none text-[10px] font-mono flex items-center gap-1.5 font-black uppercase cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              LOGOUT
+            </button>
           </div>
         </div>
       </header>
@@ -314,6 +413,19 @@ export default function App() {
           >
             <ListCollapse className="h-4 w-4 text-[#00FF66]" />
             JOURNAL ENTRIES (成交流水)
+          </button>
+
+          <button
+            onClick={() => setActiveTab("security_logs")}
+            className={`py-3.5 px-5 rounded-none font-black shrink-0 transition flex items-center gap-2 cursor-pointer touch-manipulation min-h-[44px] uppercase font-display tracking-wider border-b-2 text-xs select-none ${
+              activeTab === "security_logs"
+                ? "bg-[#0A0A0B] text-[#00FF66] border-b-[#00FF66] border border-[#2A2A2C] border-b-2"
+                : "text-[#666666] hover:text-white border border-transparent"
+            }`}
+            id="tab-security-logs"
+          >
+            <Shield className="h-4 w-4 text-[#00FF66]" />
+            SECURITY LEDGER (数字安全审计)
           </button>
         </div>
       </nav>
@@ -491,6 +603,12 @@ export default function App() {
             {activeTab === "logs" && (
               <div className="space-y-6">
                 <LogAuditor />
+              </div>
+            )}
+
+            {activeTab === "security_logs" && (
+              <div className="space-y-6">
+                <SecurityLogs secureFetch={secureFetch} />
               </div>
             )}
           </>
