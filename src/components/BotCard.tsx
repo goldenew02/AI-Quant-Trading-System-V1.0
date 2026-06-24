@@ -50,9 +50,13 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
   const handleRollback = async (version: string) => {
     try {
       setRollingId(version);
+      const token = localStorage.getItem("aegis_token");
       const res = await fetch(`/api/bots/rollback/${bot.id}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({ version })
       });
       if (res.ok) {

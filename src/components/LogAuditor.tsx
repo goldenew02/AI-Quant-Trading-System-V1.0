@@ -33,7 +33,12 @@ export default function LogAuditor() {
     try {
       setLoading(true);
       const queryParams = new URLSearchParams(filters).toString();
-      const res = await fetch(`/api/logs?${queryParams}`);
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch(`/api/logs?${queryParams}`, {
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
@@ -51,7 +56,8 @@ export default function LogAuditor() {
   }, [filters]);
 
   const handleDownload = () => {
-    window.open("/api/logs/download", "_blank");
+    const token = localStorage.getItem("aegis_token") || "";
+    window.open(`/api/logs/download?token=${encodeURIComponent(token)}`, "_blank");
   };
 
   const handleRunVerify = async () => {
@@ -59,7 +65,13 @@ export default function LogAuditor() {
       setIntegrityStatus("verifying");
       setAuditLog(prev => [...prev, `[${new Date().toLocaleTimeString()}] INITIATING LEDGER SCAN: Verifying SHA-256 hash sequence of transaction chain...`]);
       
-      const res = await fetch("/api/logs/verify", { method: "POST" });
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/logs/verify", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       const data = await res.json();
       
       setTimeout(() => {
@@ -90,7 +102,13 @@ export default function LogAuditor() {
 
   const handleTamper = async () => {
     try {
-      const res = await fetch("/api/logs/tamper", { method: "POST" });
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/logs/tamper", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       const data = await res.json();
       setAuditLog(prev => [
         ...prev,
@@ -106,7 +124,13 @@ export default function LogAuditor() {
 
   const handleRestore = async () => {
     try {
-      const res = await fetch("/api/logs/restore", { method: "POST" });
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/logs/restore", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       const data = await res.json();
       setAuditLog(prev => [
         ...prev,

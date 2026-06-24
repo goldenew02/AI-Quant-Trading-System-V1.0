@@ -40,7 +40,12 @@ export default function RiskControl() {
   const fetchRiskSettings = async () => {
     try {
       setLoading(true);
-      const res = await fetch("/api/risk");
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/risk", {
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
@@ -65,9 +70,13 @@ export default function RiskControl() {
     try {
       setSaving(true);
       setMessage(null);
+      const token = localStorage.getItem("aegis_token");
       const res = await fetch("/api/risk", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify(settings),
       });
       const contentType = res.headers.get("content-type");
@@ -104,14 +113,46 @@ export default function RiskControl() {
     setShowMfaModal(true);
   };
 
-  const handleVerifyMfaAndToggle = () => {
-    if (mfaCode === "123456" || mfaCode === "666666") {
-      handleInputChange("globalKillSwitch", mfaAction);
-      setShowMfaModal(false);
-      setMessage({ text: mfaAction ? "✓ 警告：全局一键熔断已生效！所有成交通道已阻断。" : "✓ 全局熔断已解除。系统恢复正常对冲交易。", isError: false });
-      setTimeout(() => setMessage(null), 5000);
-    } else {
-      alert("安全代码错误！请输入 123456。");
+  const handleVerifyMfaAndToggle = async () => {
+    try {
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/auth/verify-totp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ code: mfaCode, action: "TOGGLE_GLOBAL_KILL_SWITCH" }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        const targetKillSwitch = mfaAction;
+        const updatedSettings = { ...settings, globalKillSwitch: targetKillSwitch };
+        setSettings(updatedSettings);
+
+        const saveRes = await fetch("/api/risk", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify(updatedSettings),
+        });
+
+        if (saveRes.ok) {
+          setShowMfaModal(false);
+          setMessage({ text: targetKillSwitch ? "✓ 警告：全局一键熔断已生效！所有成交通道已阻断。" : "✓ 全局熔断已解除。系统恢复正常对冲交易。", isError: false });
+          setTimeout(() => setMessage(null), 5000);
+        } else {
+          const saveErr = await saveRes.json();
+          alert(saveErr.error || "MFA authorized but failed to persist risk settings.");
+        }
+      } else {
+        alert(data.error || "MFA validation failed. Unauthorized switch.");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("MFA verification connection error.");
     }
   };
 
@@ -470,9 +511,9 @@ export default function RiskControl() {
               You are toggling a high-impact global switch. Please input the Google Authenticator 6-digit dynamic passcode to authorize the operation.
             </p>
             
-            {/* Password simulation hint */}
-            <div className="bg-[#0A0A0B] p-2.5 border border-[#2A2A2C] text-[10px] text-zinc-550 mb-4 uppercase">
-              Simulated dynamic MFA code hint: <strong className="text-[#00FF66]">123456</strong> or <strong className="text-[#00FF66]">666666</strong>
+            {/* Real TOTP dynamic hint */}
+            <div className="bg-[#0A0A0B] p-2.5 border border-zinc-800 text-[10px] text-zinc-450 mb-4 uppercase leading-relaxed">
+              Enter the 6-digit TOTP token from Google Authenticator. Active secret: <strong className="text-[#00FF66] select-all">KVKVE42KGBEGKVKV</strong> (for administrator).
             </div>
 
             <input

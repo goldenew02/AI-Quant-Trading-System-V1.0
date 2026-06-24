@@ -25,7 +25,12 @@ export default function SystemMetrics() {
   const fetchMetrics = async () => {
     try {
       setLoading(true);
-      const res = await fetch("/api/overview");
+      const token = localStorage.getItem("aegis_token");
+      const res = await fetch("/api/overview", {
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
       if (res.status === 429) {
         const data = await res.json();
         setMetrics(prev => ({
@@ -83,9 +88,14 @@ export default function SystemMetrics() {
       setSimulating(true);
       setOverloadMessage("Sending 130 high-frequency parallel requests to overload the safety circuits...");
       
-      // Perform 130 requests concurrently
+      const token = localStorage.getItem("aegis_token") || "";
+      // Perform 130 requests concurrently with valid JWT signature
       const requests = Array.from({ length: 130 }).map(() =>
-        fetch("/api/overview").catch(() => null)
+        fetch("/api/overview", {
+          headers: {
+            "Authorization": `Bearer ${token}`
+          }
+        }).catch(() => null)
       );
       
       await Promise.all(requests);

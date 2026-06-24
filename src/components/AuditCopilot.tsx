@@ -18,9 +18,13 @@ export default function AuditCopilot({ activeBotId, backtestData }: AuditCopilot
       setLoading(true);
       setResponse(null);
 
+      const token = localStorage.getItem("aegis_token");
       const res = await fetch("/api/gemini/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({
           prompt: userInput,
           botId: activeBotId,

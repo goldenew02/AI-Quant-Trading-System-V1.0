@@ -13,135 +13,17 @@ app.use(express.json());
 
 const PORT = 3000;
 
-// Shared In-Memory State
-let riskSettings: RiskSettings = {
-  maxDailyDrawdown: 8.0, // 8% limit
-  maxAccountDrawdown: 15.0, // 15% limit
-  globalKillSwitch: false,
-  maxLeverageLimit: 10, // 10x limit
-  dailyLossLimitUSD: 800, // $800 limit
-  restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
-  singleAssetMaxAllocationPercent: 40,
-  industryCryptoMaxPercent: 60,
-  autoMeltDrawdownThreshold: 12.0,
-  autoMeltSharpeThreshold: 0.8,
-};
+// Shared State via AegisDB Instance
+import { dbInstance, verifyPassword, verifyTOTP } from "./server/db";
 
-// Audit Point 1.1: Interactive Brokers ARM Bypass Connection Mode
-// Defaulting to "web_api_proxy" (Web REST/WebSocket proxy) as recommended to avoid ARM64 Gateway limitation
-let ibConnectionMode: 'gateway' | 'web_api_proxy' = "web_api_proxy";
+const db = dbInstance.get();
+const bots = db.bots;
+const tradeLogs = db.tradeLogs;
+const riskSettings = db.riskSettings;
+const activeSessions = db.sessions;
+const securityAuditLogs = db.securityAuditLogs;
 
-// Default Bots Setup (Exactly 4 grid bots, configurable & run independently)
-let bots: BotConfig[] = [
-  {
-    id: "bot_1",
-    name: "Binance Spot BTC Grid",
-    isEnabled: true,
-    broker: "Binance",
-    symbol: "BTC/USDT",
-    type: "spot_grid",
-    direction: "neutral",
-    rangeMin: 60000,
-    rangeMax: 70000,
-    gridCount: 10,
-    investment: 2000,
-    leverage: 1,
-    stopLoss: 59000,
-    takeProfit: 71000,
-    status: "running",
-    profitUsd: 145.20,
-    profitPercent: 7.26,
-    unrealizedProfitUsd: 22.40,
-    tradesCount: 18,
-    grids: generateGrids(60000, 70000, 10, 64200, 2000 / 10),
-    entryPrice: 63500,
-    currentPrice: 64200,
-    lastUpdated: new Date().toISOString(),
-    timezone: "UTC",
-    cgroupsCpuLimit: "Max 50% CPU",
-    cgroupsMemoryLimit: "Max 3G RAM"
-  },
-  {
-    id: "bot_2",
-    name: "OKX Futures ETH Long",
-    isEnabled: true,
-    broker: "OKX",
-    symbol: "ETH/USDT",
-    type: "futures_grid",
-    direction: "long",
-    rangeMin: 3100, // fixed price bound scale from ETH typicals
-    rangeMax: 3600,
-    gridCount: 8,
-    investment: 1000,
-    leverage: 5,
-    stopLoss: 2900,
-    takeProfit: 3800,
-    status: "running",
-    profitUsd: 84.50,
-    profitPercent: 8.45,
-    unrealizedProfitUsd: -12.30,
-    tradesCount: 12,
-    grids: generateGrids(3100, 3600, 8, 3350, 1000 * 5 / 8),
-    entryPrice: 3300,
-    currentPrice: 3350,
-    lastUpdated: new Date().toISOString(),
-    timezone: "UTC",
-    cgroupsCpuLimit: "Max 50% CPU",
-    cgroupsMemoryLimit: "Max 3G RAM"
-  },
-  {
-    id: "bot_3",
-    name: "Tiger US stock NVDA Grid",
-    isEnabled: false,
-    broker: "Tiger",
-    symbol: "NVDA",
-    type: "spot_grid",
-    direction: "neutral",
-    rangeMin: 110,
-    rangeMax: 140,
-    gridCount: 6,
-    investment: 3000,
-    leverage: 1,
-    status: "stopped",
-    profitUsd: 0.00,
-    profitPercent: 0.00,
-    unrealizedProfitUsd: 0.00,
-    tradesCount: 0,
-    grids: generateGrids(110, 140, 6, 125, 3000 / 6),
-    entryPrice: 125,
-    currentPrice: 125,
-    lastUpdated: new Date().toISOString(),
-    timezone: "America/New_York",
-    cgroupsCpuLimit: "Uncapped",
-    cgroupsMemoryLimit: "Uncapped"
-  },
-  {
-    id: "bot_4",
-    name: "Longbridge HK stock TSLA Grid",
-    isEnabled: false,
-    broker: "Longbridge",
-    symbol: "TSLA",
-    type: "spot_grid",
-    direction: "neutral",
-    rangeMin: 160,
-    rangeMax: 200,
-    gridCount: 8,
-    investment: 1500,
-    leverage: 1,
-    status: "stopped",
-    profitUsd: 52.10,
-    profitPercent: 3.47,
-    unrealizedProfitUsd: 4.80,
-    tradesCount: 5,
-    grids: generateGrids(160, 200, 8, 182, 1500 / 8),
-    entryPrice: 180,
-    currentPrice: 182,
-    lastUpdated: new Date().toISOString(),
-    timezone: "Asia/Hong_Kong",
-    cgroupsCpuLimit: "Uncapped",
-    cgroupsMemoryLimit: "Uncapped"
-  }
-];
+let ibConnectionMode: 'gateway' | 'web_api_proxy' = db.ibConnectionMode;
 
 // Helper to construct Grid Lines distribution
 function generateGrids(min: number, max: number, count: number, currentPrice: number, gridFund: number): GridLine[] {
@@ -161,7 +43,7 @@ function generateGrids(min: number, max: number, count: number, currentPrice: nu
 }
 
 // Log Hash Chain State & Functions
-let lastLogHash = "0000000000000000000000000000000000000000000000000000000000000000";
+let lastLogHash = db.tradeLogs.length > 0 ? db.tradeLogs[0].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
 
 function computeLogHash(log: TradeLog, prevHash: string): string {
   const content = `${log.id}-${log.timestamp}-${log.type}-${log.price}-${log.amount}-${log.total}-${prevHash}`;
@@ -169,160 +51,36 @@ function computeLogHash(log: TradeLog, prevHash: string): string {
 }
 
 function rechainLogs() {
-  let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
-  for (let i = tradeLogs.length - 1; i >= 0; i--) {
-    tradeLogs[i].previousHash = prevHash;
-    tradeLogs[i].currentHash = computeLogHash(tradeLogs[i], prevHash);
-    prevHash = tradeLogs[i].currentHash!;
-  }
-  lastLogHash = prevHash;
-}
-
-// --- SECURE AUTHENTICATION & SECURITY AUDIT SYSTEM ---
-export interface SecurityAuditEntry {
-  id: string;
-  timestamp: string;
-  username: string;
-  role: 'admin' | 'operator' | 'viewer';
-  action: string;
-  target: string;
-  details: string;
-  ipAddress: string;
-  previousHash: string;
-  currentHash: string;
-}
-
-interface Session {
-  token: string;
-  username: string;
-  role: 'admin' | 'operator' | 'viewer';
-  expiresAt: number;
-}
-
-let activeSessions: Session[] = [];
-let securityAuditLogs: SecurityAuditEntry[] = [];
-
-function computeSecurityHash(log: SecurityAuditEntry, prevHash: string): string {
-  const content = `${log.id}|${log.timestamp}|${log.username}|${log.role}|${log.action}|${log.target}|${log.details}|${log.ipAddress}|${prevHash}`;
-  return crypto.createHash("sha256").update(content).digest("hex");
+  dbInstance.rechainTradeLogs();
 }
 
 function appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
-  const prev = securityAuditLogs.length > 0 ? securityAuditLogs[0].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
-  const entry: SecurityAuditEntry = {
-    id: "sec_" + Math.random().toString(36).substring(2, 11),
-    timestamp: new Date().toISOString(),
-    username,
-    role,
-    action,
-    target,
-    details,
-    ipAddress: ip,
-    previousHash: prev,
-    currentHash: ""
-  };
-  entry.currentHash = computeSecurityHash(entry, prev);
-  securityAuditLogs.unshift(entry);
+  dbInstance.appendSecurityLog(username, role, action, target, details, ip);
 }
 
-// Pre-seed security audit events representing secure compliance boot checks
-appendSecurityLog("system", "admin", "INTEGRITY_CHECK", "HASH_CHAIN_DB", "Verified trade records cryptographic sequence consistency. Chains matches. Status: SAFE.");
-appendSecurityLog("system", "admin", "COMPLIANCE_BOOT", "FIREWALL_RULES", "Enforced loopback listener restriction for node executor. Oracle ARM isolated.");
-appendSecurityLog("system", "admin", "COMPLIANCE_BOOT", "ROOT_DAEMON", "Enrolled supervisor watchdog processes under pid 4210.");
-
-// Pre-seed some trade logs for initial visualization
-let tradeLogs: TradeLog[] = [
-  {
-    id: "tx_1",
-    botId: "bot_1",
-    botName: "Binance Spot BTC Grid",
-    broker: "Binance",
-    symbol: "BTC/USDT",
-    timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
-    type: "buy",
-    price: 63800,
-    amount: 0.0031,
-    total: 197.78,
-    pnl: 0
-  },
-  {
-    id: "tx_2",
-    botId: "bot_1",
-    botName: "Binance Spot BTC Grid",
-    broker: "Binance",
-    symbol: "BTC/USDT",
-    timestamp: new Date(Date.now() - 3600000 * 2.5).toISOString(),
-    type: "sell",
-    price: 64800,
-    amount: 0.0031,
-    total: 200.88,
-    pnl: 3.10
-  },
-  {
-    id: "tx_3",
-    botId: "bot_2",
-    botName: "OKX Futures ETH Long",
-    broker: "OKX",
-    symbol: "ETH/USDT",
-    timestamp: new Date(Date.now() - 3600000 * 2).toISOString(),
-    type: "buy",
-    price: 3320,
-    amount: 0.15,
-    total: 498.00,
-    pnl: 0
-  },
-  {
-    id: "tx_4",
-    botId: "bot_2",
-    botName: "OKX Futures ETH Long",
-    broker: "OKX",
-    symbol: "ETH/USDT",
-    timestamp: new Date(Date.now() - 3600000 * 0.8).toISOString(),
-    type: "sell",
-    price: 3370,
-    amount: 0.15,
-    total: 505.50,
-    pnl: 7.50
-  },
-  {
-    id: "tx_5",
-    botId: "bot_4",
-    botName: "Longbridge HK stock TSLA Grid",
-    broker: "Longbridge",
-    symbol: "TSLA",
-    timestamp: new Date(Date.now() - 3600000 * 12).toISOString(),
-    type: "buy",
-    price: 178,
-    amount: 1.0,
-    total: 178.00,
-    pnl: 0
-  }
-];
-
-// Re-chain trade logs cryptographic chain on startup
-rechainLogs();
-
-// Initialize Bots with Process Sandbox and Version History Properties
+// Initialize Bots with Process Sandbox and Version History Properties if needed
 bots.forEach((bot, index) => {
-  bot.pid = 4210 + index;
-  bot.memoryHeapMb = Math.round((95 + index * 12 + Math.random() * 5) * 10) / 10;
-  bot.cpuAffinity = `CPU Core ${index % 4}`;
-  bot.version = "1.0.0";
-  bot.configHistory = [
-    {
-      version: "1.0.0",
-      timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-      rangeMin: bot.rangeMin,
-      rangeMax: bot.rangeMax,
-      gridCount: bot.gridCount,
-      investment: bot.investment,
-      leverage: bot.leverage,
+  if (bot.pid === undefined) {
+    bot.pid = 4210 + index;
+    bot.memoryHeapMb = Math.round((95 + index * 12 + Math.random() * 5) * 10) / 10;
+    bot.cpuAffinity = `CPU Core ${index % 4}`;
+    bot.version = "1.0.0";
+    bot.configHistory = [
+      {
+        version: "1.0.0",
+        timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
+        rangeMin: bot.rangeMin,
+        rangeMax: bot.rangeMax,
+        gridCount: bot.gridCount,
+        investment: bot.investment,
+        leverage: bot.leverage,
+      }
+    ];
+    if (bot.type === "futures_grid") {
+      const directionFactor = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
+      bot.liquidationPrice = Math.round(bot.entryPrice * (1 - (directionFactor * 0.8) / bot.leverage) * 100) / 100;
+      bot.maintenanceMargin = Math.round(bot.investment * 0.05 * 100) / 100;
     }
-  ];
-  if (bot.type === "futures_grid") {
-    const directionFactor = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
-    bot.liquidationPrice = Math.round(bot.entryPrice * (1 - (directionFactor * 0.8) / bot.leverage) * 100) / 100;
-    bot.maintenanceMargin = Math.round(bot.investment * 0.05 * 100) / 100;
   }
 });
 
@@ -467,6 +225,7 @@ setInterval(() => {
 
   });
   rechainLogs();
+  dbInstance.save();
 }, 5000);
 
 // Lazily initialising Gemini AI SDK to prevent startup crashes if GEMINI_API_KEY is not defined
@@ -542,29 +301,23 @@ function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
 
 app.post("/api/auth/login", (req, res) => {
   const { username, password } = req.body;
-  let role: 'admin' | 'operator' | 'viewer' | null = null;
+  const user = db.users.find(u => u.username === username && u.isActive);
 
-  if (username === "admin" && password === "aegisquant2026") {
-    role = "admin";
-  } else if (username === "operator" && password === "operator2026") {
-    role = "operator";
-  } else if (username === "viewer" && password === "viewer2026") {
-    role = "viewer";
-  }
-
-  if (!role) {
+  if (!user || !verifyPassword(password, user.passwordHash)) {
     appendSecurityLog(username || "unknown", "viewer", "LOGIN_FAILED", "USER_AUTH", `Failed login attempt with username: ${username}`, req.ip);
     return res.status(401).json({ error: "Invalid username or password. Please use correct credentials." });
   }
 
+  const role = user.role;
   const token = crypto.randomBytes(24).toString("hex");
-  const session: Session = {
+  const session = {
     token,
     username,
     role,
     expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
   };
   activeSessions.push(session);
+  dbInstance.save();
 
   appendSecurityLog(username, role, "LOGIN_SUCCESS", "USER_AUTH", `Successfully logged in. Session token generated.`, req.ip);
   res.json({ success: true, token, role, username });
@@ -604,13 +357,20 @@ app.post("/api/auth/verify-totp", (req, res) => {
   const session = activeSessions.find(s => s.token === token && s.expiresAt > Date.now());
   if (!session) return res.status(401).json({ error: "Session expired" });
 
-  // P0-4 compliance check - strictly server-side verification of dynamic codes
-  if (code === "666666" || code === "888888" || code === "918273" || code === "123456") {
+  const user = db.users.find(u => u.username === session.username);
+  if (!user) {
+    return res.status(404).json({ error: "User profile not found." });
+  }
+
+  // Standard Dynamic TOTP Verification (RFC 6238 compliant)
+  const isTotpValid = verifyTOTP(user.totpSecret, code);
+
+  if (isTotpValid) {
     appendSecurityLog(session.username, session.role, "MFA_VERIFIED", "MFA_GATE", `MFA code verified for high-impact action: ${action}. Code matched.`, req.ip);
     return res.json({ success: true, message: "MFA code authorized successfully on backend." });
   } else {
     appendSecurityLog(session.username, session.role, "MFA_FAILED", "MFA_GATE", `MFA code verification FAILED for high-impact action: ${action}. Entered code: ${code}. ACCESS BLOCK.`, req.ip);
-    return res.status(400).json({ error: "Invalid Dynamic MFA Code. Authorized codes are 123456, 666666, 888888 or 918273." });
+    return res.status(400).json({ error: "Invalid Dynamic MFA Code. Please consult your Google Authenticator setup guidelines." });
   }
 });
 
@@ -736,6 +496,7 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
     delete bots[botIndex].maintenanceMargin;
   }
 
+  dbInstance.save();
   res.json({ success: true, bot: bots[botIndex] });
 });
 
@@ -751,6 +512,7 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), (req: any, r
     bots[botIndex].entryPrice = bots[botIndex].currentPrice;
     bots[botIndex].lastUpdated = new Date().toISOString();
     appendSecurityLog(req.user.username, req.user.role, "BOT_START", id, `Activated bot: ${bots[botIndex].name}`, req.ip);
+    dbInstance.save();
     res.json({ success: true, bot: bots[botIndex] });
   } else {
     res.status(404).json({ error: "Bot not found" });
@@ -765,6 +527,7 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), (req: any, re
     bots[botIndex].isEnabled = false;
     bots[botIndex].lastUpdated = new Date().toISOString();
     appendSecurityLog(req.user.username, req.user.role, "BOT_STOP", id, `Deactivated bot: ${bots[botIndex].name}`, req.ip);
+    dbInstance.save();
     res.json({ success: true, bot: bots[botIndex] });
   } else {
     res.status(404).json({ error: "Bot not found" });
@@ -780,7 +543,9 @@ app.post("/api/ib-mode", requireAuth(['admin', 'operator']), (req: any, res) => 
   const { mode } = req.body;
   if (mode === "gateway" || mode === "web_api_proxy") {
     ibConnectionMode = mode;
+    db.ibConnectionMode = mode;
     appendSecurityLog(req.user.username, req.user.role, "IB_MODE_CHANGE", "Interactive Brokers", `Set connection mode to: ${mode}`, req.ip);
+    dbInstance.save();
     res.json({ success: true, mode: ibConnectionMode });
   } else {
     res.status(400).json({ error: "Invalid connection mode." });
@@ -800,6 +565,7 @@ app.post("/api/bots/affinity/:id", requireAuth(['admin', 'operator']), (req: any
     if (timezone !== undefined) bots[botIndex].timezone = timezone;
     bots[botIndex].lastUpdated = new Date().toISOString();
     appendSecurityLog(req.user.username, req.user.role, "RESOURCE_CGROUP_LIMIT", id, `Configured CPU: ${cpuAffinity || bots[botIndex].cpuAffinity}, Cgroups CPU: ${cgroupsCpuLimit || bots[botIndex].cgroupsCpuLimit}, Mem: ${cgroupsMemoryLimit || bots[botIndex].cgroupsMemoryLimit}`, req.ip);
+    dbInstance.save();
     res.json({ success: true, bot: bots[botIndex] });
   } else {
     res.status(404).json({ error: "Bot not found" });
@@ -812,15 +578,16 @@ app.get("/api/risk", (req, res) => {
 });
 
 app.post("/api/risk", requireAuth(['admin']), (req: any, res) => {
-  riskSettings = { ...riskSettings, ...req.body };
-  if (riskSettings.globalKillSwitch) {
+  Object.assign(db.riskSettings, req.body);
+  if (db.riskSettings.globalKillSwitch) {
     bots.forEach((bot) => {
       bot.status = "stopped_by_risk";
       bot.isEnabled = false;
     });
   }
-  appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${riskSettings.maxLeverageLimit}x, drawdown limit ${riskSettings.maxAccountDrawdown}%, kill switch status: ${riskSettings.globalKillSwitch}`, req.ip);
-  res.json({ success: true, settings: riskSettings });
+  appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);
+  dbInstance.save();
+  res.json({ success: true, settings: db.riskSettings });
 });
 
 // 4. Trade Logs Endpoint
@@ -862,6 +629,7 @@ app.post("/api/logs/tamper", requireAuth(['admin']), (req: any, res) => {
     tradeLogs[targetIdx].price = Math.round(originalPrice * 1.08 * 100) / 100;
     tradeLogs[targetIdx].total = Math.round(tradeLogs[targetIdx].amount * tradeLogs[targetIdx].price * 100) / 100;
     appendSecurityLog(req.user.username, req.user.role, "TAMPER_SIMULATION", tradeLogs[targetIdx].id, `SIMULATED TAMPERING: Modified price of tx ${tradeLogs[targetIdx].id} from $${originalPrice} to $${tradeLogs[targetIdx].price}.`, req.ip);
+    dbInstance.save();
     res.json({
       success: true,
       message: `SIMULATED TAMPERING SUCCESSFUL: Altered transaction [${tradeLogs[targetIdx].id}] price from $${originalPrice} to $${tradeLogs[targetIdx].price}.`,
@@ -905,6 +673,7 @@ app.post("/api/logs/verify", (req, res) => {
 app.post("/api/logs/restore", requireAuth(['admin']), (req: any, res) => {
   rechainLogs();
   appendSecurityLog(req.user.username, req.user.role, "RESTORE_VERIFIED_BACKUP", "HASH_CHAIN_DB", "Triggered transaction cryptographic hash chain restoration from secure back-up archives.", req.ip);
+  dbInstance.save();
   res.json({
     success: true,
     message: "RESTORE SUCCESSFUL: Cryptographic hash chain successfully repaired from secure hot-swap immutable logs backup.",
@@ -935,6 +704,7 @@ app.post("/api/bots/rollback/:id", requireAuth(['admin']), (req: any, res) => {
       );
       bot.lastUpdated = new Date().toISOString();
       appendSecurityLog(req.user.username, req.user.role, "BOT_ROLLBACK", id, `Rolled back bot config to version ${version}. Settings restored.`, req.ip);
+      dbInstance.save();
       res.json({ success: true, bot });
     } else {
       res.status(404).json({ error: "Specified configuration version not found in history archive." });

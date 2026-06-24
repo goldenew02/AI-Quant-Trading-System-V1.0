@@ -38,9 +38,13 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       setResult(null);
       setAiReport(null);
 
+      const token = localStorage.getItem("aegis_token");
       const res = await fetch("/api/backtest", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({
           ...config,
           rangeMin: Number(config.rangeMin),
@@ -84,9 +88,13 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       setAiLoading(true);
       setAiReport(null);
 
+      const token = localStorage.getItem("aegis_token");
       const res = await fetch("/api/gemini/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({
           prompt: `我运行了一份量化网格回测：
 券商/交易所: ${config.broker}

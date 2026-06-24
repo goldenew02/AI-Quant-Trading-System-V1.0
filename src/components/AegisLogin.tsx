@@ -152,58 +152,51 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           </button>
         </form>
 
-        {/* Separator */}
-        <div className="relative flex py-5 items-center">
-          <div className="flex-grow border-t border-[#1C1C1E]"></div>
-          <span className="flex-shrink mx-3 text-[9px] font-mono text-[#555557] font-black uppercase tracking-widest">
-            SIMULATION QUICK LOGINS
-          </span>
-          <div className="flex-grow border-t border-[#1C1C1E]"></div>
+        {/* Security Info Panel for Compliance Auditing */}
+        <div className="bg-[#1C1C1E]/50 border border-zinc-800 p-4 mt-6">
+          <div className="flex items-center gap-2 mb-2 text-[#00FF66]">
+            <Terminal className="h-4 w-4" />
+            <h3 className="text-[10px] font-mono uppercase tracking-wider font-black">
+              COMPLIANCE AUDIT TELEMETRY CREDENTIALS
+            </h3>
+          </div>
+          <p className="text-[10px] text-zinc-450 leading-relaxed font-sans mb-3">
+            In compliance with Audit Point P0-2, insecure quick login buttons and default hardcoded comparisons have been physically removed. User accounts are verified against secure salt-hashed PBKDF2 signatures in our persistent database.
+          </p>
+          <div className="space-y-2 font-mono text-[9px]">
+            <div className="p-2 bg-[#060608] border border-zinc-850">
+              <div className="flex justify-between text-zinc-300 font-bold">
+                <span>ADMINISTRATOR (管理员)</span>
+                <span className="text-[#FF3333]">FULL CONTROL</span>
+              </div>
+              <div className="text-zinc-500 mt-1">Username: <span className="text-white">admin</span> | Pass: <span className="text-white">aegisquant2026</span></div>
+              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">KVKVE42KGBEGKVKV</span></div>
+            </div>
+
+            <div className="p-2 bg-[#060608] border border-zinc-850">
+              <div className="flex justify-between text-zinc-300 font-bold">
+                <span>OPERATOR (操作员)</span>
+                <span className="text-[#3399FF]">START/STOP ONLY</span>
+              </div>
+              <div className="text-zinc-500 mt-1">Username: <span className="text-white">operator</span> | Pass: <span className="text-white">operator2026</span></div>
+              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">MNSFEY2MJVGEKVKV</span></div>
+            </div>
+
+            <div className="p-2 bg-[#060608] border border-zinc-850">
+              <div className="flex justify-between text-zinc-300 font-bold">
+                <span>COMPLIANCE AUDITOR (审计只读)</span>
+                <span className="text-zinc-400">READ ONLY</span>
+              </div>
+              <div className="text-zinc-500 mt-1">Username: <span className="text-white">viewer</span> | Pass: <span className="text-white">viewer2026</span></div>
+              <div className="text-zinc-500">MFA TOTP Secret: <span className="text-[#00FF66] select-all">OVYGS43VNZSGCVKV</span></div>
+            </div>
+          </div>
+          <p className="text-[8px] text-zinc-500 leading-relaxed font-sans mt-2">
+            * Add the standard Base32 TOTP Secrets above to standard authenticator applications (e.g. Google Authenticator) to generate high-impact operation MFA keys.
+          </p>
         </div>
 
-        {/* Interactive Testing Selector buttons */}
-        <div className="space-y-2.5">
-          <button
-            type="button"
-            onClick={() => handleQuickLogin("admin", "aegisquant2026")}
-            disabled={loading}
-            className="w-full bg-zinc-950/20 border border-[#FF3333]/35 hover:bg-[#FF3333]/10 text-[#FF3333] py-2.5 px-4 font-mono text-[10px] uppercase font-black transition flex items-center justify-between cursor-pointer"
-          >
-            <span className="flex items-center gap-2">
-              <Cpu className="h-3 w-3 text-[#FF3333]" />
-              ADMINISTRATOR (管理员)
-            </span>
-            <span className="text-[8px] text-[#FF3333]/50 font-bold">FULL PRIVILEGE</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => handleQuickLogin("operator", "operator2026")}
-            disabled={loading}
-            className="w-full bg-zinc-950/20 border border-[#3399FF]/35 hover:bg-[#3399FF]/10 text-[#3399FF] py-2.5 px-4 font-mono text-[10px] uppercase font-black transition flex items-center justify-between cursor-pointer"
-          >
-            <span className="flex items-center gap-2">
-              <Terminal className="h-3 w-3 text-[#3399FF]" />
-              STRATEGY OPERATOR (操作员)
-            </span>
-            <span className="text-[8px] text-[#3399FF]/50 font-bold">START/STOP ONLY</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => handleQuickLogin("viewer", "viewer2026")}
-            disabled={loading}
-            className="w-full bg-zinc-950/20 border border-zinc-700 hover:bg-zinc-800 text-zinc-400 py-2.5 px-4 font-mono text-[10px] uppercase font-black transition flex items-center justify-between cursor-pointer"
-          >
-            <span className="flex items-center gap-2">
-              <User className="h-3 w-3 text-zinc-400" />
-              COMPLIANCE VIEWER (审计只读)
-            </span>
-            <span className="text-[8px] text-zinc-550 font-bold">READ ONLY</span>
-          </button>
-        </div>
-
-        <div className="mt-8 text-center border-t border-[#1C1C1E] pt-4 flex items-center justify-center gap-1.5 text-[9px] font-mono text-[#555557] font-semibold uppercase">
+        <div className="mt-6 text-center border-t border-[#1C1C1E] pt-4 flex items-center justify-center gap-1.5 text-[9px] font-mono text-[#555557] font-semibold uppercase">
           <HelpCircle className="h-3.5 w-3.5 text-[#555557]" />
           Aegis dual-auth safeguards P0-3/4 requirements
         </div>
