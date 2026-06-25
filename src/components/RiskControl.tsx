@@ -1,6 +1,18 @@
 import React, { useState, useEffect } from "react";
 import { AlertOctagon, HelpCircle, Save, ToggleLeft, ToggleRight, Loader, CheckCircle2, ShieldAlert } from "lucide-react";
 import { RiskSettings } from "../types";
+import { apiFetch } from "../lib/api";
+
+function stableStringify(obj: any): string {
+  return JSON.stringify(obj, Object.keys(obj).sort());
+}
+
+async function computeSha256(text: string): Promise<string> {
+  const msgBuffer = new TextEncoder().encode(text);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+}
 
 export default function RiskControl() {
   const [settings, setSettings] = useState<RiskSettings>({
@@ -40,12 +52,7 @@ export default function RiskControl() {
   const fetchRiskSettings = async () => {
     try {
       setLoading(true);
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/risk", {
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
-      });
+      const res = await apiFetch("/api/risk");
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
@@ -92,18 +99,39 @@ export default function RiskControl() {
   const handleVerifyMfaAndToggle = async () => {
     try {
       setSaving(true);
-      const token = localStorage.getItem("aegis_token");
       
+      const updatedSettings = mfaActionType === 'TOGGLE_KILL_SWITCH' 
+        ? { ...settings, globalKillSwitch: mfaAction }
+        : settings;
+
+      // Build stable payload mapping for cryptographically binding the body hash (P0-6)
+      const payload = {
+        maxDailyDrawdown: Number(updatedSettings.maxDailyDrawdown),
+        maxAccountDrawdown: Number(updatedSettings.maxAccountDrawdown),
+        globalKillSwitch: updatedSettings.globalKillSwitch === true,
+        maxLeverageLimit: Number(updatedSettings.maxLeverageLimit),
+        dailyLossLimitUSD: Number(updatedSettings.dailyLossLimitUSD),
+        restrictedSymbols: updatedSettings.restrictedSymbols,
+        singleAssetMaxAllocationPercent: Number(updatedSettings.singleAssetMaxAllocationPercent),
+        industryCryptoMaxPercent: Number(updatedSettings.industryCryptoMaxPercent),
+        autoMeltDrawdownThreshold: Number(updatedSettings.autoMeltDrawdownThreshold),
+        autoMeltSharpeThreshold: Number(updatedSettings.autoMeltSharpeThreshold)
+      };
+
+      const payloadStr = stableStringify(payload);
+      const payloadHash = await computeSha256(payloadStr);
+      const actionName = mfaActionType === 'SAVE' ? "SAVE_RISK_LIMITS" : "TOGGLE_GLOBAL_KILL_SWITCH";
+
       // Step 1: Verify TOTP and obtain the transient high-impact action token
-      const res = await fetch("/api/auth/verify-totp", {
+      const res = await apiFetch("/api/auth/verify-totp", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ 
           code: mfaCode, 
-          action: mfaActionType === 'SAVE' ? "SAVE_RISK_LIMITS" : "TOGGLE_GLOBAL_KILL_SWITCH" 
+          action: actionName,
+          bodyHash: payloadHash
         }),
       });
       const data = await res.json();
@@ -112,19 +140,14 @@ export default function RiskControl() {
         return;
       }
 
-      // Step 2: Call post-trade /api/risk passing the actionToken
-      const updatedSettings = mfaActionType === 'TOGGLE_KILL_SWITCH' 
-        ? { ...settings, globalKillSwitch: mfaAction }
-        : settings;
-
-      const saveRes = await fetch("/api/risk", {
+      // Step 2: Call post-trade /api/risk passing the actionToken and body payload
+      const saveRes = await apiFetch("/api/risk", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          ...updatedSettings,
+          ...payload,
           actionToken: data.actionToken
         }),
       });
@@ -139,15 +162,15 @@ export default function RiskControl() {
         if (mfaActionType === 'TOGGLE_KILL_SWITCH') {
           setMessage({ text: mfaAction ? "✓ 警告：全局一键熔断已生效！所有成交通道已阻断。" : "✓ 全局熔断已解除。系统恢复正常对冲交易。", isError: false });
         } else {
-          setMessage({ text: "✓ 量化风险限额与熔断参数已部署到各个API边缘节点并生效。", isError: false });
+          setMessage({ text: "✓ 风险风控阈值参数更新成功，MFA授权闭环验证无误并部署生效。", isError: false });
         }
         setTimeout(() => setMessage(null), 5000);
       } else {
-        alert(saveData.error || "MFA authorized but failed to persist risk settings.");
+        alert(saveData.error || "风控参数保存失败");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("MFA verification connection error.");
+      alert("风控保存过程出现通讯故障: " + err.message);
     } finally {
       setSaving(false);
     }
@@ -509,8 +532,8 @@ export default function RiskControl() {
             </p>
             
             {/* Real TOTP dynamic hint */}
-            <div className="bg-[#0A0A0B] p-2.5 border border-zinc-800 text-[10px] text-zinc-450 mb-4 uppercase leading-relaxed">
-              Enter the 6-digit TOTP token from Google Authenticator. Active secret: <strong className="text-[#00FF66] select-all">KVKVE42KGBEGKVKV</strong> (for administrator).
+            <div className="bg-[#0A0A0B] p-2.5 border border-zinc-800 text-[10px] text-zinc-450 mb-4 uppercase leading-relaxed text-left">
+              Enter the 6-digit TOTP token from your authenticator app synced with your Aegis system account to authorize this action.
             </div>
 
             <input

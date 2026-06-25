@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Play, Square, Settings, RefreshCw, Layers, ShieldAlert, Coins, HelpCircle } from "lucide-react";
 import { BotConfig, BrokerType, BotType, FuturesDirection } from "../types";
+import { apiFetch } from "../lib/api";
 
 interface BotCardProps {
   key?: string;
@@ -50,12 +51,10 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
   const handleRollback = async (version: string) => {
     try {
       setRollingId(version);
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch(`/api/bots/rollback/${bot.id}`, {
+      const res = await apiFetch(`/api/bots/rollback/${bot.id}`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ version })
       });

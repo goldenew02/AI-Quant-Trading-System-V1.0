@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Download, Filter, RefreshCw, FileText, Shield, ShieldAlert, ShieldCheck, CheckCircle2, AlertTriangle, Clock, Printer } from "lucide-react";
 import { TradeLog } from "../types";
+import { apiFetch } from "../lib/api";
 
 export default function LogAuditor() {
   const [logs, setLogs] = useState<TradeLog[]>([]);
@@ -33,12 +34,7 @@ export default function LogAuditor() {
     try {
       setLoading(true);
       const queryParams = new URLSearchParams(filters).toString();
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch(`/api/logs?${queryParams}`, {
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
-      });
+      const res = await apiFetch(`/api/logs?${queryParams}`);
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
@@ -56,8 +52,7 @@ export default function LogAuditor() {
   }, [filters]);
 
   const handleDownload = () => {
-    const token = localStorage.getItem("aegis_token") || "";
-    window.open(`/api/logs/download?token=${encodeURIComponent(token)}`, "_blank");
+    window.open(`/api/logs/download`, "_blank");
   };
 
   const handleRunVerify = async () => {
@@ -65,12 +60,8 @@ export default function LogAuditor() {
       setIntegrityStatus("verifying");
       setAuditLog(prev => [...prev, `[${new Date().toLocaleTimeString()}] INITIATING LEDGER SCAN: Verifying SHA-256 hash sequence of transaction chain...`]);
       
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/logs/verify", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
+      const res = await apiFetch("/api/logs/verify", {
+        method: "POST"
       });
       const data = await res.json();
       
@@ -102,12 +93,8 @@ export default function LogAuditor() {
 
   const handleTamper = async () => {
     try {
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/logs/tamper", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
+      const res = await apiFetch("/api/logs/tamper", {
+        method: "POST"
       });
       const data = await res.json();
       setAuditLog(prev => [
@@ -124,19 +111,15 @@ export default function LogAuditor() {
 
   const handleRestore = async () => {
     try {
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/logs/restore", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
+      const res = await apiFetch("/api/logs/restore", {
+        method: "POST"
       });
       const data = await res.json();
       setAuditLog(prev => [
         ...prev,
         `[${new Date().toLocaleTimeString()}] SECURITY SECURING: Deploying secure mirrored decentralized backup records...`,
         `[${new Date().toLocaleTimeString()}] SUCCESS: ${data.message}`,
-        `[${new Date().toLocaleTimeString()}] RE-CHAINING COMPLETE: SHA-256 links restored.`
+        `[${new Date().toLocaleTimeString()}] AUDIT COMPLETE: Mirrored ledger records synchronized.`
       ]);
       alert("数据库已通过不可篡改冷热双活节点自动校验修复！");
       handleRunVerify();
@@ -540,7 +523,7 @@ export default function LogAuditor() {
                 </div>
               </div>
               <p className="text-[9px] text-zinc-550 uppercase tracking-tight font-mono mt-3">
-                Fingerprint Chain Model: Root → Index[0] → PreviousHash → CurrentHash. Dynamic interval rechain active.
+                Fingerprint Chain Model: Root → Index[0] → PreviousHash → CurrentHash. Cryptographic audit logs active.
               </p>
             </div>
           </div>

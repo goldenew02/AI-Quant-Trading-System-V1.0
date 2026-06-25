@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Cpu, HardDrive, RefreshCw, Thermometer, ShieldAlert, AlertTriangle, ShieldCheck, Clock } from "lucide-react";
 import { systemOverview } from "../types";
+import { apiFetch } from "../lib/api";
 
 export default function SystemMetrics() {
   const [metrics, setMetrics] = useState<systemOverview>({
@@ -25,12 +26,7 @@ export default function SystemMetrics() {
   const fetchMetrics = async () => {
     try {
       setLoading(true);
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/overview", {
-        headers: {
-          "Authorization": `Bearer ${token}`
-        }
-      });
+      const res = await apiFetch("/api/overview");
       if (res.status === 429) {
         const data = await res.json();
         setMetrics(prev => ({
@@ -88,14 +84,9 @@ export default function SystemMetrics() {
       setSimulating(true);
       setOverloadMessage("Sending 130 high-frequency parallel requests to overload the safety circuits...");
       
-      const token = localStorage.getItem("aegis_token") || "";
-      // Perform 130 requests concurrently with valid JWT signature
+      // Perform 130 requests concurrently
       const requests = Array.from({ length: 130 }).map(() =>
-        fetch("/api/overview", {
-          headers: {
-            "Authorization": `Bearer ${token}`
-          }
-        }).catch(() => null)
+        apiFetch("/api/overview").catch(() => null)
       );
       
       await Promise.all(requests);

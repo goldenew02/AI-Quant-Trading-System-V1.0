@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 
 import { BotConfig } from "./types";
+import { apiFetch } from "./lib/api";
 import SystemMetrics from "./components/SystemMetrics";
 import RiskControl from "./components/RiskControl";
 import LogAuditor from "./components/LogAuditor";
@@ -38,16 +39,11 @@ export default function App() {
   const [lastBacktestResult, setLastBacktestResult] = useState<any | null>(null);
   const [selectedBotForAi, setSelectedBotForAi] = useState<string>("bot_1");
   const [ibMode, setIbMode] = useState<"gateway" | "web_api_proxy">("web_api_proxy");
+  const [ibStatus, setIbStatus] = useState<{ connected: boolean; username?: string; error?: string } | null>(null);
 
   // Secure HttpOnly session states
   const [username, setUsername] = useState<string | null>(localStorage.getItem("aegis_username"));
   const [role, setRole] = useState<'admin' | 'operator' | 'viewer' | null>(localStorage.getItem("aegis_role") as any);
-
-  // Read non-HttpOnly CSRF double-submit token cookie
-  const getCsrfToken = (): string => {
-    const match = document.cookie.match(/(^|;)\s*csrf_token\s*=\s*([^;]+)/);
-    return match ? match[2] : "";
-  };
 
   const handleLoginSuccess = (newRole: 'admin' | 'operator' | 'viewer', newUsername: string) => {
     setRole(newRole);
@@ -58,12 +54,8 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch("/api/auth/logout", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "X-CSRF-Token": getCsrfToken()
-        }
+      await apiFetch("/api/auth/logout", {
+        method: "POST"
       });
     } catch (err) {
       console.error("Logout error:", err);
@@ -75,29 +67,7 @@ export default function App() {
   };
 
   const secureFetch = async (url: string, options: RequestInit = {}) => {
-    const headers = {
-      ...(options.headers || {}),
-    } as any;
-    
-    // Auto-attach anti-CSRF token on any state-changing request
-    const csrfToken = getCsrfToken();
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
-    
-    const res = await fetch(url, {
-      ...options,
-      credentials: "include", // Required to transmit HttpOnly sid cookie
-      headers,
-    });
-    
-    if (res.status === 401) {
-      setUsername(null);
-      setRole(null);
-      localStorage.removeItem("aegis_username");
-      localStorage.removeItem("aegis_role");
-    }
-    return res;
+    return apiFetch(url, options);
   };
 
   // Fetch Bots state from Backend on boot & interval
@@ -114,7 +84,7 @@ export default function App() {
     }
   };
 
-  // Fetch IB connection mode on mount
+  // Fetch IB connection mode and connection status on mount
   const fetchIbMode = async () => {
     try {
       const res = await secureFetch("/api/ib-mode");
@@ -122,8 +92,14 @@ export default function App() {
         const data = await res.json();
         setIbMode(data.mode);
       }
+      
+      const statusRes = await secureFetch("/api/ib/status");
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setIbStatus(statusData.status);
+      }
     } catch (err) {
-      console.error("Error fetching IB mode:", err);
+      console.error("Error fetching IB mode & status:", err);
     }
   };
 
@@ -138,15 +114,33 @@ export default function App() {
         const data = await res.json();
         setIbMode(data.mode);
       }
+      
+      const statusRes = await secureFetch("/api/ib/status");
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setIbStatus(statusData.status);
+      }
     } catch (err) {
-      console.error("Error updating IB mode:", err);
+      console.error("Error updating IB mode & status:", err);
     }
   };
 
   useEffect(() => {
-    // Validate session status on boot
+    const handleUnauthorized = () => {
+      setUsername(null);
+      setRole(null);
+    };
+    window.addEventListener("aegis-unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("aegis-unauthorized", handleUnauthorized);
+  }, []);
+
+  useEffect(() => {
+    // Validate session status on boot after fetching fresh anti-CSRF token
     const initSession = async () => {
       try {
+        // Fetch initialization token to ensure CSRF cookie is populated on first load
+        await fetch("/api/auth/csrf", { credentials: "include" });
+        
         const res = await fetch("/api/auth/me", { credentials: "include" });
         if (res.ok) {
           const data = await res.json();
@@ -592,7 +586,7 @@ export default function App() {
                               <span className="w-1.5 h-1.5 rounded-full bg-[#00FF66] animate-pulse"></span>
                               <span>ARM64 WEB PROXY (ACTIVE)</span>
                             </div>
-                            <p className="text-[#666666] uppercase leading-tight">
+                            <p className="text-[#666666] uppercase leading-tight mb-2">
                               Bypasses local x86 TWS Gateway limitations using ARM64-native REST proxy. Highly recommended for virtualization.
                             </p>
                           </>
@@ -602,11 +596,28 @@ export default function App() {
                               <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
                               <span>LOCAL TWS GATEWAY (EMULATED)</span>
                             </div>
-                            <p className="text-[#666666] uppercase leading-tight">
+                            <p className="text-[#666666] uppercase leading-tight mb-2">
                               Runs standard x86 gateway. Under ARM64, this forces slow binary translation layer emulation. Potential latency drift.
                             </p>
                           </>
                         )}
+
+                        {/* Live Broker Connection Status Panel (P0-4 Compliance) */}
+                        <div className="border-t border-[#2A2A2C]/40 pt-2 mt-2">
+                          <div className="flex justify-between text-[9px] font-mono uppercase">
+                            <span className="text-[#666666]">Broker API Status:</span>
+                            {ibStatus?.connected ? (
+                              <span className="text-[#00FF66] font-bold">● CONNECTED ({ibStatus.username})</span>
+                            ) : (
+                              <span className="text-[#FF3333] font-bold">● SIMULATION FALLBACK (OFFLINE)</span>
+                            )}
+                          </div>
+                          {ibStatus && !ibStatus.connected && (
+                            <p className="text-[8px] text-[#555557] font-mono uppercase leading-tight mt-1">
+                              {ibStatus.error || "No session detected on local Gateway port 5000."}
+                            </p>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>

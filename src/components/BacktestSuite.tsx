@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Play, TrendingUp, Award, Activity, ShieldAlert, Sparkles, AlertCircle, RefreshCw } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts";
+import { apiFetch } from "../lib/api";
 
 interface BacktestSuiteProps {
   onBacktestComplete: (result: any) => void;
@@ -38,12 +39,10 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       setResult(null);
       setAiReport(null);
 
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/backtest", {
+      const res = await apiFetch("/api/backtest", {
         method: "POST",
         headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           ...config,
@@ -88,12 +87,10 @@ export default function BacktestSuite({ onBacktestComplete }: BacktestSuiteProps
       setAiLoading(true);
       setAiReport(null);
 
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/gemini/analyze", {
+      const res = await apiFetch("/api/gemini/analyze", {
         method: "POST",
         headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           prompt: `我运行了一份量化网格回测：

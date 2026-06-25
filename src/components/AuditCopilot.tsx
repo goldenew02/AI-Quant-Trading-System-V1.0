@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Bot, RefreshCw, Send, Sparkles, Brain, CheckCircle, ShieldAlert } from "lucide-react";
+import { apiFetch } from "../lib/api";
 
 interface AuditCopilotProps {
   activeBotId?: string;
@@ -18,12 +19,10 @@ export default function AuditCopilot({ activeBotId, backtestData }: AuditCopilot
       setLoading(true);
       setResponse(null);
 
-      const token = localStorage.getItem("aegis_token");
-      const res = await fetch("/api/gemini/analyze", {
+      const res = await apiFetch("/api/gemini/analyze", {
         method: "POST",
         headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           prompt: userInput,

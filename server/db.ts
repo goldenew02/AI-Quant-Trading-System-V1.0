@@ -10,30 +10,21 @@ const envPath = path.join(process.cwd(), ".env");
 if (!fs.existsSync(envPath)) {
   const adminUser = "admin";
   const adminPass = "Aegis_" + crypto.randomBytes(6).toString("hex") + "!";
-  
-  // Generate random base32 standard secret
-  const base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let adminTotp = "";
-  for (let i = 0; i < 16; i++) {
-    adminTotp += base32Chars[crypto.randomInt(base32Chars.length)];
-  }
-  
   const encKey = crypto.randomBytes(32).toString("base64");
   const sessSec = crypto.randomBytes(32).toString("base64");
 
   const envContent = `# AegisQuant Secure Environment Configuration
 BOOTSTRAP_ADMIN_USER=${adminUser}
 BOOTSTRAP_ADMIN_PASSWORD=${adminPass}
-BOOTSTRAP_ADMIN_TOTP_SECRET=${adminTotp}
 ENCRYPTION_KEY=${encKey}
 SESSION_SECRET=${sessSec}
 `;
   fs.writeFileSync(envPath, envContent, "utf-8");
   console.log("==================================================================");
   console.log("  SECURE BOOTSTRAP: Created fresh .env with dynamic secrets.      ");
-  console.log(`  Admin User: ${adminUser}                                        `);
-  console.log(`  Admin Password: ${adminPass}                                    `);
-  console.log(`  Admin TOTP Secret: ${adminTotp}                                 `);
+  console.log("  [NOTICE] Secure administrator credentials have been bootstrapped.");
+  console.log("  To obtain your random admin password, check the .env file.      ");
+  console.log("  TOTP setup will be forced upon first administrator login.       ");
   console.log("==================================================================");
 }
 
@@ -45,7 +36,6 @@ dotenv.config();
 const requiredEnvVars = [
   "BOOTSTRAP_ADMIN_USER",
   "BOOTSTRAP_ADMIN_PASSWORD",
-  "BOOTSTRAP_ADMIN_TOTP_SECRET",
   "ENCRYPTION_KEY",
   "SESSION_SECRET"
 ];
@@ -255,11 +245,13 @@ export class AegisDB {
   private data!: AegisDatabase;
   private sqlDb!: sqlite3.Database;
 
+  public ready: Promise<void>;
+
   constructor() {
-    this.initDatabase();
+    this.ready = this.initDatabaseAsync();
   }
 
-  private initDatabase() {
+  private initDatabaseAsync(): Promise<void> {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
@@ -267,144 +259,152 @@ export class AegisDB {
     // Connect to SQLite Database
     this.sqlDb = new sqlite3.Database(SQLITE_FILE);
     
-    // Enable WAL journal mode for performance and crash recovery (P0-4)
-    this.sqlDb.run("PRAGMA journal_mode=WAL;");
+    return new Promise<void>((resolve, reject) => {
+      this.sqlDb.serialize(() => {
+        // Enable WAL journal mode for performance and crash recovery (P0-4)
+        this.sqlDb.run("PRAGMA journal_mode=WAL;");
+        this.sqlDb.run("PRAGMA foreign_keys=ON;");
+        this.sqlDb.run("PRAGMA busy_timeout=5000;");
 
-    // Create Tables synchronously for safety on startup
-    this.sqlDb.serialize(() => {
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS users (
-          username TEXT PRIMARY KEY,
-          passwordHash TEXT NOT NULL,
-          role TEXT NOT NULL,
-          totpSecret TEXT,
-          isActive INTEGER NOT NULL DEFAULT 1,
-          tempTotpSecret TEXT,
-          tempTotpExpiresAt INTEGER,
-          mustEnrollTotp INTEGER NOT NULL DEFAULT 0
-        )
-      `);
+        // Create Tables synchronously for safety on startup
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            passwordHash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            totpSecret TEXT,
+            isActive INTEGER NOT NULL DEFAULT 1,
+            tempTotpSecret TEXT,
+            tempTotpExpiresAt INTEGER,
+            mustEnrollTotp INTEGER NOT NULL DEFAULT 0
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS sessions (
-          tokenHash TEXT PRIMARY KEY,
-          username TEXT NOT NULL,
-          role TEXT NOT NULL,
-          expiresAt INTEGER NOT NULL
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS sessions (
+            tokenHash TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            role TEXT NOT NULL,
+            expiresAt INTEGER NOT NULL
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS bots (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          isEnabled INTEGER NOT NULL,
-          broker TEXT NOT NULL,
-          symbol TEXT NOT NULL,
-          type TEXT NOT NULL,
-          direction TEXT NOT NULL,
-          rangeMin REAL NOT NULL,
-          rangeMax REAL NOT NULL,
-          gridCount INTEGER NOT NULL,
-          investment REAL NOT NULL,
-          leverage INTEGER NOT NULL,
-          stopLoss REAL,
-          takeProfit REAL,
-          status TEXT NOT NULL,
-          profitUsd REAL NOT NULL,
-          profitPercent REAL NOT NULL,
-          unrealizedProfitUsd REAL NOT NULL,
-          tradesCount INTEGER NOT NULL,
-          entryPrice REAL NOT NULL,
-          currentPrice REAL NOT NULL,
-          lastUpdated TEXT NOT NULL,
-          timezone TEXT NOT NULL,
-          cgroupsCpuLimit TEXT,
-          cgroupsMemoryLimit TEXT,
-          pid INTEGER,
-          memoryHeapMb REAL,
-          cpuAffinity TEXT,
-          version TEXT,
-          liquidationPrice REAL,
-          maintenanceMargin REAL,
-          grids TEXT,
-          configHistory TEXT
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS bots (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            isEnabled INTEGER NOT NULL,
+            broker TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            type TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            rangeMin REAL NOT NULL,
+            rangeMax REAL NOT NULL,
+            gridCount INTEGER NOT NULL,
+            investment REAL NOT NULL,
+            leverage INTEGER NOT NULL,
+            stopLoss REAL,
+            takeProfit REAL,
+            status TEXT NOT NULL,
+            profitUsd REAL NOT NULL,
+            profitPercent REAL NOT NULL,
+            unrealizedProfitUsd REAL NOT NULL,
+            tradesCount INTEGER NOT NULL,
+            entryPrice REAL NOT NULL,
+            currentPrice REAL NOT NULL,
+            lastUpdated TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            cgroupsCpuLimit TEXT,
+            cgroupsMemoryLimit TEXT,
+            pid INTEGER,
+            memoryHeapMb REAL,
+            cpuAffinity TEXT,
+            version TEXT,
+            liquidationPrice REAL,
+            maintenanceMargin REAL,
+            grids TEXT,
+            configHistory TEXT
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS trade_logs (
-          id TEXT PRIMARY KEY,
-          botId TEXT NOT NULL,
-          botName TEXT NOT NULL,
-          broker TEXT NOT NULL,
-          symbol TEXT NOT NULL,
-          timestamp TEXT NOT NULL,
-          type TEXT NOT NULL,
-          price REAL NOT NULL,
-          amount REAL NOT NULL,
-          total REAL NOT NULL,
-          pnl REAL,
-          previousHash TEXT NOT NULL,
-          currentHash TEXT NOT NULL
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS trade_logs (
+            id TEXT PRIMARY KEY,
+            botId TEXT NOT NULL,
+            botName TEXT NOT NULL,
+            broker TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            type TEXT NOT NULL,
+            price REAL NOT NULL,
+            amount REAL NOT NULL,
+            total REAL NOT NULL,
+            pnl REAL,
+            previousHash TEXT NOT NULL,
+            currentHash TEXT NOT NULL
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS security_audit_logs (
-          id TEXT PRIMARY KEY,
-          timestamp TEXT NOT NULL,
-          username TEXT NOT NULL,
-          role TEXT NOT NULL,
-          action TEXT NOT NULL,
-          target TEXT NOT NULL,
-          details TEXT NOT NULL,
-          ipAddress TEXT NOT NULL,
-          previousHash TEXT NOT NULL,
-          currentHash TEXT NOT NULL
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS security_audit_logs (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            username TEXT NOT NULL,
+            role TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            details TEXT NOT NULL,
+            ipAddress TEXT NOT NULL,
+            previousHash TEXT NOT NULL,
+            currentHash TEXT NOT NULL
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS risk_settings (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          maxDailyDrawdown REAL NOT NULL,
-          maxAccountDrawdown REAL NOT NULL,
-          globalKillSwitch INTEGER NOT NULL,
-          maxLeverageLimit INTEGER NOT NULL,
-          dailyLossLimitUSD REAL NOT NULL,
-          restrictedSymbols TEXT NOT NULL,
-          singleAssetMaxAllocationPercent REAL NOT NULL,
-          industryCryptoMaxPercent REAL NOT NULL,
-          autoMeltDrawdownThreshold REAL NOT NULL,
-          autoMeltSharpeThreshold REAL NOT NULL
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS risk_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            maxDailyDrawdown REAL NOT NULL,
+            maxAccountDrawdown REAL NOT NULL,
+            globalKillSwitch INTEGER NOT NULL,
+            maxLeverageLimit INTEGER NOT NULL,
+            dailyLossLimitUSD REAL NOT NULL,
+            restrictedSymbols TEXT NOT NULL,
+            singleAssetMaxAllocationPercent REAL NOT NULL,
+            industryCryptoMaxPercent REAL NOT NULL,
+            autoMeltDrawdownThreshold REAL NOT NULL,
+            autoMeltSharpeThreshold REAL NOT NULL
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS system_config (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS system_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          )
+        `);
 
-      this.sqlDb.run(`
-        CREATE TABLE IF NOT EXISTS mfa_action_tokens (
-          tokenHash TEXT PRIMARY KEY,
-          sessionIdHash TEXT NOT NULL,
-          username TEXT NOT NULL,
-          action TEXT NOT NULL,
-          bodyHash TEXT NOT NULL,
-          expiresAt INTEGER NOT NULL,
-          usedAt INTEGER
-        )
-      `);
+        this.sqlDb.run(`
+          CREATE TABLE IF NOT EXISTS mfa_action_tokens (
+            tokenHash TEXT PRIMARY KEY,
+            sessionIdHash TEXT NOT NULL,
+            username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            bodyHash TEXT NOT NULL,
+            expiresAt INTEGER NOT NULL,
+            usedAt INTEGER
+          )
+        `, (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            this.loadAllDataAsync().then(resolve).catch(reject);
+          }
+        });
+      });
     });
-
-    this.loadAllData();
   }
 
-  private loadAllData() {
+  private loadAllDataAsync(): Promise<void> {
     this.data = {
       users: [],
       sessions: [],
@@ -426,144 +426,179 @@ export class AegisDB {
       ibConnectionMode: "web_api_proxy"
     };
 
-    // Load from SQLite synchronously using sqlite3 callbacks wrapped in serialize
-    this.sqlDb.serialize(() => {
-      // 1. Users
-      this.sqlDb.all("SELECT * FROM users", (err, rows: any[]) => {
-        if (!err && rows && rows.length > 0) {
-          this.data.users = rows.map(r => ({
-            username: r.username,
-            passwordHash: r.passwordHash,
-            role: r.role,
-            totpSecret: r.totpSecret,
-            isActive: r.isActive === 1,
-            tempTotpSecret: r.tempTotpSecret,
-            tempTotpExpiresAt: r.tempTotpExpiresAt,
-            mustEnrollTotp: r.mustEnrollTotp === 1
-          }));
-        } else {
-          // No users found -> Bootstrap Administrator with high security and force改密 / force TOTP
-          const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
-          const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
-          
-          this.data.users = [
-            {
-              username: seedUser,
-              passwordHash: hashPassword(seedPass),
-              role: "admin",
-              totpSecret: null, // Forces Dynamic Enrollment
-              isActive: true,
-              mustEnrollTotp: true
+    return new Promise<void>((resolve, reject) => {
+      this.sqlDb.serialize(() => {
+        const promises: Promise<any>[] = [];
+
+        // 1. Users
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.all("SELECT * FROM users", (err, rows: any[]) => {
+            if (err) return rej(err);
+            if (rows && rows.length > 0) {
+              this.data.users = rows.map(r => ({
+                username: r.username,
+                passwordHash: r.passwordHash,
+                role: r.role,
+                totpSecret: r.totpSecret,
+                isActive: r.isActive === 1,
+                tempTotpSecret: r.tempTotpSecret,
+                tempTotpExpiresAt: r.tempTotpExpiresAt,
+                mustEnrollTotp: r.mustEnrollTotp === 1
+              }));
+              res();
+            } else {
+              const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
+              const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+              this.data.users = [
+                {
+                  username: seedUser,
+                  passwordHash: hashPassword(seedPass),
+                  role: "admin",
+                  totpSecret: null,
+                  isActive: true,
+                  mustEnrollTotp: true
+                }
+              ];
+              this.save();
+              res();
             }
-          ];
-          this.save();
-        }
-      });
+          });
+        }));
 
-      // 2. Sessions
-      this.sqlDb.all("SELECT * FROM sessions", (err, rows: any[]) => {
-        if (!err && rows) {
-          this.data.sessions = rows.map(r => ({
-            tokenHash: r.tokenHash,
-            username: r.username,
-            role: r.role,
-            expiresAt: r.expiresAt
-          }));
-        }
-      });
+        // 2. Sessions
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.all("SELECT * FROM sessions", (err, rows: any[]) => {
+            if (err) return rej(err);
+            if (rows) {
+              this.data.sessions = rows.map(r => ({
+                tokenHash: r.tokenHash,
+                username: r.username,
+                role: r.role,
+                expiresAt: r.expiresAt
+              }));
+            }
+            res();
+          });
+        }));
 
-      // 3. Bots
-      this.sqlDb.all("SELECT * FROM bots", (err, rows: any[]) => {
-        if (!err && rows && rows.length > 0) {
-          this.data.bots = rows.map(r => ({
-            id: r.id,
-            name: r.name,
-            isEnabled: r.isEnabled === 1,
-            broker: r.broker,
-            symbol: r.symbol,
-            type: r.type,
-            direction: r.direction,
-            rangeMin: r.rangeMin,
-            rangeMax: r.rangeMax,
-            gridCount: r.gridCount,
-            investment: r.investment,
-            leverage: r.leverage,
-            stopLoss: r.stopLoss,
-            takeProfit: r.takeProfit,
-            status: r.status,
-            profitUsd: r.profitUsd,
-            profitPercent: r.profitPercent,
-            unrealizedProfitUsd: r.unrealizedProfitUsd,
-            tradesCount: r.tradesCount,
-            entryPrice: r.entryPrice,
-            currentPrice: r.currentPrice,
-            lastUpdated: r.lastUpdated,
-            timezone: r.timezone,
-            cgroupsCpuLimit: r.cgroupsCpuLimit,
-            cgroupsMemoryLimit: r.cgroupsMemoryLimit,
-            pid: r.pid,
-            memoryHeapMb: r.memoryHeapMb,
-            cpuAffinity: r.cpuAffinity,
-            version: r.version,
-            liquidationPrice: r.liquidationPrice,
-            maintenanceMargin: r.maintenanceMargin,
-            grids: JSON.parse(r.grids || "[]"),
-            configHistory: JSON.parse(r.configHistory || "[]")
-          }));
-        } else {
-          // Seed standard bots
-          this.data.bots = this.getSeedBots();
-          this.save();
-        }
-      });
+        // 3. Bots
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.all("SELECT * FROM bots", (err, rows: any[]) => {
+            if (err) return rej(err);
+            if (rows && rows.length > 0) {
+              this.data.bots = rows.map(r => ({
+                id: r.id,
+                name: r.name,
+                isEnabled: r.isEnabled === 1,
+                broker: r.broker,
+                symbol: r.symbol,
+                type: r.type,
+                direction: r.direction,
+                rangeMin: r.rangeMin,
+                rangeMax: r.rangeMax,
+                gridCount: r.gridCount,
+                investment: r.investment,
+                leverage: r.leverage,
+                stopLoss: r.stopLoss,
+                takeProfit: r.takeProfit,
+                status: r.status,
+                profitUsd: r.profitUsd,
+                profitPercent: r.profitPercent,
+                unrealizedProfitUsd: r.unrealizedProfitUsd,
+                tradesCount: r.tradesCount,
+                entryPrice: r.entryPrice,
+                currentPrice: r.currentPrice,
+                lastUpdated: r.lastUpdated,
+                timezone: r.timezone,
+                cgroupsCpuLimit: r.cgroupsCpuLimit,
+                cgroupsMemoryLimit: r.cgroupsMemoryLimit,
+                pid: r.pid,
+                memoryHeapMb: r.memoryHeapMb,
+                cpuAffinity: r.cpuAffinity,
+                version: r.version,
+                liquidationPrice: r.liquidationPrice,
+                maintenanceMargin: r.maintenanceMargin,
+                grids: JSON.parse(r.grids || "[]"),
+                configHistory: JSON.parse(r.configHistory || "[]")
+              }));
+              res();
+            } else {
+              this.data.bots = this.getSeedBots();
+              this.save();
+              res();
+            }
+          });
+        }));
 
-      // 4. Trade logs
-      this.sqlDb.all("SELECT * FROM trade_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
-        if (!err && rows && rows.length > 0) {
-          this.data.tradeLogs = rows;
-        } else {
-          this.data.tradeLogs = this.getSeedTradeLogs();
-          this.save();
-        }
-      });
+        // 4. Trade logs
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.all("SELECT * FROM trade_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
+            if (err) return rej(err);
+            if (rows && rows.length > 0) {
+              this.data.tradeLogs = rows;
+              res();
+            } else {
+              this.data.tradeLogs = this.getSeedTradeLogs();
+              this.save();
+              res();
+            }
+          });
+        }));
 
-      // 5. Security audit logs
-      this.sqlDb.all("SELECT * FROM security_audit_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
-        if (!err && rows && rows.length > 0) {
-          this.data.securityAuditLogs = rows;
-        } else {
-          this.data.securityAuditLogs = this.getSeedSecurityLogs();
-          this.save();
-        }
-      });
+        // 5. Security audit logs
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.all("SELECT * FROM security_audit_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
+            if (err) return rej(err);
+            if (rows && rows.length > 0) {
+              this.data.securityAuditLogs = rows;
+              res();
+            } else {
+              this.data.securityAuditLogs = this.getSeedSecurityLogs();
+              this.save();
+              res();
+            }
+          });
+        }));
 
-      // 6. Risk settings
-      this.sqlDb.get("SELECT * FROM risk_settings LIMIT 1", (err, row: any) => {
-        if (!err && row) {
-          this.data.riskSettings = {
-            maxDailyDrawdown: row.maxDailyDrawdown,
-            maxAccountDrawdown: row.maxAccountDrawdown,
-            globalKillSwitch: row.globalKillSwitch === 1,
-            maxLeverageLimit: row.maxLeverageLimit,
-            dailyLossLimitUSD: row.dailyLossLimitUSD,
-            restrictedSymbols: JSON.parse(row.restrictedSymbols || "[]"),
-            singleAssetMaxAllocationPercent: row.singleAssetMaxAllocationPercent,
-            industryCryptoMaxPercent: row.industryCryptoMaxPercent,
-            autoMeltDrawdownThreshold: row.autoMeltDrawdownThreshold,
-            autoMeltSharpeThreshold: row.autoMeltSharpeThreshold
-          };
-        } else {
-          this.save();
-        }
-      });
+        // 6. Risk settings
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.get("SELECT * FROM risk_settings LIMIT 1", (err, row: any) => {
+            if (err) return rej(err);
+            if (row) {
+              this.data.riskSettings = {
+                maxDailyDrawdown: row.maxDailyDrawdown,
+                maxAccountDrawdown: row.maxAccountDrawdown,
+                globalKillSwitch: row.globalKillSwitch === 1,
+                maxLeverageLimit: row.maxLeverageLimit,
+                dailyLossLimitUSD: row.dailyLossLimitUSD,
+                restrictedSymbols: JSON.parse(row.restrictedSymbols || "[]"),
+                singleAssetMaxAllocationPercent: row.singleAssetMaxAllocationPercent,
+                industryCryptoMaxPercent: row.industryCryptoMaxPercent,
+                autoMeltDrawdownThreshold: row.autoMeltDrawdownThreshold,
+                autoMeltSharpeThreshold: row.autoMeltSharpeThreshold
+              };
+              res();
+            } else {
+              this.save();
+              res();
+            }
+          });
+        }));
 
-      // 7. System configurations
-      this.sqlDb.get("SELECT value FROM system_config WHERE key = 'ibConnectionMode'", (err, row: any) => {
-        if (!err && row) {
-          this.data.ibConnectionMode = row.value as any;
-        } else {
-          this.save();
-        }
+        // 7. System configurations
+        promises.push(new Promise<void>((res, rej) => {
+          this.sqlDb.get("SELECT value FROM system_config WHERE key = 'ibConnectionMode'", (err, row: any) => {
+            if (err) return rej(err);
+            if (row) {
+              this.data.ibConnectionMode = row.value as any;
+            } else {
+              this.save();
+            }
+            res();
+          });
+        }));
+
+        Promise.all(promises).then(() => resolve()).catch(reject);
       });
     });
   }
@@ -922,15 +957,49 @@ export class AegisDB {
     `, [tokenHash, sessionIdHash, username, action, bodyHash, expiresAt]);
   }
 
-  public consumeMfaToken(tokenHash: string, callback: (err: any, token: any) => void) {
-    this.sqlDb.get("SELECT * FROM mfa_action_tokens WHERE tokenHash = ? AND usedAt IS NULL", [tokenHash], (err, row) => {
-      if (!err && row) {
+  public consumeMfaTokenAsync(
+    tokenHash: string,
+    username: string,
+    sessionIdHash: string,
+    action: string,
+    bodyHash: string
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.sqlDb.get("SELECT * FROM mfa_action_tokens WHERE tokenHash = ?", [tokenHash], (err, row: any) => {
+        if (err) {
+          return reject(err);
+        }
+        if (!row) {
+          return reject(new Error("MFA action token not found"));
+        }
+        if (row.usedAt !== null) {
+          return reject(new Error("MFA action token has already been consumed"));
+        }
+        if (row.expiresAt < Date.now()) {
+          return reject(new Error("MFA action token has expired"));
+        }
+        if (row.username !== username) {
+          return reject(new Error("MFA action token belongs to a different user context"));
+        }
+        if (row.sessionIdHash !== sessionIdHash) {
+          return reject(new Error("MFA action token bound to a different session context"));
+        }
+        if (row.action !== action) {
+          return reject(new Error("MFA action token registered for a different action context"));
+        }
+        if (row.bodyHash !== bodyHash) {
+          return reject(new Error("Cryptographic payload modification detected: request body hash does not match MFA authorization token"));
+        }
+
+        // All checks passed! Now mark as used.
         this.sqlDb.run("UPDATE mfa_action_tokens SET usedAt = ? WHERE tokenHash = ?", [Date.now(), tokenHash], (updErr) => {
-          callback(updErr, row);
+          if (updErr) {
+            reject(updErr);
+          } else {
+            resolve();
+          }
         });
-      } else {
-        callback(err || new Error("MFA token not found or already consumed"), null);
-      }
+      });
     });
   }
 }
