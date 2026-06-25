@@ -1,11 +1,9 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import sqlite3 from "sqlite3";
 import { BotConfig, TradeLog, RiskSettings, BrokerAccount, Order, Fill } from "../src/types";
 
 // --- ENVIRONMENT INITIALIZATION & FAIL-FAST VALIDATION ---
-// 1. Auto-seed .env file if it does not exist with strong dynamic values
 const envPath = path.join(process.cwd(), ".env");
 if (!fs.existsSync(envPath)) {
   const adminUser = "admin";
@@ -103,10 +101,18 @@ export interface AegisDatabase {
   brokerAccounts: BrokerAccount[];
   orders: Order[];
   fills: Fill[];
+  mfaActionTokens?: {
+    tokenHash: string;
+    sessionIdHash: string;
+    username: string;
+    action: string;
+    bodyHash: string;
+    expiresAt: number;
+    usedAt?: number | null;
+  }[];
 }
 
 const DB_DIR = path.join(process.cwd(), "data");
-const SQLITE_FILE = path.join(DB_DIR, "aegis_secure.db");
 
 // Dynamic base32 decoder for standard Google Authenticator TOTP keys
 function base32ToBuffer(secret: string): Buffer {
@@ -246,8 +252,6 @@ export function computeSecurityHash(log: SecurityAuditEntry, prevHash: string): 
 
 export class AegisDB {
   private data!: AegisDatabase;
-  private sqlDb!: sqlite3.Database;
-
   public ready: Promise<void>;
 
   constructor() {
@@ -259,466 +263,79 @@ export class AegisDB {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
 
-    // Connect to SQLite Database
-    this.sqlDb = new sqlite3.Database(SQLITE_FILE);
-    
+    const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
+
     return new Promise<void>((resolve, reject) => {
-      this.sqlDb.serialize(() => {
-        // Enable WAL journal mode for performance and crash recovery (P0-4)
-        this.sqlDb.run("PRAGMA journal_mode=WAL;");
-        this.sqlDb.run("PRAGMA foreign_keys=ON;");
-        this.sqlDb.run("PRAGMA busy_timeout=5000;");
-
-        // Create Tables synchronously for safety on startup
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            passwordHash TEXT NOT NULL,
-            role TEXT NOT NULL,
-            totpSecret TEXT,
-            isActive INTEGER NOT NULL DEFAULT 1,
-            tempTotpSecret TEXT,
-            tempTotpExpiresAt INTEGER,
-            mustEnrollTotp INTEGER NOT NULL DEFAULT 0
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS sessions (
-            tokenHash TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            role TEXT NOT NULL,
-            expiresAt INTEGER NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS bots (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            isEnabled INTEGER NOT NULL,
-            broker TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            type TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            rangeMin REAL NOT NULL,
-            rangeMax REAL NOT NULL,
-            gridCount INTEGER NOT NULL,
-            investment REAL NOT NULL,
-            leverage INTEGER NOT NULL,
-            stopLoss REAL,
-            takeProfit REAL,
-            status TEXT NOT NULL,
-            profitUsd REAL NOT NULL,
-            profitPercent REAL NOT NULL,
-            unrealizedProfitUsd REAL NOT NULL,
-            tradesCount INTEGER NOT NULL,
-            entryPrice REAL NOT NULL,
-            currentPrice REAL NOT NULL,
-            lastUpdated TEXT NOT NULL,
-            timezone TEXT NOT NULL,
-            cgroupsCpuLimit TEXT,
-            cgroupsMemoryLimit TEXT,
-            pid INTEGER,
-            memoryHeapMb REAL,
-            cpuAffinity TEXT,
-            version TEXT,
-            liquidationPrice REAL,
-            maintenanceMargin REAL,
-            grids TEXT,
-            configHistory TEXT
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS trade_logs (
-            id TEXT PRIMARY KEY,
-            botId TEXT NOT NULL,
-            botName TEXT NOT NULL,
-            broker TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            type TEXT NOT NULL,
-            price REAL NOT NULL,
-            amount REAL NOT NULL,
-            total REAL NOT NULL,
-            pnl REAL,
-            previousHash TEXT NOT NULL,
-            currentHash TEXT NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS security_audit_logs (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT NOT NULL,
-            username TEXT NOT NULL,
-            role TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT NOT NULL,
-            details TEXT NOT NULL,
-            ipAddress TEXT NOT NULL,
-            previousHash TEXT NOT NULL,
-            currentHash TEXT NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS risk_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            maxDailyDrawdown REAL NOT NULL,
-            maxAccountDrawdown REAL NOT NULL,
-            globalKillSwitch INTEGER NOT NULL,
-            maxLeverageLimit INTEGER NOT NULL,
-            dailyLossLimitUSD REAL NOT NULL,
-            restrictedSymbols TEXT NOT NULL,
-            singleAssetMaxAllocationPercent REAL NOT NULL,
-            industryCryptoMaxPercent REAL NOT NULL,
-            autoMeltDrawdownThreshold REAL NOT NULL,
-            autoMeltSharpeThreshold REAL NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS system_config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS mfa_action_tokens (
-            tokenHash TEXT PRIMARY KEY,
-            sessionIdHash TEXT NOT NULL,
-            username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            bodyHash TEXT NOT NULL,
-            expiresAt INTEGER NOT NULL,
-            usedAt INTEGER
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS broker_accounts (
-            id TEXT PRIMARY KEY,
-            broker TEXT NOT NULL,
-            accountAlias TEXT NOT NULL,
-            encryptedApiKey TEXT NOT NULL,
-            encryptedSecret TEXT NOT NULL,
-            encryptedPassphrase TEXT,
-            permissions TEXT NOT NULL,
-            isSandbox INTEGER NOT NULL DEFAULT 1,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS orders (
-            id TEXT PRIMARY KEY,
-            botId TEXT NOT NULL,
-            broker TEXT NOT NULL,
-            brokerAccountId TEXT NOT NULL,
-            clientOrderId TEXT NOT NULL,
-            brokerOrderId TEXT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            type TEXT NOT NULL,
-            price REAL NOT NULL,
-            quantity REAL NOT NULL,
-            status TEXT NOT NULL,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL,
-            lastError TEXT
-          )
-        `);
-
-        this.sqlDb.run(`
-          CREATE TABLE IF NOT EXISTS fills (
-            id TEXT PRIMARY KEY,
-            orderId TEXT NOT NULL,
-            brokerFillId TEXT,
-            price REAL NOT NULL,
-            quantity REAL NOT NULL,
-            fee REAL NOT NULL,
-            feeCurrency TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-          )
-        `, (err) => {
-          if (err) {
-            reject(err);
-          } else {
-            // Index creations for high performance, transaction-isolation, and append-only audits (P0-3)
-            this.sqlDb.run("CREATE INDEX IF NOT EXISTS idx_trade_logs_bot_time ON trade_logs(botId, timestamp);");
-            this.sqlDb.run("CREATE INDEX IF NOT EXISTS idx_trade_logs_broker_symbol_time ON trade_logs(broker, symbol, timestamp);");
-            this.sqlDb.run("CREATE INDEX IF NOT EXISTS idx_security_logs_time ON security_audit_logs(timestamp);");
-            this.sqlDb.run("CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(clientOrderId);");
-            this.loadAllDataAsync().then(resolve).catch(reject);
+      try {
+        if (fs.existsSync(JSON_FILE)) {
+          const raw = fs.readFileSync(JSON_FILE, "utf-8");
+          this.data = JSON.parse(raw);
+          if (!this.data.users) this.data.users = [];
+          if (!this.data.sessions) this.data.sessions = [];
+          if (!this.data.bots) this.data.bots = [];
+          if (!this.data.tradeLogs) this.data.tradeLogs = [];
+          if (!this.data.securityAuditLogs) this.data.securityAuditLogs = [];
+          if (!this.data.brokerAccounts) this.data.brokerAccounts = [];
+          if (!this.data.orders) this.data.orders = [];
+          if (!this.data.fills) this.data.fills = [];
+          if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
+          if (!this.data.riskSettings) {
+            this.data.riskSettings = {
+              maxDailyDrawdown: 8.0,
+              maxAccountDrawdown: 15.0,
+              globalKillSwitch: false,
+              maxLeverageLimit: 10,
+              dailyLossLimitUSD: 800,
+              restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+              singleAssetMaxAllocationPercent: 40,
+              industryCryptoMaxPercent: 60,
+              autoMeltDrawdownThreshold: 12.0,
+              autoMeltSharpeThreshold: 0.8
+            };
           }
-        });
-      });
-    });
-  }
-
-  private loadAllDataAsync(): Promise<void> {
-    this.data = {
-      users: [],
-      sessions: [],
-      bots: [],
-      tradeLogs: [],
-      securityAuditLogs: [],
-      riskSettings: {
-        maxDailyDrawdown: 8.0,
-        maxAccountDrawdown: 15.0,
-        globalKillSwitch: false,
-        maxLeverageLimit: 10,
-        dailyLossLimitUSD: 800,
-        restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
-        singleAssetMaxAllocationPercent: 40,
-        industryCryptoMaxPercent: 60,
-        autoMeltDrawdownThreshold: 12.0,
-        autoMeltSharpeThreshold: 0.8
-      },
-      ibConnectionMode: "web_api_proxy",
-      brokerAccounts: [],
-      orders: [],
-      fills: []
-    };
-
-    return new Promise<void>((resolve, reject) => {
-      this.sqlDb.serialize(() => {
-        const promises: Promise<any>[] = [];
-
-        // 1. Users
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM users", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows && rows.length > 0) {
-              this.data.users = rows.map(r => ({
-                username: r.username,
-                passwordHash: r.passwordHash,
-                role: r.role,
-                totpSecret: r.totpSecret,
-                isActive: r.isActive === 1,
-                tempTotpSecret: r.tempTotpSecret,
-                tempTotpExpiresAt: r.tempTotpExpiresAt,
-                mustEnrollTotp: r.mustEnrollTotp === 1
-              }));
-              res();
-            } else {
-              const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
-              const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
-              this.data.users = [
-                {
-                  username: seedUser,
-                  passwordHash: hashPassword(seedPass),
-                  role: "admin",
-                  totpSecret: null,
-                  isActive: true,
-                  mustEnrollTotp: true
-                }
-              ];
-              this.save();
-              res();
-            }
-          });
-        }));
-
-        // 2. Sessions
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM sessions", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows) {
-              this.data.sessions = rows.map(r => ({
-                tokenHash: r.tokenHash,
-                username: r.username,
-                role: r.role,
-                expiresAt: r.expiresAt
-              }));
-            }
-            res();
-          });
-        }));
-
-        // 3. Bots
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM bots", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows && rows.length > 0) {
-              this.data.bots = rows.map(r => ({
-                id: r.id,
-                name: r.name,
-                isEnabled: r.isEnabled === 1,
-                broker: r.broker,
-                symbol: r.symbol,
-                type: r.type,
-                direction: r.direction,
-                rangeMin: r.rangeMin,
-                rangeMax: r.rangeMax,
-                gridCount: r.gridCount,
-                investment: r.investment,
-                leverage: r.leverage,
-                stopLoss: r.stopLoss,
-                takeProfit: r.takeProfit,
-                status: r.status,
-                profitUsd: r.profitUsd,
-                profitPercent: r.profitPercent,
-                unrealizedProfitUsd: r.unrealizedProfitUsd,
-                tradesCount: r.tradesCount,
-                entryPrice: r.entryPrice,
-                currentPrice: r.currentPrice,
-                lastUpdated: r.lastUpdated,
-                timezone: r.timezone,
-                cgroupsCpuLimit: r.cgroupsCpuLimit,
-                cgroupsMemoryLimit: r.cgroupsMemoryLimit,
-                pid: r.pid,
-                memoryHeapMb: r.memoryHeapMb,
-                cpuAffinity: r.cpuAffinity,
-                version: r.version,
-                liquidationPrice: r.liquidationPrice,
-                maintenanceMargin: r.maintenanceMargin,
-                grids: JSON.parse(r.grids || "[]"),
-                configHistory: JSON.parse(r.configHistory || "[]")
-              }));
-              res();
-            } else {
-              this.data.bots = this.getSeedBots();
-              this.save();
-              res();
-            }
-          });
-        }));
-
-        // 4. Trade logs
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM trade_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows && rows.length > 0) {
-              this.data.tradeLogs = rows;
-              res();
-            } else {
-              this.data.tradeLogs = this.getSeedTradeLogs();
-              this.save();
-              res();
-            }
-          });
-        }));
-
-        // 5. Security audit logs
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM security_audit_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows && rows.length > 0) {
-              this.data.securityAuditLogs = rows;
-              res();
-            } else {
-              this.data.securityAuditLogs = this.getSeedSecurityLogs();
-              this.save();
-              res();
-            }
-          });
-        }));
-
-        // 6. Risk settings
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.get("SELECT * FROM risk_settings LIMIT 1", (err, row: any) => {
-            if (err) return rej(err);
-            if (row) {
-              this.data.riskSettings = {
-                maxDailyDrawdown: row.maxDailyDrawdown,
-                maxAccountDrawdown: row.maxAccountDrawdown,
-                globalKillSwitch: row.globalKillSwitch === 1,
-                maxLeverageLimit: row.maxLeverageLimit,
-                dailyLossLimitUSD: row.dailyLossLimitUSD,
-                restrictedSymbols: JSON.parse(row.restrictedSymbols || "[]"),
-                singleAssetMaxAllocationPercent: row.singleAssetMaxAllocationPercent,
-                industryCryptoMaxPercent: row.industryCryptoMaxPercent,
-                autoMeltDrawdownThreshold: row.autoMeltDrawdownThreshold,
-                autoMeltSharpeThreshold: row.autoMeltSharpeThreshold
-              };
-              res();
-            } else {
-              this.save();
-              res();
-            }
-          });
-        }));
-
-        // 7. System configurations
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.get("SELECT value FROM system_config WHERE key = 'ibConnectionMode'", (err, row: any) => {
-            if (err) return rej(err);
-            if (row) {
-              this.data.ibConnectionMode = row.value as any;
-            } else {
-              this.save();
-            }
-            res();
-          });
-        }));
-
-        // 8. Broker Accounts
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM broker_accounts", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows) {
-              this.data.brokerAccounts = rows.map(r => ({
-                id: r.id,
-                broker: r.broker,
-                accountAlias: r.accountAlias,
-                encryptedApiKey: r.encryptedApiKey,
-                encryptedSecret: r.encryptedSecret,
-                encryptedPassphrase: r.encryptedPassphrase || undefined,
-                permissions: r.permissions,
-                isSandbox: r.isSandbox === 1,
-                createdAt: r.createdAt,
-                updatedAt: r.updatedAt
-              }));
-            }
-            res();
-          });
-        }));
-
-        // 9. Orders
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM orders ORDER BY createdAt DESC", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows) {
-              this.data.orders = rows.map(r => ({
-                id: r.id,
-                botId: r.botId,
-                broker: r.broker as any,
-                brokerAccountId: r.brokerAccountId,
-                clientOrderId: r.clientOrderId,
-                brokerOrderId: r.brokerOrderId || undefined,
-                symbol: r.symbol,
-                side: r.side as any,
-                type: r.type as any,
-                price: r.price,
-                quantity: r.quantity,
-                status: r.status as any,
-                createdAt: r.createdAt,
-                updatedAt: r.updatedAt,
-                lastError: r.lastError || undefined
-              }));
-            }
-            res();
-          });
-        }));
-
-        // 10. Fills
-        promises.push(new Promise<void>((res, rej) => {
-          this.sqlDb.all("SELECT * FROM fills ORDER BY timestamp DESC", (err, rows: any[]) => {
-            if (err) return rej(err);
-            if (rows) {
-              this.data.fills = rows;
-            }
-            res();
-          });
-        }));
-
-        Promise.all(promises).then(() => resolve()).catch(reject);
-      });
+          if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
+        } else {
+          const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
+          const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+          this.data = {
+            users: [
+              {
+                username: seedUser,
+                passwordHash: hashPassword(seedPass),
+                role: "admin",
+                totpSecret: null,
+                isActive: true,
+                mustEnrollTotp: true
+              }
+            ],
+            sessions: [],
+            bots: this.getSeedBots(),
+            tradeLogs: this.getSeedTradeLogs(),
+            securityAuditLogs: this.getSeedSecurityLogs(),
+            riskSettings: {
+              maxDailyDrawdown: 8.0,
+              maxAccountDrawdown: 15.0,
+              globalKillSwitch: false,
+              maxLeverageLimit: 10,
+              dailyLossLimitUSD: 800,
+              restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+              singleAssetMaxAllocationPercent: 40,
+              industryCryptoMaxPercent: 60,
+              autoMeltDrawdownThreshold: 12.0,
+              autoMeltSharpeThreshold: 0.8
+            },
+            ibConnectionMode: "web_api_proxy",
+            brokerAccounts: [],
+            orders: [],
+            fills: [],
+            mfaActionTokens: []
+          };
+          this.save();
+        }
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
     });
   }
 
@@ -903,147 +520,12 @@ export class AegisDB {
   }
 
   public save() {
-    this.sqlDb.serialize(() => {
-      this.sqlDb.run("BEGIN TRANSACTION;");
-
-      // 1. Users table
-      this.sqlDb.run("DELETE FROM users;");
-      const stmtUser = this.sqlDb.prepare("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-      for (const u of this.data.users) {
-        stmtUser.run(
-          u.username,
-          u.passwordHash,
-          u.role,
-          u.totpSecret || null,
-          u.isActive ? 1 : 0,
-          u.tempTotpSecret || null,
-          u.tempTotpExpiresAt || null,
-          u.mustEnrollTotp ? 1 : 0
-        );
-      }
-      stmtUser.finalize();
-
-      // 2. Sessions table
-      this.sqlDb.run("DELETE FROM sessions;");
-      const stmtSess = this.sqlDb.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?)");
-      for (const s of this.data.sessions) {
-        stmtSess.run(s.tokenHash, s.username, s.role, s.expiresAt);
-      }
-      stmtSess.finalize();
-
-      // 3. Bots table
-      this.sqlDb.run("DELETE FROM bots;");
-      const stmtBot = this.sqlDb.prepare(`
-        INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const b of this.data.bots) {
-        stmtBot.run(
-          b.id,
-          b.name,
-          b.isEnabled ? 1 : 0,
-          b.broker,
-          b.symbol,
-          b.type,
-          b.direction,
-          b.rangeMin,
-          b.rangeMax,
-          b.gridCount,
-          b.investment,
-          b.leverage,
-          b.stopLoss || null,
-          b.takeProfit || null,
-          b.status,
-          b.profitUsd,
-          b.profitPercent,
-          b.unrealizedProfitUsd,
-          b.tradesCount,
-          b.entryPrice,
-          b.currentPrice,
-          b.lastUpdated,
-          b.timezone,
-          b.cgroupsCpuLimit || null,
-          b.cgroupsMemoryLimit || null,
-          b.pid || null,
-          b.memoryHeapMb || null,
-          b.cpuAffinity || null,
-          b.version || null,
-          b.liquidationPrice || null,
-          b.maintenanceMargin || null,
-          JSON.stringify(b.grids || []),
-          JSON.stringify(b.configHistory || [])
-        );
-      }
-      stmtBot.finalize();
-
-      // 4. Trade logs table
-      this.sqlDb.run("DELETE FROM trade_logs;");
-      const stmtTrade = this.sqlDb.prepare(`
-        INSERT INTO trade_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const t of this.data.tradeLogs) {
-        stmtTrade.run(
-          t.id,
-          t.botId,
-          t.botName,
-          t.broker,
-          t.symbol,
-          t.timestamp,
-          t.type,
-          t.price,
-          t.amount,
-          t.total,
-          t.pnl === undefined ? null : t.pnl,
-          t.previousHash || "",
-          t.currentHash || ""
-        );
-      }
-      stmtTrade.finalize();
-
-      // 5. Security audit logs table
-      this.sqlDb.run("DELETE FROM security_audit_logs;");
-      const stmtAudit = this.sqlDb.prepare(`
-        INSERT INTO security_audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const a of this.data.securityAuditLogs) {
-        stmtAudit.run(
-          a.id,
-          a.timestamp,
-          a.username,
-          a.role,
-          a.action,
-          a.target,
-          a.details,
-          a.ipAddress,
-          a.previousHash || "",
-          a.currentHash || ""
-        );
-      }
-      stmtAudit.finalize();
-
-      // 6. Risk settings table
-      this.sqlDb.run("DELETE FROM risk_settings;");
-      const r = this.data.riskSettings;
-      this.sqlDb.run(`
-        INSERT INTO risk_settings (maxDailyDrawdown, maxAccountDrawdown, globalKillSwitch, maxLeverageLimit, dailyLossLimitUSD, restrictedSymbols, singleAssetMaxAllocationPercent, industryCryptoMaxPercent, autoMeltDrawdownThreshold, autoMeltSharpeThreshold)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        r.maxDailyDrawdown,
-        r.maxAccountDrawdown,
-        r.globalKillSwitch ? 1 : 0,
-        r.maxLeverageLimit,
-        r.dailyLossLimitUSD,
-        JSON.stringify(r.restrictedSymbols || []),
-        r.singleAssetMaxAllocationPercent,
-        r.industryCryptoMaxPercent,
-        r.autoMeltDrawdownThreshold,
-        r.autoMeltSharpeThreshold
-      ]);
-
-      // 7. System config table
-      this.sqlDb.run("INSERT OR REPLACE INTO system_config VALUES ('ibConnectionMode', ?)", [this.data.ibConnectionMode]);
-
-      this.sqlDb.run("COMMIT;");
-    });
+    const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
+    try {
+      fs.writeFileSync(JSON_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+    } catch (err) {
+      console.error("Database save failed:", err);
+    }
   }
 
   public appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
@@ -1062,23 +544,7 @@ export class AegisDB {
     };
     entry.currentHash = computeSecurityHash(entry, prev);
     this.data.securityAuditLogs.unshift(entry);
-
-    // Strictly append-only SQLite insert, protecting from deletion or tampering (P0-3)
-    this.sqlDb.run(`
-      INSERT INTO security_audit_logs (id, timestamp, username, role, action, target, details, ipAddress, previousHash, currentHash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      entry.id,
-      entry.timestamp,
-      entry.username,
-      entry.role,
-      entry.action,
-      entry.target,
-      entry.details,
-      entry.ipAddress,
-      entry.previousHash,
-      entry.currentHash
-    ]);
+    this.save();
   }
 
   public appendTradeLog(log: Omit<TradeLog, "previousHash" | "currentHash">): TradeLog {
@@ -1090,27 +556,7 @@ export class AegisDB {
     };
     newLog.currentHash = computeLogHash(newLog, prev);
     this.data.tradeLogs.unshift(newLog);
-
-    // Strictly append-only trade ledger insertion (P0-3)
-    this.sqlDb.run(`
-      INSERT INTO trade_logs (id, botId, botName, broker, symbol, timestamp, type, price, amount, total, pnl, previousHash, currentHash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      newLog.id,
-      newLog.botId,
-      newLog.botName,
-      newLog.broker,
-      newLog.symbol,
-      newLog.timestamp,
-      newLog.type,
-      newLog.price,
-      newLog.amount,
-      newLog.total,
-      newLog.pnl === undefined ? null : newLog.pnl,
-      newLog.previousHash,
-      newLog.currentHash
-    ]);
-
+    this.save();
     return newLog;
   }
 
@@ -1121,49 +567,12 @@ export class AegisDB {
     } else {
       this.data.bots.push(bot);
     }
-
-    this.sqlDb.run(`
-      INSERT OR REPLACE INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      bot.id,
-      bot.name,
-      bot.isEnabled ? 1 : 0,
-      bot.broker,
-      bot.symbol,
-      bot.type,
-      bot.direction,
-      bot.rangeMin,
-      bot.rangeMax,
-      bot.gridCount,
-      bot.investment,
-      bot.leverage,
-      bot.stopLoss || null,
-      bot.takeProfit || null,
-      bot.status,
-      bot.profitUsd,
-      bot.profitPercent,
-      bot.unrealizedProfitUsd,
-      bot.tradesCount,
-      bot.entryPrice,
-      bot.currentPrice,
-      bot.lastUpdated,
-      bot.timezone || "UTC",
-      bot.cgroupsCpuLimit || null,
-      bot.cgroupsMemoryLimit || null,
-      bot.pid || null,
-      bot.memoryHeapMb || null,
-      bot.cpuAffinity || null,
-      bot.version || null,
-      bot.liquidationPrice || null,
-      bot.maintenanceMargin || null,
-      JSON.stringify(bot.grids || []),
-      JSON.stringify(bot.configHistory || [])
-    ]);
+    this.save();
   }
 
   public deleteBot(id: string) {
     this.data.bots = this.data.bots.filter(b => b.id !== id);
-    this.sqlDb.run("DELETE FROM bots WHERE id = ?", [id]);
+    this.save();
   }
 
   public upsertUser(u: DBUser) {
@@ -1173,28 +582,13 @@ export class AegisDB {
     } else {
       this.data.users.push(u);
     }
-    this.sqlDb.run(`
-      INSERT OR REPLACE INTO users (username, passwordHash, role, totpSecret, isActive, tempTotpSecret, tempTotpExpiresAt, mustEnrollTotp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      u.username,
-      u.passwordHash,
-      u.role,
-      u.totpSecret || null,
-      u.isActive ? 1 : 0,
-      u.tempTotpSecret || null,
-      u.tempTotpExpiresAt || null,
-      u.mustEnrollTotp ? 1 : 0
-    ]);
+    this.save();
   }
 
   public deleteUser(username: string) {
     this.data.users = this.data.users.filter(user => user.username !== username);
-    this.sqlDb.serialize(() => {
-      this.sqlDb.run("DELETE FROM users WHERE username = ?", [username]);
-      this.sqlDb.run("DELETE FROM sessions WHERE username = ?", [username]);
-    });
     this.data.sessions = this.data.sessions.filter(s => s.username !== username);
+    this.save();
   }
 
   public upsertSession(s: DBSession) {
@@ -1204,40 +598,22 @@ export class AegisDB {
     } else {
       this.data.sessions.push(s);
     }
-    this.sqlDb.run(`
-      INSERT OR REPLACE INTO sessions (tokenHash, username, role, expiresAt)
-      VALUES (?, ?, ?, ?)
-    `, [s.tokenHash, s.username, s.role, s.expiresAt]);
+    this.save();
   }
 
   public deleteSession(tokenHash: string) {
     this.data.sessions = this.data.sessions.filter(s => s.tokenHash !== tokenHash);
-    this.sqlDb.run("DELETE FROM sessions WHERE tokenHash = ?", [tokenHash]);
+    this.save();
   }
 
   public updateRiskSettings(r: RiskSettings) {
     this.data.riskSettings = r;
-    this.sqlDb.run("DELETE FROM risk_settings;");
-    this.sqlDb.run(`
-      INSERT INTO risk_settings (maxDailyDrawdown, maxAccountDrawdown, globalKillSwitch, maxLeverageLimit, dailyLossLimitUSD, restrictedSymbols, singleAssetMaxAllocationPercent, industryCryptoMaxPercent, autoMeltDrawdownThreshold, autoMeltSharpeThreshold)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      r.maxDailyDrawdown,
-      r.maxAccountDrawdown,
-      r.globalKillSwitch ? 1 : 0,
-      r.maxLeverageLimit,
-      r.dailyLossLimitUSD,
-      JSON.stringify(r.restrictedSymbols || []),
-      r.singleAssetMaxAllocationPercent,
-      r.industryCryptoMaxPercent,
-      r.autoMeltDrawdownThreshold,
-      r.autoMeltSharpeThreshold
-    ]);
+    this.save();
   }
 
   public updateIbConnectionMode(mode: 'gateway' | 'web_api_proxy') {
     this.data.ibConnectionMode = mode;
-    this.sqlDb.run("INSERT OR REPLACE INTO system_config VALUES ('ibConnectionMode', ?)", [mode]);
+    this.save();
   }
 
   public upsertBrokerAccount(acc: BrokerAccount) {
@@ -1247,50 +623,17 @@ export class AegisDB {
     } else {
       this.data.brokerAccounts.push(acc);
     }
-    this.sqlDb.run(`
-      INSERT OR REPLACE INTO broker_accounts (id, broker, accountAlias, encryptedApiKey, encryptedSecret, encryptedPassphrase, permissions, isSandbox, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      acc.id,
-      acc.broker,
-      acc.accountAlias,
-      acc.encryptedApiKey,
-      acc.encryptedSecret,
-      acc.encryptedPassphrase || null,
-      acc.permissions,
-      acc.isSandbox ? 1 : 0,
-      acc.createdAt,
-      acc.updatedAt
-    ]);
+    this.save();
   }
 
   public deleteBrokerAccount(id: string) {
     this.data.brokerAccounts = this.data.brokerAccounts.filter(a => a.id !== id);
-    this.sqlDb.run("DELETE FROM broker_accounts WHERE id = ?", [id]);
+    this.save();
   }
 
   public insertOrder(ord: Order) {
     this.data.orders.unshift(ord);
-    this.sqlDb.run(`
-      INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, side, type, price, quantity, status, createdAt, updatedAt, lastError)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      ord.id,
-      ord.botId,
-      ord.broker,
-      ord.brokerAccountId,
-      ord.clientOrderId,
-      ord.brokerOrderId || null,
-      ord.symbol,
-      ord.side,
-      ord.type,
-      ord.price,
-      ord.quantity,
-      ord.status,
-      ord.createdAt,
-      ord.updatedAt,
-      ord.lastError || null
-    ]);
+    this.save();
   }
 
   public updateOrderStatus(clientOrderId: string, status: Order["status"], brokerOrderId?: string, lastError?: string) {
@@ -1300,41 +643,31 @@ export class AegisDB {
       if (brokerOrderId) ord.brokerOrderId = brokerOrderId;
       if (lastError) ord.lastError = lastError;
       ord.updatedAt = new Date().toISOString();
-      
-      this.sqlDb.run(`
-        UPDATE orders
-        SET status = ?, brokerOrderId = COALESCE(?, brokerOrderId), lastError = COALESCE(?, lastError), updatedAt = ?
-        WHERE clientOrderId = ?
-      `, [status, brokerOrderId || null, lastError || null, ord.updatedAt, clientOrderId]);
+      this.save();
     }
   }
 
   public insertFill(fill: Fill) {
     this.data.fills.unshift(fill);
-    this.sqlDb.run(`
-      INSERT INTO fills (id, orderId, brokerFillId, price, quantity, fee, feeCurrency, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      fill.id,
-      fill.orderId,
-      fill.brokerFillId || null,
-      fill.price,
-      fill.quantity,
-      fill.fee,
-      fill.feeCurrency,
-      fill.timestamp
-    ]);
+    this.save();
   }
 
   public getMfaTokensDb(callback: (err: any, rows: any[]) => void) {
-    this.sqlDb.all("SELECT * FROM mfa_action_tokens", callback);
+    callback(null, this.data.mfaActionTokens || []);
   }
 
   public insertMfaToken(tokenHash: string, sessionIdHash: string, username: string, action: string, bodyHash: string, expiresAt: number) {
-    this.sqlDb.run(`
-      INSERT INTO mfa_action_tokens (tokenHash, sessionIdHash, username, action, bodyHash, expiresAt)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `, [tokenHash, sessionIdHash, username, action, bodyHash, expiresAt]);
+    if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
+    this.data.mfaActionTokens.push({
+      tokenHash,
+      sessionIdHash,
+      username,
+      action,
+      bodyHash,
+      expiresAt,
+      usedAt: null
+    });
+    this.save();
   }
 
   public consumeMfaTokenAsync(
@@ -1345,27 +678,23 @@ export class AegisDB {
     bodyHash: string
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      // Execute standard atomic conditional update to guarantee single consumption (P0-4 compliance)
       const now = Date.now();
-      this.sqlDb.run(`
-        UPDATE mfa_action_tokens
-        SET usedAt = ?
-        WHERE tokenHash = ?
-          AND username = ?
-          AND sessionIdHash = ?
-          AND action = ?
-          AND bodyHash = ?
-          AND usedAt IS NULL
-          AND expiresAt >= ?
-      `, [now, tokenHash, username, sessionIdHash, action, bodyHash, now], function(err) {
-        if (err) {
-          return reject(err);
-        }
-        if (this.changes !== 1) {
-          return reject(new Error("MFA authorization failed: token is expired, already used, or bound to a different request context"));
-        }
-        resolve();
-      });
+      if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
+      const token = this.data.mfaActionTokens.find(
+        t => t.tokenHash === tokenHash &&
+             t.username === username &&
+             t.sessionIdHash === sessionIdHash &&
+             t.action === action &&
+             t.bodyHash === bodyHash &&
+             !t.usedAt &&
+             t.expiresAt >= now
+      );
+      if (!token) {
+        return reject(new Error("MFA authorization failed: token is expired, already used, or bound to a different request context"));
+      }
+      token.usedAt = now;
+      this.save();
+      resolve();
     });
   }
 }
