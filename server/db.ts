@@ -1,19 +1,89 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import sqlite3 from "sqlite3";
 import { BotConfig, TradeLog, RiskSettings } from "../src/types";
+
+// --- ENVIRONMENT INITIALIZATION & FAIL-FAST VALIDATION ---
+// 1. Auto-seed .env file if it does not exist with strong dynamic values
+const envPath = path.join(process.cwd(), ".env");
+if (!fs.existsSync(envPath)) {
+  const adminUser = "admin";
+  const adminPass = "Aegis_" + crypto.randomBytes(6).toString("hex") + "!";
+  
+  // Generate random base32 standard secret
+  const base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let adminTotp = "";
+  for (let i = 0; i < 16; i++) {
+    adminTotp += base32Chars[crypto.randomInt(base32Chars.length)];
+  }
+  
+  const encKey = crypto.randomBytes(32).toString("base64");
+  const sessSec = crypto.randomBytes(32).toString("base64");
+
+  const envContent = `# AegisQuant Secure Environment Configuration
+BOOTSTRAP_ADMIN_USER=${adminUser}
+BOOTSTRAP_ADMIN_PASSWORD=${adminPass}
+BOOTSTRAP_ADMIN_TOTP_SECRET=${adminTotp}
+ENCRYPTION_KEY=${encKey}
+SESSION_SECRET=${sessSec}
+`;
+  fs.writeFileSync(envPath, envContent, "utf-8");
+  console.log("==================================================================");
+  console.log("  SECURE BOOTSTRAP: Created fresh .env with dynamic secrets.      ");
+  console.log(`  Admin User: ${adminUser}                                        `);
+  console.log(`  Admin Password: ${adminPass}                                    `);
+  console.log(`  Admin TOTP Secret: ${adminTotp}                                 `);
+  console.log("==================================================================");
+}
+
+// Load environment variables
+import dotenv from "dotenv";
+dotenv.config();
+
+// Fail-fast verification of required secrets as demanded by P0-1
+const requiredEnvVars = [
+  "BOOTSTRAP_ADMIN_USER",
+  "BOOTSTRAP_ADMIN_PASSWORD",
+  "BOOTSTRAP_ADMIN_TOTP_SECRET",
+  "ENCRYPTION_KEY",
+  "SESSION_SECRET"
+];
+
+for (const key of requiredEnvVars) {
+  if (!process.env[key]) {
+    console.error(`FATAL: Missing critical security environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+
+// Validate ENCRYPTION_KEY format (must be 32 bytes when base64 decoded)
+const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY!;
+let decodedEncryptionKey: Buffer;
+try {
+  decodedEncryptionKey = Buffer.from(ENCRYPTION_KEY_RAW, "base64");
+} catch (err) {
+  console.error("FATAL: ENCRYPTION_KEY must be a valid base64 encoded string.");
+  process.exit(1);
+}
+if (decodedEncryptionKey.length !== 32) {
+  console.error(`FATAL: ENCRYPTION_KEY must decode to exactly 32 bytes (got ${decodedEncryptionKey.length} bytes).`);
+  process.exit(1);
+}
 
 export interface DBUser {
   username: string;
   passwordHash: string;
   role: 'admin' | 'operator' | 'viewer';
-  totpSecret: string; // standard base32 secret
+  totpSecret: string | null; // standard base32 secret (AES-GCM encrypted)
   isActive: boolean;
-  tempTotpSecret?: string;
+  tempTotpSecret?: string | null;
+  tempTotpExpiresAt?: number | null;
+  mustEnrollTotp?: boolean;
 }
 
 export interface DBSession {
-  token: string;
+  tokenHash: string; // sha256(token + SESSION_SECRET) to protect token leakage in db
   username: string;
   role: 'admin' | 'operator' | 'viewer';
   expiresAt: number;
@@ -43,7 +113,7 @@ export interface AegisDatabase {
 }
 
 const DB_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DB_DIR, "aegis_db.json");
+const SQLITE_FILE = path.join(DB_DIR, "aegis_secure.db");
 
 // Dynamic base32 decoder for standard Google Authenticator TOTP keys
 function base32ToBuffer(secret: string): Buffer {
@@ -58,7 +128,7 @@ function base32ToBuffer(secret: string): Buffer {
   }
   const bytes: number[] = [];
   for (let i = 0; i + 8 <= bits.length; i += 8) {
-    bytes.push(parseInt(bits.substr(i, 8), 2));
+    bytes.push(parseInt(bits.substring(i, i + 8), 2));
   }
   return Buffer.from(bytes);
 }
@@ -110,7 +180,7 @@ export function verifyTOTP(secret: string, token: string): boolean {
   return false;
 }
 
-// PBKDF2 Password Hashing (Upgraded to 310,000 iterations for compliance)
+// PBKDF2 Password Hashing (310,000 iterations + SHA-512)
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString("hex");
   const hash = crypto.pbkdf2Sync(password, salt, 310000, 64, "sha512").toString("hex");
@@ -129,39 +199,44 @@ export function verifyPassword(password: string, stored: string): boolean {
   }
 }
 
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "aegis_critical_secure_key_32_bytes";
-
+// AES-256-GCM Secure Encryption complying with P0-3
+// Format: v1:k1:iv:ciphertext:authTag (No fallbacks or silent plaintext degradation)
 export function encryptSecret(plainText: string): string {
   try {
     const iv = crypto.randomBytes(12);
-    const key = crypto.createHash("sha256").update(ENCRYPTION_KEY).digest();
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    // Use decoded 32-byte encryption key
+    const cipher = crypto.createCipheriv("aes-256-gcm", decodedEncryptionKey, iv);
     let encrypted = cipher.update(plainText, "utf8", "hex");
     encrypted += cipher.final("hex");
     const authTag = cipher.getAuthTag().toString("hex");
-    return `${iv.toString("hex")}:${encrypted}:${authTag}`;
-  } catch (err) {
-    console.error("Encryption failed:", err);
-    return plainText;
+    return `v1:k1:${iv.toString("hex")}:${encrypted}:${authTag}`;
+  } catch (err: any) {
+    console.error("Encryption failure:", err);
+    throw new Error(`CRITICAL_DECRYPTION_EXCEPTION: Cryptographic encryption failed - ${err.message}`);
   }
 }
 
 export function decryptSecret(encryptedText: string): string {
   try {
-    if (!encryptedText.includes(":")) return encryptedText;
-    const [ivHex, encrypted, authTagHex] = encryptedText.split(":");
-    if (!ivHex || !encrypted || !authTagHex) return encryptedText;
+    if (!encryptedText.startsWith("v1:k1:")) {
+      throw new Error("Invalid cipher format (no matching version header)");
+    }
+    const parts = encryptedText.split(":");
+    if (parts.length !== 5) {
+      throw new Error("Malformed cipher metadata blocks.");
+    }
+    const [, , ivHex, encryptedHex, authTagHex] = parts;
     const iv = Buffer.from(ivHex, "hex");
     const authTag = Buffer.from(authTagHex, "hex");
-    const key = crypto.createHash("sha256").update(ENCRYPTION_KEY).digest();
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    
+    const decipher = crypto.createDecipheriv("aes-256-gcm", decodedEncryptionKey, iv);
     decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(encrypted, "hex", "utf8");
+    let decrypted = decipher.update(encryptedHex, "hex", "utf8");
     decrypted += decipher.final("utf8");
     return decrypted;
-  } catch (err) {
-    console.error("Decryption failed:", err);
-    return encryptedText;
+  } catch (err: any) {
+    console.error("Decryption failure:", err);
+    throw new Error(`CRITICAL_DECRYPTION_EXCEPTION: Cryptographic decryption failed - ${err.message}`);
   }
 }
 
@@ -177,283 +252,164 @@ export function computeSecurityHash(log: SecurityAuditEntry, prevHash: string): 
 }
 
 export class AegisDB {
-  private data: AegisDatabase;
+  private data!: AegisDatabase;
+  private sqlDb!: sqlite3.Database;
 
   constructor() {
-    this.data = this.load();
+    this.initDatabase();
   }
 
-  private load(): AegisDatabase {
+  private initDatabase() {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
 
-    if (fs.existsSync(DB_FILE)) {
-      try {
-        const raw = fs.readFileSync(DB_FILE, "utf-8");
-        // Sweep for compromised legacy strings. Force cleanup on detection.
-        const compromised = [
-          "aegisquant",
-          "operator2026",
-          "viewer2026",
-          "KVKVE42",
-          "MNSFEY",
-          "OVYGS"
-        ];
-        if (compromised.some(leak => raw.includes(leak))) {
-          console.warn("Leaked legacy credentials found in persistent JSON file. Purging file...");
-          fs.unlinkSync(DB_FILE);
-        } else {
-          return JSON.parse(raw);
-        }
-      } catch (err) {
-        console.error("Database parsing failed. Repairing data...", err);
-      }
-    }
+    // Connect to SQLite Database
+    this.sqlDb = new sqlite3.Database(SQLITE_FILE);
+    
+    // Enable WAL journal mode for performance and crash recovery (P0-4)
+    this.sqlDb.run("PRAGMA journal_mode=WAL;");
 
-    // Default bootstrap credentials securely defined at runtime or loaded from environment
-    const adminUser = process.env.BOOTSTRAP_ADMIN_USER || "admin";
-    const adminPass = process.env.BOOTSTRAP_ADMIN_PASSWORD || "AegisSecure2026!";
-    const adminTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET || "NBSWY3DPEB3W64TBNQ"; // base32 for admin2026
+    // Create Tables synchronously for safety on startup
+    this.sqlDb.serialize(() => {
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS users (
+          username TEXT PRIMARY KEY,
+          passwordHash TEXT NOT NULL,
+          role TEXT NOT NULL,
+          totpSecret TEXT,
+          isActive INTEGER NOT NULL DEFAULT 1,
+          tempTotpSecret TEXT,
+          tempTotpExpiresAt INTEGER,
+          mustEnrollTotp INTEGER NOT NULL DEFAULT 0
+        )
+      `);
 
-    // Secure Seeding (Single Admin User initially bootstrapped, operator/viewer added by admin dynamically)
-    const seedDb: AegisDatabase = {
-      users: [
-        {
-          username: adminUser,
-          passwordHash: hashPassword(adminPass),
-          role: "admin",
-          totpSecret: encryptSecret(adminTotp),
-          isActive: true
-        }
-      ],
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          tokenHash TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          role TEXT NOT NULL,
+          expiresAt INTEGER NOT NULL
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS bots (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          isEnabled INTEGER NOT NULL,
+          broker TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          type TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          rangeMin REAL NOT NULL,
+          rangeMax REAL NOT NULL,
+          gridCount INTEGER NOT NULL,
+          investment REAL NOT NULL,
+          leverage INTEGER NOT NULL,
+          stopLoss REAL,
+          takeProfit REAL,
+          status TEXT NOT NULL,
+          profitUsd REAL NOT NULL,
+          profitPercent REAL NOT NULL,
+          unrealizedProfitUsd REAL NOT NULL,
+          tradesCount INTEGER NOT NULL,
+          entryPrice REAL NOT NULL,
+          currentPrice REAL NOT NULL,
+          lastUpdated TEXT NOT NULL,
+          timezone TEXT NOT NULL,
+          cgroupsCpuLimit TEXT,
+          cgroupsMemoryLimit TEXT,
+          pid INTEGER,
+          memoryHeapMb REAL,
+          cpuAffinity TEXT,
+          version TEXT,
+          liquidationPrice REAL,
+          maintenanceMargin REAL,
+          grids TEXT,
+          configHistory TEXT
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS trade_logs (
+          id TEXT PRIMARY KEY,
+          botId TEXT NOT NULL,
+          botName TEXT NOT NULL,
+          broker TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          type TEXT NOT NULL,
+          price REAL NOT NULL,
+          amount REAL NOT NULL,
+          total REAL NOT NULL,
+          pnl REAL,
+          previousHash TEXT NOT NULL,
+          currentHash TEXT NOT NULL
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS security_audit_logs (
+          id TEXT PRIMARY KEY,
+          timestamp TEXT NOT NULL,
+          username TEXT NOT NULL,
+          role TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target TEXT NOT NULL,
+          details TEXT NOT NULL,
+          ipAddress TEXT NOT NULL,
+          previousHash TEXT NOT NULL,
+          currentHash TEXT NOT NULL
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS risk_settings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          maxDailyDrawdown REAL NOT NULL,
+          maxAccountDrawdown REAL NOT NULL,
+          globalKillSwitch INTEGER NOT NULL,
+          maxLeverageLimit INTEGER NOT NULL,
+          dailyLossLimitUSD REAL NOT NULL,
+          restrictedSymbols TEXT NOT NULL,
+          singleAssetMaxAllocationPercent REAL NOT NULL,
+          industryCryptoMaxPercent REAL NOT NULL,
+          autoMeltDrawdownThreshold REAL NOT NULL,
+          autoMeltSharpeThreshold REAL NOT NULL
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS system_config (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `);
+
+      this.sqlDb.run(`
+        CREATE TABLE IF NOT EXISTS mfa_action_tokens (
+          tokenHash TEXT PRIMARY KEY,
+          sessionIdHash TEXT NOT NULL,
+          username TEXT NOT NULL,
+          action TEXT NOT NULL,
+          bodyHash TEXT NOT NULL,
+          expiresAt INTEGER NOT NULL,
+          usedAt INTEGER
+        )
+      `);
+    });
+
+    this.loadAllData();
+  }
+
+  private loadAllData() {
+    this.data = {
+      users: [],
       sessions: [],
-      bots: [
-        {
-          id: "bot_1",
-          name: "Binance Spot BTC Grid",
-          isEnabled: true,
-          broker: "Binance",
-          symbol: "BTC/USDT",
-          type: "spot_grid",
-          direction: "neutral",
-          rangeMin: 60000,
-          rangeMax: 70000,
-          gridCount: 10,
-          investment: 2000,
-          leverage: 1,
-          stopLoss: 59000,
-          takeProfit: 71000,
-          status: "running",
-          profitUsd: 145.20,
-          profitPercent: 7.26,
-          unrealizedProfitUsd: 22.40,
-          tradesCount: 18,
-          grids: this.generateGrids(60000, 70000, 10, 64200, 2000 / 10),
-          entryPrice: 63500,
-          currentPrice: 64200,
-          lastUpdated: new Date().toISOString(),
-          timezone: "UTC",
-          cgroupsCpuLimit: "Max 50% CPU",
-          cgroupsMemoryLimit: "Max 3G RAM",
-          pid: 4210,
-          memoryHeapMb: 98.4,
-          cpuAffinity: "CPU Core 0",
-          version: "1.0.0",
-          configHistory: [
-            {
-              version: "1.0.0",
-              timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-              rangeMin: 60000,
-              rangeMax: 70000,
-              gridCount: 10,
-              investment: 2000,
-              leverage: 1,
-            }
-          ]
-        },
-        {
-          id: "bot_2",
-          name: "OKX Futures ETH Long",
-          isEnabled: true,
-          broker: "OKX",
-          symbol: "ETH/USDT",
-          type: "futures_grid",
-          direction: "long",
-          rangeMin: 3100,
-          rangeMax: 3600,
-          gridCount: 8,
-          investment: 1000,
-          leverage: 5,
-          stopLoss: 2900,
-          takeProfit: 3800,
-          status: "running",
-          profitUsd: 84.50,
-          profitPercent: 8.45,
-          unrealizedProfitUsd: -12.30,
-          tradesCount: 12,
-          grids: this.generateGrids(3100, 3600, 8, 3350, 1000 * 5 / 8),
-          entryPrice: 3300,
-          currentPrice: 3350,
-          lastUpdated: new Date().toISOString(),
-          timezone: "UTC",
-          cgroupsCpuLimit: "Max 50% CPU",
-          cgroupsMemoryLimit: "Max 3G RAM",
-          pid: 4211,
-          memoryHeapMb: 112.1,
-          cpuAffinity: "CPU Core 1",
-          version: "1.0.0",
-          configHistory: [
-            {
-              version: "1.0.0",
-              timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-              rangeMin: 3100,
-              rangeMax: 3600,
-              gridCount: 8,
-              investment: 1000,
-              leverage: 5,
-            }
-          ],
-          liquidationPrice: Math.round(3300 * (1 - (1 * 0.8) / 5) * 100) / 100,
-          maintenanceMargin: Math.round(1000 * 0.05 * 100) / 100
-        },
-        {
-          id: "bot_3",
-          name: "Tiger US stock NVDA Grid",
-          isEnabled: false,
-          broker: "Tiger",
-          symbol: "NVDA",
-          type: "spot_grid",
-          direction: "neutral",
-          rangeMin: 110,
-          rangeMax: 140,
-          gridCount: 6,
-          investment: 3000,
-          leverage: 1,
-          status: "stopped",
-          profitUsd: 0.00,
-          profitPercent: 0.00,
-          unrealizedProfitUsd: 0.00,
-          tradesCount: 0,
-          grids: this.generateGrids(110, 140, 6, 125, 3000 / 6),
-          entryPrice: 125,
-          currentPrice: 125,
-          lastUpdated: new Date().toISOString(),
-          timezone: "America/New_York",
-          cgroupsCpuLimit: "Uncapped",
-          cgroupsMemoryLimit: "Uncapped",
-          pid: 4212,
-          memoryHeapMb: 104.5,
-          cpuAffinity: "CPU Core 2",
-          version: "1.0.0",
-          configHistory: [
-            {
-              version: "1.0.0",
-              timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-              rangeMin: 110,
-              rangeMax: 140,
-              gridCount: 6,
-              investment: 3000,
-              leverage: 1,
-            }
-          ]
-        },
-        {
-          id: "bot_4",
-          name: "Longbridge HK stock TSLA Grid",
-          isEnabled: false,
-          broker: "Longbridge",
-          symbol: "TSLA",
-          type: "spot_grid",
-          direction: "neutral",
-          rangeMin: 160,
-          rangeMax: 200,
-          gridCount: 8,
-          investment: 1500,
-          leverage: 1,
-          status: "stopped",
-          profitUsd: 52.10,
-          profitPercent: 3.47,
-          unrealizedProfitUsd: 4.80,
-          tradesCount: 5,
-          grids: this.generateGrids(160, 200, 8, 182, 1500 / 8),
-          entryPrice: 180,
-          currentPrice: 182,
-          lastUpdated: new Date().toISOString(),
-          timezone: "Asia/Hong_Kong",
-          cgroupsCpuLimit: "Uncapped",
-          cgroupsMemoryLimit: "Uncapped",
-          pid: 4213,
-          memoryHeapMb: 118.9,
-          cpuAffinity: "CPU Core 3",
-          version: "1.0.0",
-          configHistory: [
-            {
-              version: "1.0.0",
-              timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-              rangeMin: 160,
-              rangeMax: 200,
-              gridCount: 8,
-              investment: 1500,
-              leverage: 1,
-            }
-          ]
-        }
-      ],
-      tradeLogs: [
-        {
-          id: "tx_1",
-          botId: "bot_1",
-          botName: "Binance Spot BTC Grid",
-          broker: "Binance",
-          symbol: "BTC/USDT",
-          timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
-          type: "buy",
-          price: 63800,
-          amount: 0.0031,
-          total: 197.78,
-          pnl: 0
-        },
-        {
-          id: "tx_2",
-          botId: "bot_1",
-          botName: "Binance Spot BTC Grid",
-          broker: "Binance",
-          symbol: "BTC/USDT",
-          timestamp: new Date(Date.now() - 3600000 * 2.5).toISOString(),
-          type: "sell",
-          price: 64800,
-          amount: 0.0031,
-          total: 200.88,
-          pnl: 3.10
-        },
-        {
-          id: "tx_3",
-          botId: "bot_2",
-          botName: "OKX Futures ETH Long",
-          broker: "OKX",
-          symbol: "ETH/USDT",
-          timestamp: new Date(Date.now() - 3600000 * 2).toISOString(),
-          type: "buy",
-          price: 3320,
-          amount: 0.15,
-          total: 498.00,
-          pnl: 0
-        },
-        {
-          id: "tx_4",
-          botId: "bot_2",
-          botName: "OKX Futures ETH Long",
-          broker: "OKX",
-          symbol: "ETH/USDT",
-          timestamp: new Date(Date.now() - 3600000 * 0.8).toISOString(),
-          type: "sell",
-          price: 3370,
-          amount: 0.15,
-          total: 505.50,
-          pnl: 7.50
-        }
-      ],
+      bots: [],
+      tradeLogs: [],
       securityAuditLogs: [],
       riskSettings: {
         maxDailyDrawdown: 8.0,
@@ -470,23 +426,289 @@ export class AegisDB {
       ibConnectionMode: "web_api_proxy"
     };
 
-    // Calculate trade log cryptographic hashes for standard seed data
-    let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
-    for (let i = seedDb.tradeLogs.length - 1; i >= 0; i--) {
-      seedDb.tradeLogs[i].previousHash = prevHash;
-      seedDb.tradeLogs[i].currentHash = computeLogHash(seedDb.tradeLogs[i], prevHash);
-      prevHash = seedDb.tradeLogs[i].currentHash!;
-    }
+    // Load from SQLite synchronously using sqlite3 callbacks wrapped in serialize
+    this.sqlDb.serialize(() => {
+      // 1. Users
+      this.sqlDb.all("SELECT * FROM users", (err, rows: any[]) => {
+        if (!err && rows && rows.length > 0) {
+          this.data.users = rows.map(r => ({
+            username: r.username,
+            passwordHash: r.passwordHash,
+            role: r.role,
+            totpSecret: r.totpSecret,
+            isActive: r.isActive === 1,
+            tempTotpSecret: r.tempTotpSecret,
+            tempTotpExpiresAt: r.tempTotpExpiresAt,
+            mustEnrollTotp: r.mustEnrollTotp === 1
+          }));
+        } else {
+          // No users found -> Bootstrap Administrator with high security and force改密 / force TOTP
+          const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
+          const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+          
+          this.data.users = [
+            {
+              username: seedUser,
+              passwordHash: hashPassword(seedPass),
+              role: "admin",
+              totpSecret: null, // Forces Dynamic Enrollment
+              isActive: true,
+              mustEnrollTotp: true
+            }
+          ];
+          this.save();
+        }
+      });
 
-    // seed security audit events (chained as well)
-    const initSecLogs = [
-      { action: "INTEGRITY_CHECK", target: "HASH_CHAIN_DB", details: "Verified trade records cryptographic sequence consistency. Chains matches. Status: SAFE." },
-      { action: "COMPLIANCE_BOOT", target: "FIREWALL_RULES", details: "Enforced loopback listener restriction for node executor. Oracle ARM isolated." },
-      { action: "COMPLIANCE_BOOT", target: "ROOT_DAEMON", details: "Enrolled supervisor watchdog processes under pid 4210." }
+      // 2. Sessions
+      this.sqlDb.all("SELECT * FROM sessions", (err, rows: any[]) => {
+        if (!err && rows) {
+          this.data.sessions = rows.map(r => ({
+            tokenHash: r.tokenHash,
+            username: r.username,
+            role: r.role,
+            expiresAt: r.expiresAt
+          }));
+        }
+      });
+
+      // 3. Bots
+      this.sqlDb.all("SELECT * FROM bots", (err, rows: any[]) => {
+        if (!err && rows && rows.length > 0) {
+          this.data.bots = rows.map(r => ({
+            id: r.id,
+            name: r.name,
+            isEnabled: r.isEnabled === 1,
+            broker: r.broker,
+            symbol: r.symbol,
+            type: r.type,
+            direction: r.direction,
+            rangeMin: r.rangeMin,
+            rangeMax: r.rangeMax,
+            gridCount: r.gridCount,
+            investment: r.investment,
+            leverage: r.leverage,
+            stopLoss: r.stopLoss,
+            takeProfit: r.takeProfit,
+            status: r.status,
+            profitUsd: r.profitUsd,
+            profitPercent: r.profitPercent,
+            unrealizedProfitUsd: r.unrealizedProfitUsd,
+            tradesCount: r.tradesCount,
+            entryPrice: r.entryPrice,
+            currentPrice: r.currentPrice,
+            lastUpdated: r.lastUpdated,
+            timezone: r.timezone,
+            cgroupsCpuLimit: r.cgroupsCpuLimit,
+            cgroupsMemoryLimit: r.cgroupsMemoryLimit,
+            pid: r.pid,
+            memoryHeapMb: r.memoryHeapMb,
+            cpuAffinity: r.cpuAffinity,
+            version: r.version,
+            liquidationPrice: r.liquidationPrice,
+            maintenanceMargin: r.maintenanceMargin,
+            grids: JSON.parse(r.grids || "[]"),
+            configHistory: JSON.parse(r.configHistory || "[]")
+          }));
+        } else {
+          // Seed standard bots
+          this.data.bots = this.getSeedBots();
+          this.save();
+        }
+      });
+
+      // 4. Trade logs
+      this.sqlDb.all("SELECT * FROM trade_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
+        if (!err && rows && rows.length > 0) {
+          this.data.tradeLogs = rows;
+        } else {
+          this.data.tradeLogs = this.getSeedTradeLogs();
+          this.save();
+        }
+      });
+
+      // 5. Security audit logs
+      this.sqlDb.all("SELECT * FROM security_audit_logs ORDER BY timestamp DESC", (err, rows: any[]) => {
+        if (!err && rows && rows.length > 0) {
+          this.data.securityAuditLogs = rows;
+        } else {
+          this.data.securityAuditLogs = this.getSeedSecurityLogs();
+          this.save();
+        }
+      });
+
+      // 6. Risk settings
+      this.sqlDb.get("SELECT * FROM risk_settings LIMIT 1", (err, row: any) => {
+        if (!err && row) {
+          this.data.riskSettings = {
+            maxDailyDrawdown: row.maxDailyDrawdown,
+            maxAccountDrawdown: row.maxAccountDrawdown,
+            globalKillSwitch: row.globalKillSwitch === 1,
+            maxLeverageLimit: row.maxLeverageLimit,
+            dailyLossLimitUSD: row.dailyLossLimitUSD,
+            restrictedSymbols: JSON.parse(row.restrictedSymbols || "[]"),
+            singleAssetMaxAllocationPercent: row.singleAssetMaxAllocationPercent,
+            industryCryptoMaxPercent: row.industryCryptoMaxPercent,
+            autoMeltDrawdownThreshold: row.autoMeltDrawdownThreshold,
+            autoMeltSharpeThreshold: row.autoMeltSharpeThreshold
+          };
+        } else {
+          this.save();
+        }
+      });
+
+      // 7. System configurations
+      this.sqlDb.get("SELECT value FROM system_config WHERE key = 'ibConnectionMode'", (err, row: any) => {
+        if (!err && row) {
+          this.data.ibConnectionMode = row.value as any;
+        } else {
+          this.save();
+        }
+      });
+    });
+  }
+
+  private getSeedBots(): BotConfig[] {
+    return [
+      {
+        id: "bot_1",
+        name: "Binance Spot BTC Grid",
+        isEnabled: true,
+        broker: "Binance",
+        symbol: "BTC/USDT",
+        type: "spot_grid",
+        direction: "neutral",
+        rangeMin: 60000,
+        rangeMax: 70000,
+        gridCount: 10,
+        investment: 2000,
+        leverage: 1,
+        stopLoss: 59000,
+        takeProfit: 71000,
+        status: "running",
+        profitUsd: 145.20,
+        profitPercent: 7.26,
+        unrealizedProfitUsd: 22.40,
+        tradesCount: 18,
+        grids: this.generateGrids(60000, 70000, 10, 64200, 2000 / 10),
+        entryPrice: 63500,
+        currentPrice: 64200,
+        lastUpdated: new Date().toISOString(),
+        timezone: "UTC",
+        cgroupsCpuLimit: "Max 50% CPU",
+        cgroupsMemoryLimit: "Max 3G RAM",
+        pid: 4210,
+        memoryHeapMb: 98.4,
+        cpuAffinity: "CPU Core 0",
+        version: "1.0.0",
+        configHistory: [
+          {
+            version: "1.0.0",
+            timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
+            rangeMin: 60000,
+            rangeMax: 70000,
+            gridCount: 10,
+            investment: 2000,
+            leverage: 1,
+          }
+        ]
+      },
+      {
+        id: "bot_2",
+        name: "OKX Futures ETH Long",
+        isEnabled: true,
+        broker: "OKX",
+        symbol: "ETH/USDT",
+        type: "futures_grid",
+        direction: "long",
+        rangeMin: 3100,
+        rangeMax: 3600,
+        gridCount: 8,
+        investment: 1000,
+        leverage: 5,
+        stopLoss: 2900,
+        takeProfit: 3800,
+        status: "running",
+        profitUsd: 84.50,
+        profitPercent: 8.45,
+        unrealizedProfitUsd: -12.30,
+        tradesCount: 12,
+        grids: this.generateGrids(3100, 3600, 8, 3350, 1000 * 5 / 8),
+        entryPrice: 3300,
+        currentPrice: 3350,
+        lastUpdated: new Date().toISOString(),
+        timezone: "UTC",
+        cgroupsCpuLimit: "Max 50% CPU",
+        cgroupsMemoryLimit: "Max 3G RAM",
+        pid: 4211,
+        memoryHeapMb: 112.1,
+        cpuAffinity: "CPU Core 1",
+        version: "1.0.0",
+        configHistory: [
+          {
+            version: "1.0.0",
+            timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
+            rangeMin: 3100,
+            rangeMax: 3600,
+            gridCount: 8,
+            investment: 1000,
+            leverage: 5,
+          }
+        ],
+        liquidationPrice: Math.round(3300 * (1 - (1 * 0.8) / 5) * 100) / 100,
+        maintenanceMargin: Math.round(1000 * 0.05 * 100) / 100
+      }
+    ];
+  }
+
+  private getSeedTradeLogs(): TradeLog[] {
+    const seedLogs: any[] = [
+      {
+        id: "tx_1",
+        botId: "bot_1",
+        botName: "Binance Spot BTC Grid",
+        broker: "Binance",
+        symbol: "BTC/USDT",
+        timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
+        type: "buy",
+        price: 63800,
+        amount: 0.0031,
+        total: 197.78,
+        pnl: 0
+      },
+      {
+        id: "tx_2",
+        botId: "bot_1",
+        botName: "Binance Spot BTC Grid",
+        broker: "Binance",
+        symbol: "BTC/USDT",
+        timestamp: new Date(Date.now() - 3600000 * 2.5).toISOString(),
+        type: "sell",
+        price: 64800,
+        amount: 0.0031,
+        total: 200.88,
+        pnl: 3.10
+      }
     ];
 
+    let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
+    for (let i = seedLogs.length - 1; i >= 0; i--) {
+      const log = seedLogs[i] as any;
+      log.previousHash = prevHash;
+      log.currentHash = computeLogHash(log, prevHash);
+      prevHash = log.currentHash;
+    }
+    return seedLogs as TradeLog[];
+  }
+
+  private getSeedSecurityLogs(): SecurityAuditEntry[] {
+    const seedSec = [
+      { action: "INTEGRITY_CHECK", target: "HASH_CHAIN_DB", details: "Verified trade records cryptographic sequence consistency. Chains matches. Status: SAFE." },
+      { action: "COMPLIANCE_BOOT", target: "FIREWALL_RULES", details: "Enforced loopback listener restriction for node executor. Oracle ARM isolated." }
+    ];
     let prevSecHash = "0000000000000000000000000000000000000000000000000000000000000000";
-    for (const log of initSecLogs) {
+    const result: SecurityAuditEntry[] = [];
+    for (const log of seedSec) {
       const entry: SecurityAuditEntry = {
         id: "sec_" + Math.random().toString(36).substring(2, 11),
         timestamp: new Date().toISOString(),
@@ -500,22 +722,10 @@ export class AegisDB {
         currentHash: ""
       };
       entry.currentHash = computeSecurityHash(entry, prevSecHash);
-      seedDb.securityAuditLogs.unshift(entry);
+      result.unshift(entry);
       prevSecHash = entry.currentHash;
     }
-
-    this.saveData(seedDb);
-    return seedDb;
-  }
-
-  private saveData(db: AegisDatabase) {
-    try {
-      const tempFile = `${DB_FILE}.tmp`;
-      fs.writeFileSync(tempFile, JSON.stringify(db, null, 2), "utf-8");
-      fs.renameSync(tempFile, DB_FILE);
-    } catch (err) {
-      console.error("Atomic database write failed:", err);
-    }
+    return result;
   }
 
   private generateGrids(min: number, max: number, count: number, currentPrice: number, gridFund: number) {
@@ -539,11 +749,150 @@ export class AegisDB {
   }
 
   public save() {
-    this.saveData(this.data);
+    this.sqlDb.serialize(() => {
+      this.sqlDb.run("BEGIN TRANSACTION;");
+
+      // 1. Users table
+      this.sqlDb.run("DELETE FROM users;");
+      const stmtUser = this.sqlDb.prepare("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const u of this.data.users) {
+        stmtUser.run(
+          u.username,
+          u.passwordHash,
+          u.role,
+          u.totpSecret || null,
+          u.isActive ? 1 : 0,
+          u.tempTotpSecret || null,
+          u.tempTotpExpiresAt || null,
+          u.mustEnrollTotp ? 1 : 0
+        );
+      }
+      stmtUser.finalize();
+
+      // 2. Sessions table
+      this.sqlDb.run("DELETE FROM sessions;");
+      const stmtSess = this.sqlDb.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?)");
+      for (const s of this.data.sessions) {
+        stmtSess.run(s.tokenHash, s.username, s.role, s.expiresAt);
+      }
+      stmtSess.finalize();
+
+      // 3. Bots table
+      this.sqlDb.run("DELETE FROM bots;");
+      const stmtBot = this.sqlDb.prepare(`
+        INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const b of this.data.bots) {
+        stmtBot.run(
+          b.id,
+          b.name,
+          b.isEnabled ? 1 : 0,
+          b.broker,
+          b.symbol,
+          b.type,
+          b.direction,
+          b.rangeMin,
+          b.rangeMax,
+          b.gridCount,
+          b.investment,
+          b.leverage,
+          b.stopLoss || null,
+          b.takeProfit || null,
+          b.status,
+          b.profitUsd,
+          b.profitPercent,
+          b.unrealizedProfitUsd,
+          b.tradesCount,
+          b.entryPrice,
+          b.currentPrice,
+          b.lastUpdated,
+          b.timezone,
+          b.cgroupsCpuLimit || null,
+          b.cgroupsMemoryLimit || null,
+          b.pid || null,
+          b.memoryHeapMb || null,
+          b.cpuAffinity || null,
+          b.version || null,
+          b.liquidationPrice || null,
+          b.maintenanceMargin || null,
+          JSON.stringify(b.grids || []),
+          JSON.stringify(b.configHistory || [])
+        );
+      }
+      stmtBot.finalize();
+
+      // 4. Trade logs table
+      this.sqlDb.run("DELETE FROM trade_logs;");
+      const stmtTrade = this.sqlDb.prepare(`
+        INSERT INTO trade_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const t of this.data.tradeLogs) {
+        stmtTrade.run(
+          t.id,
+          t.botId,
+          t.botName,
+          t.broker,
+          t.symbol,
+          t.timestamp,
+          t.type,
+          t.price,
+          t.amount,
+          t.total,
+          t.pnl === undefined ? null : t.pnl,
+          t.previousHash || "",
+          t.currentHash || ""
+        );
+      }
+      stmtTrade.finalize();
+
+      // 5. Security audit logs table
+      this.sqlDb.run("DELETE FROM security_audit_logs;");
+      const stmtAudit = this.sqlDb.prepare(`
+        INSERT INTO security_audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const a of this.data.securityAuditLogs) {
+        stmtAudit.run(
+          a.id,
+          a.timestamp,
+          a.username,
+          a.role,
+          a.action,
+          a.target,
+          a.details,
+          a.ipAddress,
+          a.previousHash || "",
+          a.currentHash || ""
+        );
+      }
+      stmtAudit.finalize();
+
+      // 6. Risk settings table
+      this.sqlDb.run("DELETE FROM risk_settings;");
+      const r = this.data.riskSettings;
+      this.sqlDb.run(`
+        INSERT INTO risk_settings (maxDailyDrawdown, maxAccountDrawdown, globalKillSwitch, maxLeverageLimit, dailyLossLimitUSD, restrictedSymbols, singleAssetMaxAllocationPercent, industryCryptoMaxPercent, autoMeltDrawdownThreshold, autoMeltSharpeThreshold)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        r.maxDailyDrawdown,
+        r.maxAccountDrawdown,
+        r.globalKillSwitch ? 1 : 0,
+        r.maxLeverageLimit,
+        r.dailyLossLimitUSD,
+        JSON.stringify(r.restrictedSymbols || []),
+        r.singleAssetMaxAllocationPercent,
+        r.industryCryptoMaxPercent,
+        r.autoMeltDrawdownThreshold,
+        r.autoMeltSharpeThreshold
+      ]);
+
+      // 7. System config table
+      this.sqlDb.run("INSERT OR REPLACE INTO system_config VALUES ('ibConnectionMode', ?)", [this.data.ibConnectionMode]);
+
+      this.sqlDb.run("COMMIT;");
+    });
   }
 
   public appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
-    // Audit Point 6.1: Immutable Ledger. Appends ONLY.
     const prev = this.data.securityAuditLogs.length > 0 ? this.data.securityAuditLogs[0].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
     const entry: SecurityAuditEntry = {
       id: "sec_" + Math.random().toString(36).substring(2, 11),
@@ -562,14 +911,27 @@ export class AegisDB {
     this.save();
   }
 
-  public rechainTradeLogs() {
-    let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
-    for (let i = this.data.tradeLogs.length - 1; i >= 0; i--) {
-      this.data.tradeLogs[i].previousHash = prevHash;
-      this.data.tradeLogs[i].currentHash = computeLogHash(this.data.tradeLogs[i], prevHash);
-      prevHash = this.data.tradeLogs[i].currentHash!;
-    }
-    this.save();
+  public getMfaTokensDb(callback: (err: any, rows: any[]) => void) {
+    this.sqlDb.all("SELECT * FROM mfa_action_tokens", callback);
+  }
+
+  public insertMfaToken(tokenHash: string, sessionIdHash: string, username: string, action: string, bodyHash: string, expiresAt: number) {
+    this.sqlDb.run(`
+      INSERT INTO mfa_action_tokens (tokenHash, sessionIdHash, username, action, bodyHash, expiresAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [tokenHash, sessionIdHash, username, action, bodyHash, expiresAt]);
+  }
+
+  public consumeMfaToken(tokenHash: string, callback: (err: any, token: any) => void) {
+    this.sqlDb.get("SELECT * FROM mfa_action_tokens WHERE tokenHash = ? AND usedAt IS NULL", [tokenHash], (err, row) => {
+      if (!err && row) {
+        this.sqlDb.run("UPDATE mfa_action_tokens SET usedAt = ? WHERE tokenHash = ?", [Date.now(), tokenHash], (updErr) => {
+          callback(updErr, row);
+        });
+      } else {
+        callback(err || new Error("MFA token not found or already consumed"), null);
+      }
+    });
   }
 }
 

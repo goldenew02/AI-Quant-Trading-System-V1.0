@@ -4,12 +4,60 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { BotConfig, TradeLog, RiskSettings, GridLine } from "./src/types";
 
 dotenv.config();
 
 const app = express();
+app.use(helmet({
+  contentSecurityPolicy: false, // Ensure full React dev frame compatibility
+  crossOriginEmbedderPolicy: false
+}));
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(express.json());
+app.use(cookieParser(process.env.SESSION_SECRET));
+
+// Anti-CSRF verification middleware complying with P0-2.9
+function validateCsrf(req: any, res: any, next: any) {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    return next();
+  }
+  const csrfHeader = req.headers["x-csrf-token"];
+  const csrfCookie = req.cookies.csrf_token;
+  if (!csrfHeader || !csrfCookie || csrfHeader !== csrfCookie) {
+    return res.status(403).json({ error: "Invalid or missing CSRF token (anti-CSRF shield triggered)." });
+  }
+  next();
+}
+app.use(validateCsrf);
+
+// Define targeted rate limiters to satisfy P1-2
+const authRateLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5, // 5 attempts max
+  message: { error: "Too many authentication attempts. Please try again after 10 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const generalRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120, // 120 requests max
+  message: { error: "General API rate limit exceeded. Please slow down your requests." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // DO NOT lock out administrative wind-risk controls, global kill switches, or health verification routes
+    return req.path === "/api/risk" || req.path.startsWith("/api/bots/kill");
+  }
+});
 
 const PORT = 3000;
 
@@ -132,101 +180,111 @@ const lastKnownPrices: Record<string, number> = {
   "TSLA": 182.15,
 };
 
-// 7*24h simulation logic running every 5 seconds on Node backend background
-setInterval(() => {
-  if (riskSettings.globalKillSwitch) return;
+// Isolated step function for a single robot instance to prevent cascade crash (P0-7)
+function runIsolatedBotStep(bot: BotConfig) {
+  const currentPrice = lastKnownPrices[bot.symbol] || bot.currentPrice;
+  // Drifts 0.15% max
+  const driftPercent = (Math.random() - 0.49) * 0.003; 
+  const nextPrice = Math.round(currentPrice * (1 + driftPercent) * 100) / 100;
+  lastKnownPrices[bot.symbol] = nextPrice;
+  bot.currentPrice = nextPrice;
+  bot.lastUpdated = new Date().toISOString();
 
-  // Let's drift active symbols slightly
-  bots.forEach((bot) => {
-    if (bot.status !== "running") return;
+  // Unrealized PnL Calculation
+  const units = bot.investment / bot.entryPrice;
+  if (bot.type === "futures_grid") {
+    const pnlMultiplier = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
+    bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * bot.leverage * pnlMultiplier * 100) / 100;
+  } else {
+    bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * 100) / 100;
+  }
 
-    const currentPrice = lastKnownPrices[bot.symbol] || bot.currentPrice;
-    // Drifts 0.15% max
-    const driftPercent = (Math.random() - 0.49) * 0.003; 
-    const nextPrice = Math.round(currentPrice * (1 + driftPercent) * 100) / 100;
-    lastKnownPrices[bot.symbol] = nextPrice;
-    bot.currentPrice = nextPrice;
-    bot.lastUpdated = new Date().toISOString();
+  // Grid filling simulation matching
+  bot.grids.forEach((grid) => {
+    const alreadyFilled = grid.filled;
+    const isCrossed = (grid.type === "buy" && nextPrice <= grid.price) || (grid.type === "sell" && nextPrice >= grid.price);
 
-    // Unrealized PnL Calculation
-    // Spot: (currentPrice - entryPrice) * units
-    // Futures Long: (currentPrice - entryPrice) * leverage * units
-    const units = bot.investment / bot.entryPrice;
-    if (bot.type === "futures_grid") {
-      const pnlMultiplier = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
-      bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * bot.leverage * pnlMultiplier * 100) / 100;
-    } else {
-      bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * 100) / 100;
-    }
+    if (!alreadyFilled && isCrossed) {
+      grid.filled = true;
+      bot.tradesCount++;
 
-    // Grid filling simulation matching
-    bot.grids.forEach((grid) => {
-      // If price crossed the grid line, simulate trade
-      const alreadyFilled = grid.filled;
-      const isCrossed = (grid.type === "buy" && nextPrice <= grid.price) || (grid.type === "sell" && nextPrice >= grid.price);
+      const tradePrice = grid.price;
+      const total = Math.round(grid.amount * tradePrice * 100) / 100;
 
-      if (!alreadyFilled && isCrossed) {
-        // Trigger fill
-        grid.filled = true;
-        bot.tradesCount++;
-
-        // Random fill amount / calculations
-        const tradePrice = grid.price;
-        const total = Math.round(grid.amount * tradePrice * 100) / 100;
-
-        // Trade realized PnL accrues
-        let realizedPnl = 0;
-        if (grid.type === "sell") {
-          // Selling at higher grid realizes profit
-          realizedPnl = Math.round((tradePrice - bot.entryPrice) * grid.amount * 100) / 100;
-          if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2; // keep positive for grid arbitrage
-          if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100; // grid profit standard
-          bot.profitUsd += realizedPnl;
-        } else {
-          // Buying at lower levels increases average or seeds arb
-          realizedPnl = 0;
-        }
-
-        bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
-        bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
-
-        // Save trade log
-        const newLog: Omit<TradeLog, "previousHash" | "currentHash"> = {
-          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-          botId: bot.id,
-          botName: bot.name,
-          broker: bot.broker,
-          symbol: bot.symbol,
-          timestamp: new Date().toISOString(),
-          type: grid.type,
-          price: tradePrice,
-          amount: grid.amount,
-          total,
-          pnl: realizedPnl > 0 ? realizedPnl : undefined,
-        };
-        try {
-          appendTradeLog(newLog);
-        } catch (err: any) {
-          console.error("Simulation trade log write blocked:", err.message);
-        }
-
-        // Grid rotation mechanics:
-        // In grid trading, if we buy a grid level, we put a sell order just above it.
-        // If we sell, we put a buy order just below it.
-        // We simulate this by flipping grid type of neighbor or resetting after a small timer.
-        setTimeout(() => {
-          grid.filled = false;
-          grid.type = grid.type === "buy" ? "sell" : "buy";
-        }, 12000);
+      let realizedPnl = 0;
+      if (grid.type === "sell") {
+        realizedPnl = Math.round((tradePrice - bot.entryPrice) * grid.amount * 100) / 100;
+        if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+        if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100;
+        bot.profitUsd += realizedPnl;
       }
-    });
 
-    // Check Stop Loss and Take Profit
-    if (bot.stopLoss && nextPrice <= bot.stopLoss) {
-      bot.status = "stopped_by_risk";
-      bot.isEnabled = false;
-      const riskLog: Omit<TradeLog, "previousHash" | "currentHash"> = {
-        id: `sys_${Math.random().toString(36).substr(2, 9)}`,
+      bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+      bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+
+      const newLog: Omit<TradeLog, "previousHash" | "currentHash"> = {
+        id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+        botId: bot.id,
+        botName: bot.name,
+        broker: bot.broker,
+        symbol: bot.symbol,
+        timestamp: new Date().toISOString(),
+        type: grid.type,
+        price: tradePrice,
+        amount: grid.amount,
+        total,
+        pnl: realizedPnl > 0 ? realizedPnl : undefined,
+      };
+      try {
+        appendTradeLog(newLog);
+      } catch (err: any) {
+        console.error("Simulation trade log write blocked:", err.message);
+      }
+
+      setTimeout(() => {
+        grid.filled = false;
+        grid.type = grid.type === "buy" ? "sell" : "buy";
+      }, 12000);
+    }
+  });
+
+  // Check Stop Loss and Take Profit
+  if (bot.stopLoss && nextPrice <= bot.stopLoss) {
+    bot.status = "stopped_by_risk";
+    bot.isEnabled = false;
+    const riskLog: Omit<TradeLog, "previousHash" | "currentHash"> = {
+      id: `sys_${Math.random().toString(36).substr(2, 9)}`,
+      botId: bot.id,
+      botName: bot.name,
+      broker: bot.broker,
+      symbol: bot.symbol,
+      timestamp: new Date().toISOString(),
+      type: "sell",
+      price: nextPrice,
+      amount: units,
+      total: units * nextPrice,
+      pnl: -Math.abs(bot.investment * 0.15)
+    };
+    try {
+      appendTradeLog(riskLog);
+    } catch (err: any) {
+      console.error("Simulation stop loss log write blocked:", err.message);
+    }
+  }
+
+  if (bot.takeProfit && nextPrice >= bot.takeProfit) {
+    bot.status = "stopped";
+    bot.isEnabled = false;
+  }
+
+  // Risk auditing trigger
+  const currentDrawdown = (bot.unrealizedProfitUsd < 0) ? Math.abs((bot.unrealizedProfitUsd / bot.investment) * 100) : 0;
+  if (currentDrawdown >= riskSettings.maxAccountDrawdown) {
+    bot.status = "stopped_by_risk";
+    bot.isEnabled = false;
+    try {
+      appendTradeLog({
+        id: `sys_drawdown_${bot.id}`,
         botId: bot.id,
         botName: bot.name,
         broker: bot.broker,
@@ -236,46 +294,39 @@ setInterval(() => {
         price: nextPrice,
         amount: units,
         total: units * nextPrice,
-        pnl: -Math.abs(bot.investment * 0.15) // stop loss hit
-      };
-      try {
-        appendTradeLog(riskLog);
-      } catch (err: any) {
-        console.error("Simulation stop loss log write blocked:", err.message);
-      }
+        pnl: bot.unrealizedProfitUsd
+      });
+    } catch (err: any) {
+      console.error("Simulation drawdown log write blocked:", err.message);
     }
+  }
+}
 
-    if (bot.takeProfit && nextPrice >= bot.takeProfit) {
-      bot.status = "stopped";
-      bot.isEnabled = false;
-    }
+// 7*24h simulation logic running every 5 seconds on Node backend background
+setInterval(() => {
+  if (riskSettings.globalKillSwitch) return;
 
-    // Risk auditing trigger
-    const currentDrawdown = (bot.unrealizedProfitUsd < 0) ? Math.abs((bot.unrealizedProfitUsd / bot.investment) * 100) : 0;
-    if (currentDrawdown >= riskSettings.maxAccountDrawdown) {
+  // Let's drift active symbols slightly in isolated context (P0-7)
+  bots.forEach((bot) => {
+    if (bot.status !== "running") return;
+
+    try {
+      runIsolatedBotStep(bot);
+    } catch (botError: any) {
+      console.error(`CRITICAL: Isolated error in bot [${bot.name}] (${bot.id}):`, botError.message);
+      appendSecurityLog(
+        "system",
+        "admin",
+        "BOT_EXECUTION_ERROR",
+        bot.id,
+        `CRITICAL: Fault isolated in bot executor. Bot [${bot.name}] crashed: ${botError.message}. Safely terminated bot to prevent cascade failures.`,
+        "127.0.0.1"
+      );
       bot.status = "stopped_by_risk";
       bot.isEnabled = false;
-      // Append risk kill-switch log
-      try {
-        appendTradeLog({
-          id: `sys_drawdown_${bot.id}`,
-          botId: bot.id,
-          botName: bot.name,
-          broker: bot.broker,
-          symbol: bot.symbol,
-          timestamp: new Date().toISOString(),
-          type: "sell",
-          price: nextPrice,
-          amount: units,
-          total: units * nextPrice,
-          pnl: bot.unrealizedProfitUsd
-        });
-      } catch (err: any) {
-        console.error("Simulation drawdown log write blocked:", err.message);
-      }
     }
-
   });
+
   dbInstance.save();
 }, 5000);
 
@@ -310,18 +361,14 @@ setInterval(() => {
 }, 60000);
 
 // Middleware to monitor API call frequency and prevent high frequency API overload risk
-app.use((req, res, next) => {
-  if (req.path.startsWith("/api/")) {
-    apiRequestCounter++;
-    if (apiRequestCounter > rateLimitCap) {
-      circuitBreakerActive = true;
-      return res.status(429).json({
-        error: `风控熔断预警 (CIRCUIT_BREAKER_ACTIVE): API高频并发频次 [${apiRequestCounter}] 超过每分钟上限 [${rateLimitCap}] 次。触发紧急回路熔断保护，暂停API响应 60 秒。`
-      });
-    }
+app.use("/api/", (req, res, next) => {
+  apiRequestCounter++;
+  if (apiRequestCounter > rateLimitCap) {
+    circuitBreakerActive = true;
   }
   next();
 });
+app.use("/api/", generalRateLimiter);
 
 function getCookie(req: any, name: string): string | null {
   const cookieHeader = req.headers.cookie;
@@ -337,20 +384,20 @@ function getCookie(req: any, name: string): string | null {
 // --- SECURE AUTHENTICATION MIDDLEWARE & ENDPOINTS ---
 function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
   return (req: any, res: any, next: any) => {
-    const authHeader = req.headers["authorization"];
-    let token = authHeader && authHeader.split(" ")[1];
-    
-    // Fallback to secure HttpOnly cookie (anti-XSS)
-    if (!token) {
-      token = getCookie(req, "sid") || undefined;
-    }
+    // Session token is strictly retrieved from the signed HttpOnly cookie (no localStorage)
+    const token = req.signedCookies.sid;
     
     if (!token) {
       return res.status(401).json({ error: "Missing authentication credentials." });
     }
     
-    const session = activeSessions.find(s => s.token === token && s.expiresAt > Date.now());
+    // Compute token hash to protect against DB token theft (P0-2)
+    const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+    
+    const session = activeSessions.find(s => s.tokenHash === tokenHash && s.expiresAt > Date.now());
     if (!session) {
+      res.clearCookie("sid");
+      res.clearCookie("csrf_token");
       return res.status(401).json({ error: "Session expired or invalid token. Please log in again." });
     }
     
@@ -361,12 +408,19 @@ function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
       return res.status(403).json({ error: `Insufficient permissions. Role required: ${allowedRoles.join(" or ")}` });
     }
     
+    // Strict Dynamic TOTP MFA enrollment containment (P0-1.6)
+    const user = db.users.find(u => u.username === session.username);
+    const isTotpSetupRoute = req.path === "/api/auth/totp/setup" || req.path === "/api/auth/totp/confirm" || req.path === "/api/auth/logout" || req.path === "/api/auth/me";
+    if (user && user.mustEnrollTotp && !isTotpSetupRoute) {
+      return res.status(403).json({ error: "Dynamic MFA enrollment is required before accessing system resources. Please configure your Google Authenticator." });
+    }
+    
     req.user = session;
     next();
   };
 }
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", authRateLimiter, (req, res) => {
   const { username, password } = req.body;
   const user = db.users.find(u => u.username === username && u.isActive);
 
@@ -375,10 +429,13 @@ app.post("/api/auth/login", (req, res) => {
     return res.status(401).json({ error: "Invalid username or password. Please use correct credentials." });
   }
 
+  // Session rotation on login (P0-2.7)
   const role = user.role;
   const token = crypto.randomBytes(24).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+  
   const session = {
-    token,
+    tokenHash,
     username,
     role,
     expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
@@ -386,27 +443,39 @@ app.post("/api/auth/login", (req, res) => {
   activeSessions.push(session);
   dbInstance.save();
 
-  appendSecurityLog(username, role, "LOGIN_SUCCESS", "USER_AUTH", `Successfully logged in. Session token generated.`, req.ip);
+  appendSecurityLog(username, role, "LOGIN_SUCCESS", "USER_AUTH", `Successfully logged in. Secure session generated.`, req.ip);
 
-  // Set httpOnly secure cookie
+  // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
     httpOnly: true,
+    signed: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",
     maxAge: 30 * 60 * 1000
   });
 
-  res.json({ success: true, token, role, username });
+  // Distribute CSRF double-submit cookie (P0-2.9)
+  const csrfToken = crypto.randomBytes(24).toString("hex");
+  res.cookie("csrf_token", csrfToken, {
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 30 * 60 * 1000
+  });
+
+  // Do not return any token in response payload (anti-XSS)
+  res.json({ 
+    success: true, 
+    role, 
+    username, 
+    mustEnrollTotp: !!user.mustEnrollTotp 
+  });
 });
 
 app.post("/api/auth/logout", (req, res) => {
-  const authHeader = req.headers["authorization"];
-  let token = authHeader && authHeader.split(" ")[1];
-  if (!token) {
-    token = getCookie(req, "sid") || undefined;
-  }
+  const token = req.signedCookies.sid;
   if (token) {
-    const idx = activeSessions.findIndex(s => s.token === token);
+    const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+    const idx = activeSessions.findIndex(s => s.tokenHash === tokenHash);
     if (idx !== -1) {
       const sess = activeSessions[idx];
       appendSecurityLog(sess.username, sess.role, "LOGOUT", "USER_AUTH", `User triggered secure logout. Session destroyed.`, req.ip);
@@ -414,37 +483,49 @@ app.post("/api/auth/logout", (req, res) => {
     }
   }
   res.clearCookie("sid");
+  res.clearCookie("csrf_token");
   res.json({ success: true });
 });
 
 app.get("/api/auth/me", requireAuth(['admin', 'operator', 'viewer']), (req: any, res) => {
-  res.json({ username: req.user.username, role: req.user.role });
+  const user = db.users.find(u => u.username === req.user.username);
+  res.json({ 
+    username: req.user.username, 
+    role: req.user.role, 
+    mustEnrollTotp: user ? !!user.mustEnrollTotp : false 
+  });
 });
 
-app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), (req: any, res) => {
+app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), authRateLimiter, (req: any, res) => {
   const { code, action } = req.body;
   const user = db.users.find(u => u.username === req.user.username);
-  if (!user) {
-    return res.status(404).json({ error: "User profile not found." });
+  if (!user || !user.totpSecret) {
+    return res.status(404).json({ error: "User profile or dynamic MFA keys not configured." });
   }
 
-  // Decrypt secret before verification
+  // Decrypt secret securely and throw immediately if decryption is tampered/fails
   const decryptedSecret = decryptSecret(user.totpSecret);
   const isTotpValid = verifyTOTP(decryptedSecret, code);
 
   if (isTotpValid) {
-    // Generate transient high-impact MFA action token (valid for 5 minutes)
-    const actionToken = crypto.randomBytes(16).toString("hex");
-    mfaActionTokens.push({
-      token: actionToken,
-      username: req.user.username,
-      action: action || "update_risk",
-      expiresAt: Date.now() + 5 * 60 * 1000
-    });
-    appendSecurityLog(req.user.username, req.user.role, "MFA_VERIFIED", "MFA_GATE", `MFA code verified for high-impact action: ${action}. Action token generated.`, req.ip);
+    // Generate transient, high-impact MFA action token (strictly valid for 3 minutes per P0-5.2)
+    const actionToken = crypto.randomBytes(24).toString("hex");
+    const actionTokenHash = crypto.createHash("sha256").update(actionToken + process.env.SESSION_SECRET).digest("hex");
+    const sessionIdHash = crypto.createHash("sha256").update(req.signedCookies.sid + process.env.SESSION_SECRET).digest("hex");
+
+    dbInstance.insertMfaToken(
+      actionTokenHash,
+      sessionIdHash,
+      req.user.username,
+      action || "update_risk",
+      "", // Can optionally bind specific payload digest
+      Date.now() + 3 * 60 * 1000 // Strictly 3 minutes!
+    );
+
+    appendSecurityLog(req.user.username, req.user.role, "MFA_VERIFIED", "MFA_GATE", `MFA code verified. High-impact 3-minute action token generated.`, req.ip);
     return res.json({ success: true, actionToken, message: "MFA code authorized successfully on backend." });
   } else {
-    appendSecurityLog(req.user.username, req.user.role, "MFA_FAILED", "MFA_GATE", `MFA code verification FAILED for action: ${action}. Entered code: ${code}. ACCESS BLOCK.`, req.ip);
+    appendSecurityLog(req.user.username, req.user.role, "MFA_FAILED", "MFA_GATE", `MFA code verification FAILED. ACCESS BLOCK.`, req.ip);
     return res.status(400).json({ error: "Invalid Dynamic MFA Code. Please consult your Google Authenticator setup guidelines." });
   }
 });
@@ -461,7 +542,9 @@ app.post("/api/auth/totp/setup", requireAuth(['admin', 'operator', 'viewer']), (
     tempSecret += chars[crypto.randomInt(chars.length)];
   }
 
-  user.tempTotpSecret = tempSecret;
+  // Encrypt the temporary secret and set a 10-minute expiry time to prevent persistence leakage (P0-3.5)
+  user.tempTotpSecret = encryptSecret(tempSecret);
+  user.tempTotpExpiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
   dbInstance.save();
 
   appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_INIT", "USER_AUTH", "Initiated TOTP setup/reset workflow.", req.ip);
@@ -471,18 +554,29 @@ app.post("/api/auth/totp/setup", requireAuth(['admin', 'operator', 'viewer']), (
 app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']), (req: any, res) => {
   const { code } = req.body;
   const user = db.users.find(u => u.username === req.user.username);
-  if (!user || !user.tempTotpSecret) {
+  if (!user || !user.tempTotpSecret || !user.tempTotpExpiresAt) {
     return res.status(400).json({ error: "TOTP setup workflow has not been initialized." });
   }
 
-  const isValid = verifyTOTP(user.tempTotpSecret, code);
+  if (Date.now() > user.tempTotpExpiresAt) {
+    delete user.tempTotpSecret;
+    delete user.tempTotpExpiresAt;
+    dbInstance.save();
+    return res.status(400).json({ error: "TOTP setup secret has expired. Please re-initiate setup." });
+  }
+
+  // Decrypt and verify
+  const tempDecrypted = decryptSecret(user.tempTotpSecret);
+  const isValid = verifyTOTP(tempDecrypted, code);
   if (!isValid) {
     return res.status(400).json({ error: "Invalid verification code. TOTP setup confirm failed." });
   }
 
-  // Promote temporary secret to formal secret (encrypted with AES-256-GCM)
-  user.totpSecret = encryptSecret(user.tempTotpSecret);
+  // Promote temporary secret to formal secret
+  user.totpSecret = user.tempTotpSecret; // Already safely encrypted with AES-256-GCM
+  user.mustEnrollTotp = false;
   delete user.tempTotpSecret;
+  delete user.tempTotpExpiresAt;
   dbInstance.save();
 
   appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM", "USER_AUTH", "Successfully bound new TOTP authenticator device.", req.ip);
@@ -495,7 +589,8 @@ app.get("/api/users", requireAuth(['admin']), (req: any, res) => {
     username: u.username,
     role: u.role,
     isActive: u.isActive,
-    hasTotp: !!u.totpSecret
+    hasTotp: !!u.totpSecret,
+    mustEnrollTotp: !!u.mustEnrollTotp
   }));
   res.json(safeUsers);
 });
@@ -509,17 +604,18 @@ app.post("/api/users", requireAuth(['admin']), (req: any, res) => {
     return res.status(400).json({ error: "Username already exists." });
   }
 
-  const defaultTempTotp = "NBSWY3DPEB3W64TBNQ"; // standard default base32 secret
+  // Newly provisioned users must NOT have a default TOTP key. They must enroll dynamically (P0-1.5)
   db.users.push({
     username,
     passwordHash: hashPassword(password),
     role,
-    totpSecret: encryptSecret(defaultTempTotp),
+    totpSecret: null, // No default TOTP key
+    mustEnrollTotp: true, // Forces dynamic setup on login
     isActive: true
   });
   dbInstance.save();
 
-  appendSecurityLog(req.user.username, req.user.role, "USER_CREATION", username, `Created new ${role} user: ${username}`, req.ip);
+  appendSecurityLog(req.user.username, req.user.role, "USER_CREATION", username, `Created new ${role} user: ${username} with dynamic MFA enrollment requirement.`, req.ip);
   res.json({ success: true });
 });
 
@@ -738,21 +834,33 @@ app.post("/api/bots/affinity/:id", requireAuth(['admin', 'operator']), (req: any
   }
 });
 
+// Helper to consume MFA action token securely
+function consumeMfaTokenAsync(token: string, username: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!token) return resolve(false);
+    const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+    dbInstance.consumeMfaToken(tokenHash, (err, row) => {
+      if (err || !row) return resolve(false);
+      if (row.expiresAt < Date.now()) return resolve(false);
+      if (row.username !== username) return resolve(false);
+      resolve(true);
+    });
+  });
+}
+
 // 3. Risk Settings Endpoints
 app.get("/api/risk", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
   res.json(riskSettings);
 });
 
-app.post("/api/risk", requireAuth(['admin']), (req: any, res) => {
+app.post("/api/risk", requireAuth(['admin']), async (req: any, res) => {
   const { actionToken, maxDailyDrawdown, maxAccountDrawdown, globalKillSwitch, maxLeverageLimit, dailyLossLimitUSD, restrictedSymbols, singleAssetMaxAllocationPercent, industryCryptoMaxPercent, autoMeltDrawdownThreshold, autoMeltSharpeThreshold } = req.body;
 
-  // Validate transient MFA action token for high-impact updates
-  const tokenIdx = mfaActionTokens.findIndex(t => t.token === actionToken && t.username === req.user.username && t.expiresAt > Date.now());
-  if (tokenIdx === -1) {
+  // Validate transient MFA action token for high-impact updates securely in SQLite
+  const isMfaValid = await consumeMfaTokenAsync(actionToken, req.user.username);
+  if (!isMfaValid) {
     return res.status(400).json({ error: "Invalid or expired MFA action token. High-impact risk control modification rejected." });
   }
-  // Consume the action token
-  mfaActionTokens.splice(tokenIdx, 1);
 
   // Apply properties safely
   const proposedSettings = { maxDailyDrawdown, maxAccountDrawdown, globalKillSwitch, maxLeverageLimit, dailyLossLimitUSD, restrictedSymbols, singleAssetMaxAllocationPercent, industryCryptoMaxPercent, autoMeltDrawdownThreshold, autoMeltSharpeThreshold };
@@ -806,6 +914,11 @@ app.get("/api/logs/download", requireAuth(['admin', 'operator', 'viewer']), (req
 
 // 5a. Cryptographic Hash Chain Verification & Tamper Simulation Endpoints
 app.post("/api/logs/tamper", requireAuth(['admin']), (req: any, res) => {
+  // Tamper simulation is strictly forbidden in production (P1-1.2)
+  if (process.env.NODE_ENV === "production") {
+    return res.status(403).json({ error: "Tamper simulation is strictly disabled in production builds under compliance guidelines." });
+  }
+
   if (tradeLogs.length > 0) {
     // Tamper with the oldest log price to break the hash chain
     const targetIdx = tradeLogs.length - 1; 
@@ -824,7 +937,7 @@ app.post("/api/logs/tamper", requireAuth(['admin']), (req: any, res) => {
   }
 });
 
-app.post("/api/logs/verify", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
+app.post("/api/logs/verify", requireAuth(['admin', 'operator', 'viewer']), (req: any, res) => {
   let prevHash = "0000000000000000000000000000000000000000000000000000000000000000";
   const violations: any[] = [];
 
@@ -844,6 +957,19 @@ app.post("/api/logs/verify", requireAuth(['admin', 'operator', 'viewer']), (req,
       });
     }
     prevHash = log.currentHash || computed;
+  }
+
+  // Comply with P1-1.3: If violations are found, write detailed warning into permanent security log
+  if (violations.length > 0) {
+    const firstViolation = violations[0];
+    appendSecurityLog(
+      req.user.username,
+      req.user.role,
+      "CHAIN_INTEGRITY_COMPROMISED",
+      "HASH_CHAIN_DB",
+      `CRITICAL: Ledger integrity compromised. Total violations: ${violations.length}. First mismatch at log ID [${firstViolation.id}]. Recorded: [${firstViolation.recordedHash}], Calculated: [${firstViolation.calculatedHash}].`,
+      req.ip
+    );
   }
 
   res.json({

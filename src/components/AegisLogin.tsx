@@ -1,8 +1,8 @@
 import React, { useState } from "react";
-import { ShieldAlert, Key, HelpCircle, RefreshCw, Cpu, User, Lock, Terminal } from "lucide-react";
+import { ShieldAlert, Key, HelpCircle, RefreshCw, User, Lock, Terminal, Fingerprint, Copy, Check } from "lucide-react";
 
 interface AegisLoginProps {
-  onLoginSuccess: (token: string, role: 'admin' | 'operator' | 'viewer', username: string) => void;
+  onLoginSuccess: (role: 'admin' | 'operator' | 'viewer', username: string) => void;
 }
 
 export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
@@ -10,6 +10,14 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Dynamic TOTP enrollment states
+  const [mfaSetupMode, setMfaSetupMode] = useState(false);
+  const [tempSecret, setTempSecret] = useState<string | null>(null);
+  const [totpCode, setTotpCode] = useState("");
+  const [tempRole, setTempRole] = useState<'admin' | 'operator' | 'viewer' | null>(null);
+  const [tempUsername, setTempUsername] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const handleLoginSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -30,7 +38,28 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
       const contentType = res.headers.get("content-type");
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
-        onLoginSuccess(data.token, data.role, data.username);
+        
+        if (data.mustEnrollTotp) {
+          // Store temp credentials and trigger dynamic TOTP setup workflow (P0-1.5)
+          setTempRole(data.role);
+          setTempUsername(data.username);
+          
+          const setupRes = await fetch("/api/auth/totp/setup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" }
+          });
+          
+          if (setupRes.ok) {
+            const setupData = await setupRes.json();
+            setTempSecret(setupData.tempSecret);
+            setMfaSetupMode(true);
+          } else {
+            setError("Authentication succeeded but failed to initialize secure TOTP setup channel.");
+          }
+        } else {
+          // Standard login when already enrolled
+          onLoginSuccess(data.role, data.username);
+        }
       } else {
         const data = await res.json();
         setError(data.error || "Authentication failed. ACCESS SHIELDED.");
@@ -40,6 +69,49 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
       setError("Unable to connect to Aegis Core Server. Please retry.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleMfaConfirmSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    if (totpCode.trim().length !== 6) {
+      setError("Dynamic MFA code must be exactly 6 digits.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch("/api/auth/totp/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: totpCode.trim() })
+      });
+
+      if (res.ok) {
+        if (tempRole && tempUsername) {
+          onLoginSuccess(tempRole, tempUsername);
+        } else {
+          setError("Session context lost. Please log in again.");
+          setMfaSetupMode(false);
+        }
+      } else {
+        const data = await res.json();
+        setError(data.error || "Dynamic MFA code verification failed. Setup not complete.");
+      }
+    } catch (err) {
+      console.error(err);
+      setError("MFA confirmation channel interrupted. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCopySecret = () => {
+    if (tempSecret) {
+      navigator.clipboard.writeText(tempSecret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     }
   };
 
@@ -57,10 +129,10 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
             <div className="absolute inset-0 border border-[#00FF66] animate-ping opacity-25"></div>
           </div>
           <h2 className="text-lg font-black tracking-[0.2em] font-display text-white uppercase italic">
-            AEGIS SECURITY PROTOCOL
+            {mfaSetupMode ? "MFA ACTIVATION SHIELD" : "AEGIS SECURITY PROTOCOL"}
           </h2>
           <p className="text-[10px] text-[#666666] font-mono tracking-widest uppercase font-black mt-1">
-            ARM Execution Core Authorization Shield v2.4
+            {mfaSetupMode ? "Secure Authentication Onboarding Guide" : "ARM Execution Core Authorization Shield v2.4"}
           </p>
         </div>
 
@@ -72,60 +144,137 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           </div>
         )}
 
-        {/* Credentials Form */}
-        <form onSubmit={handleLoginSubmit} className="space-y-4">
-          <div>
-            <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
-              Access Token Username
-            </label>
-            <div className="relative">
-              <User className="absolute left-3.5 top-3.5 h-4 w-4 text-[#444446]" />
+        {!mfaSetupMode ? (
+          /* Credentials Form */
+          <form onSubmit={handleLoginSubmit} className="space-y-4">
+            <div>
+              <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
+                Access Token Username
+              </label>
+              <div className="relative">
+                <User className="absolute left-3.5 top-3.5 h-4 w-4 text-[#444446]" />
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Enter operator username..."
+                  disabled={loading}
+                  className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] text-xs py-3.5 pl-11 pr-4 w-full focus:outline-none focus:border-[#00FF66] font-mono"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
+                Cryptographic Password
+              </label>
+              <div className="relative">
+                <Lock className="absolute left-3.5 top-3.5 h-4 w-4 text-[#444446]" />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter password sequence..."
+                  disabled={loading}
+                  className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] text-xs py-3.5 pl-11 pr-4 w-full focus:outline-none focus:border-[#00FF66] font-mono"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full bg-[#00FF66] text-black font-black uppercase text-xs tracking-wider py-4 hover:bg-[#00CC55] transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 mt-2 font-mono"
+            >
+              {loading ? (
+                <>
+                  <RefreshCw className="h-4 w-4 animate-spin text-black" />
+                  VERIFYING DIGITAL KEY...
+                </>
+              ) : (
+                <>
+                  <Key className="h-4 w-4 text-black" />
+                  AUTHORIZE TERMINAL INTERACTION
+                </>
+              )}
+            </button>
+          </form>
+        ) : (
+          /* Multi-Factor Authentication Setup Flow (P0-1.5 Compliance) */
+          <form onSubmit={handleMfaConfirmSubmit} className="space-y-5">
+            <div className="bg-[#1C1C1E]/50 border border-[#2A2A2C] p-4 text-xs space-y-3 font-sans leading-relaxed text-zinc-300">
+              <div className="flex items-center gap-2 text-amber-500 font-bold font-mono text-[10px]">
+                <Fingerprint className="h-4 w-4 animate-pulse text-amber-500" />
+                <span>DYNAMIC TOTP MFA BIND REQUIRED</span>
+              </div>
+              <p>
+                To safeguard client assets and prevent unauthorized control commands, your account must enroll a dynamic Multi-Factor Authentication token.
+              </p>
+              <div className="space-y-1 bg-[#060608] p-3 border border-zinc-800 font-mono text-[10px]">
+                <div className="text-[#666666] uppercase font-black text-[9px] mb-1.5">Google Authenticator Key:</div>
+                <div className="flex items-center justify-between gap-2 text-white font-bold select-all tracking-wider text-xs p-1.5 bg-[#141416] border border-zinc-850">
+                  <span>{tempSecret}</span>
+                  <button
+                    type="button"
+                    onClick={handleCopySecret}
+                    className="p-1 hover:text-[#00FF66] text-[#666666] transition cursor-pointer"
+                    title="Copy to clipboard"
+                  >
+                    {copied ? <Check className="h-3.5 w-3.5 text-[#00FF66]" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              </div>
+              <ol className="list-decimal list-inside space-y-1 text-[11px] text-zinc-400">
+                <li>Open Google Authenticator on your mobile device.</li>
+                <li>Add a new account and choose <strong className="text-zinc-300 font-medium">"Enter a setup key"</strong>.</li>
+                <li>Enter the setup key above under standard Time-Based (TOTP) setting.</li>
+                <li>Input the generated 6-digit dynamic code below to complete authorization.</li>
+              </ol>
+            </div>
+
+            <div>
+              <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
+                Dynamic 6-Digit Authenticator Code
+              </label>
               <input
                 type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Enter operator username..."
+                maxLength={6}
+                value={totpCode}
+                onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ""))}
+                placeholder="000000"
                 disabled={loading}
-                className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] text-xs py-3.5 pl-11 pr-4 w-full focus:outline-none focus:border-[#00FF66] font-mono"
+                className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] tracking-[0.8em] text-center font-bold font-mono text-lg py-3.5 w-full focus:outline-none focus:border-[#00FF66]"
               />
             </div>
-          </div>
 
-          <div>
-            <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
-              Cryptographic Password
-            </label>
-            <div className="relative">
-              <Lock className="absolute left-3.5 top-3.5 h-4 w-4 text-[#444446]" />
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password sequence..."
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setMfaSetupMode(false)}
+                className="w-1/3 border border-[#2A2A2C] text-[#666666] font-bold uppercase text-xs py-4 hover:bg-zinc-900 transition font-mono cursor-pointer"
+              >
+                CANCEL
+              </button>
+              <button
+                type="submit"
                 disabled={loading}
-                className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] text-xs py-3.5 pl-11 pr-4 w-full focus:outline-none focus:border-[#00FF66] font-mono"
-              />
+                className="w-2/3 bg-[#00FF66] text-black font-black uppercase text-xs tracking-wider py-4 hover:bg-[#00CC55] transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 font-mono"
+              >
+                {loading ? (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin text-black" />
+                    CONFIRMING BIND...
+                  </>
+                ) : (
+                  <>
+                    <Check className="h-4 w-4 text-black" />
+                    ACTIVATE & ENTER
+                  </>
+                )}
+              </button>
             </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-[#00FF66] text-black font-black uppercase text-xs tracking-wider py-4 hover:bg-[#00CC55] transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 mt-2"
-          >
-            {loading ? (
-              <>
-                <RefreshCw className="h-4 w-4 animate-spin text-black" />
-                VERIFYING DIGITAL KEY...
-              </>
-            ) : (
-              <>
-                <Key className="h-4 w-4 text-black" />
-                AUTHORIZE TERMINAL INTERACTION
-              </>
-            )}
-          </button>
-        </form>
+          </form>
+        )}
 
         {/* Security Info Panel for Compliance Auditing */}
         <div className="bg-[#1C1C1E]/50 border border-zinc-800 p-4 mt-6">
@@ -147,7 +296,7 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
               <div>- Database: <span className="text-zinc-300">Active (AES-256-GCM Encrypted Secrets)</span></div>
               <div>- Signatures: <span className="text-zinc-300">PBKDF2-SHA512 (310,000 iterations)</span></div>
               <div>- MFA Policy: <span className="text-zinc-300">Dynamic Google Authenticator RFC6238</span></div>
-              <div className="pt-2 text-zinc-500 italic leading-normal font-sans">
+              <div className="pt-2 text-zinc-500 italic leading-normal font-sans text-left">
                 To log in, please use the secure credentials configured via your environment setup (e.g. BOOTSTRAP_ADMIN_USER / BOOTSTRAP_ADMIN_PASSWORD).
               </div>
             </div>

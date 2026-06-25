@@ -39,35 +39,37 @@ export default function App() {
   const [selectedBotForAi, setSelectedBotForAi] = useState<string>("bot_1");
   const [ibMode, setIbMode] = useState<"gateway" | "web_api_proxy">("web_api_proxy");
 
-  // JWT auth states
-  const [token, setToken] = useState<string | null>(localStorage.getItem("aegis_token"));
+  // Secure HttpOnly session states
   const [username, setUsername] = useState<string | null>(localStorage.getItem("aegis_username"));
   const [role, setRole] = useState<'admin' | 'operator' | 'viewer' | null>(localStorage.getItem("aegis_role") as any);
 
-  const handleLoginSuccess = (newToken: string, newRole: 'admin' | 'operator' | 'viewer', newUsername: string) => {
-    setToken(newToken);
+  // Read non-HttpOnly CSRF double-submit token cookie
+  const getCsrfToken = (): string => {
+    const match = document.cookie.match(/(^|;)\s*csrf_token\s*=\s*([^;]+)/);
+    return match ? match[2] : "";
+  };
+
+  const handleLoginSuccess = (newRole: 'admin' | 'operator' | 'viewer', newUsername: string) => {
     setRole(newRole);
     setUsername(newUsername);
-    localStorage.setItem("aegis_token", newToken);
     localStorage.setItem("aegis_username", newUsername);
     localStorage.setItem("aegis_role", newRole);
   };
 
   const handleLogout = async () => {
     try {
-      if (token) {
-        await fetch("/api/auth/logout", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${token}` }
-        });
-      }
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "X-CSRF-Token": getCsrfToken()
+        }
+      });
     } catch (err) {
       console.error("Logout error:", err);
     }
-    setToken(null);
     setUsername(null);
     setRole(null);
-    localStorage.removeItem("aegis_token");
     localStorage.removeItem("aegis_username");
     localStorage.removeItem("aegis_role");
   };
@@ -76,18 +78,22 @@ export default function App() {
     const headers = {
       ...(options.headers || {}),
     } as any;
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
+    
+    // Auto-attach anti-CSRF token on any state-changing request
+    const csrfToken = getCsrfToken();
+    if (csrfToken) {
+      headers["X-CSRF-Token"] = csrfToken;
     }
+    
     const res = await fetch(url, {
       ...options,
+      credentials: "include", // Required to transmit HttpOnly sid cookie
       headers,
     });
+    
     if (res.status === 401) {
-      setToken(null);
       setUsername(null);
       setRole(null);
-      localStorage.removeItem("aegis_token");
       localStorage.removeItem("aegis_username");
       localStorage.removeItem("aegis_role");
     }
@@ -138,14 +144,38 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!token) return;
+    // Validate session status on boot
+    const initSession = async () => {
+      try {
+        const res = await fetch("/api/auth/me", { credentials: "include" });
+        if (res.ok) {
+          const data = await res.json();
+          setUsername(data.username);
+          setRole(data.role);
+          localStorage.setItem("aegis_username", data.username);
+          localStorage.setItem("aegis_role", data.role);
+        } else {
+          setUsername(null);
+          setRole(null);
+          localStorage.removeItem("aegis_username");
+          localStorage.removeItem("aegis_role");
+        }
+      } catch (err) {
+        console.error("Session init failed on boot:", err);
+      }
+    };
+    initSession();
+  }, []);
+
+  useEffect(() => {
+    if (!username) return;
     setLoading(true);
     Promise.all([fetchBots(), fetchIbMode()]).then(() => setLoading(false));
 
     // Polling active bot prices & trade counters from simulated background environment every 4 seconds
     const interval = setInterval(fetchBots, 4000);
     return () => clearInterval(interval);
-  }, [token]);
+  }, [username]);
 
   const handleStartBot = async (id: string) => {
     try {
@@ -215,7 +245,7 @@ export default function App() {
   const activeBotsCount = bots.filter((b) => b.status === "running").length;
   const portfolioReturnPercent = totalInvestment > 0 ? (totalRealizedProfit / totalInvestment) * 100 : 0;
 
-  if (!token || !role) {
+  if (!username || !role) {
     return <AegisLogin onLoginSuccess={handleLoginSuccess} />;
   }
 
