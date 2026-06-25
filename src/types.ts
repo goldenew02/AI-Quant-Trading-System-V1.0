@@ -114,3 +114,46 @@ export interface systemOverview {
   circuitBreakerActive: boolean;
 }
 
+export interface BrokerAccount {
+  id: string;
+  broker: string;
+  accountAlias: string;
+  encryptedApiKey: string;
+  encryptedSecret: string;
+  encryptedPassphrase?: string;
+  permissions: string;
+  isSandbox: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Order {
+  id: string;
+  botId: string;
+  broker: BrokerType;
+  brokerAccountId: string;
+  clientOrderId: string;
+  brokerOrderId?: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  type: "LMT" | "MKT";
+  price: number;
+  quantity: number;
+  status: "ORDER_INTENT_CREATED" | "PENDING" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED";
+  createdAt: string;
+  updatedAt: string;
+  lastError?: string;
+}
+
+export interface Fill {
+  id: string;
+  orderId: string;
+  brokerFillId?: string;
+  price: number;
+  quantity: number;
+  fee: number;
+  feeCurrency: string;
+  timestamp: string;
+}
+
+

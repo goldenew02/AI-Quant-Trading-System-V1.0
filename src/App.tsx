@@ -31,9 +31,10 @@ import BacktestSuite from "./components/BacktestSuite";
 import AegisLogin from "./components/AegisLogin";
 import SecurityLogs from "./components/SecurityLogs";
 import UserAccountCenter from "./components/UserAccountCenter";
+import BrokerAccountManager from "./components/BrokerAccountManager";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs" | "security_logs" | "profile">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "backtest" | "risk" | "ai" | "logs" | "security_logs" | "profile" | "brokers">("dashboard");
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastBacktestResult, setLastBacktestResult] = useState<any | null>(null);
@@ -454,6 +455,19 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => setActiveTab("brokers")}
+            className={`py-3.5 px-5 rounded-none font-black shrink-0 transition flex items-center gap-2 cursor-pointer touch-manipulation min-h-[44px] uppercase font-display tracking-wider border-b-2 text-xs select-none ${
+              activeTab === "brokers"
+                ? "bg-[#0A0A0B] text-[#00FF66] border-b-[#00FF66] border border-[#2A2A2C] border-b-2"
+                : "text-[#666666] hover:text-white border border-transparent"
+            }`}
+            id="tab-brokers"
+          >
+            <Shield className="h-4 w-4 text-[#00FF66]" />
+            BROKERS VAULT (券商直连)
+          </button>
+
+          <button
             onClick={() => setActiveTab("profile")}
             className={`py-3.5 px-5 rounded-none font-black shrink-0 transition flex items-center gap-2 cursor-pointer touch-manipulation min-h-[44px] uppercase font-display tracking-wider border-b-2 text-xs select-none ${
               activeTab === "profile"
@@ -670,6 +684,12 @@ export default function App() {
             {activeTab === "profile" && (
               <div className="space-y-6">
                 <UserAccountCenter secureFetch={secureFetch} currentRole={role!} currentUsername={username!} />
+              </div>
+            )}
+
+            {activeTab === "brokers" && (
+              <div className="space-y-6">
+                <BrokerAccountManager role={role} username={username} />
               </div>
             )}
           </>

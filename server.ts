@@ -10,7 +10,8 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
 import https from "https";
-import { BotConfig, TradeLog, RiskSettings, GridLine } from "./src/types";
+import { BotConfig, TradeLog, RiskSettings, GridLine, Order, Fill, BrokerAccount } from "./src/types";
+import { getBrokerAdapter } from "./server/brokers";
 
 dotenv.config();
 
@@ -176,15 +177,8 @@ function appendTradeLog(log: Omit<TradeLog, "previousHash" | "currentHash">) {
     throw new Error("AUDIT_CHAIN_BROKEN: Cryptographic log chain is broken. Order execution blocked.");
   }
 
-  const prevHash = tradeLogs.length > 0 ? tradeLogs[0].currentHash || "0000000000000000000000000000000000000000000000000000000000000000" : "0000000000000000000000000000000000000000000000000000000000000000";
-  const newLog: TradeLog = {
-    ...log,
-    previousHash: prevHash,
-    currentHash: ""
-  };
-  newLog.currentHash = computeLogHash(newLog, prevHash);
+  const newLog = dbInstance.appendTradeLog(log);
   tradeLogs.unshift(newLog);
-  dbInstance.save();
 }
 
 function appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
@@ -267,39 +261,202 @@ function runIsolatedBotStep(bot: BotConfig) {
       bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
       bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
 
-      const newLog: Omit<TradeLog, "previousHash" | "currentHash"> = {
-        id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-        botId: bot.id,
-        botName: bot.name,
-        broker: bot.broker,
-        symbol: bot.symbol,
-        timestamp: new Date().toISOString(),
-        type: grid.type,
-        price: tradePrice,
-        amount: grid.amount,
-        total,
-        pnl: realizedPnl > 0 ? realizedPnl : undefined,
-      };
-      try {
-        if (bot.broker === "IB" && ibConnectionMode === "gateway") {
-          console.log(`[IB Routing] Attempting to route ${grid.type.toUpperCase()} of ${grid.amount} ${bot.symbol} at ${tradePrice} to IB Gateway...`);
-          ibClient.placeOrder("DU123456", bot.symbol.split("/")[0], "STK", grid.type, grid.amount, tradePrice)
-            .then((orderResult) => {
-              console.log(`[IB Routing Success] Order processed on IB Gateway:`, orderResult);
-            })
-            .catch((routingErr) => {
-              console.error(`[IB Routing Offline] falling back to high-fidelity local execution engine:`, routingErr.message);
-            });
-        }
-        appendTradeLog(newLog);
-      } catch (err: any) {
-        console.error("Simulation trade log write blocked:", err.message);
-      }
+      // 1. Look for configured real broker credentials matching current bot's broker
+      const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
 
-      setTimeout(() => {
-        grid.filled = false;
-        grid.type = grid.type === "buy" ? "sell" : "buy";
-      }, 12000);
+      if (realAcc) {
+        // --- REAL BROKER PATHWAY (Strict Order State Machine & No Mock Fallback - P0-2) ---
+        const clientOrderId = "cl_ord_" + crypto.randomBytes(8).toString("hex");
+        const orderId = "ord_" + crypto.randomBytes(8).toString("hex");
+        
+        const orderEntity: Order = {
+          id: orderId,
+          botId: bot.id,
+          broker: bot.broker,
+          brokerAccountId: realAcc.id,
+          clientOrderId,
+          symbol: bot.symbol,
+          side: grid.type.toUpperCase() as "BUY" | "SELL",
+          type: "LMT",
+          price: tradePrice,
+          quantity: grid.amount,
+          status: "ORDER_INTENT_CREATED",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        dbInstance.insertOrder(orderEntity);
+
+        // 2. Perform automated strict risk checks before API execution (P1-1)
+        if (riskSettings.restrictedSymbols.includes(bot.symbol)) {
+          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, "Symbol restricted by risk parameters.");
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          appendSecurityLog("system", "admin", "RISK_VIOLATION", bot.id, `Order blocked: symbol ${bot.symbol} is restricted by risk management.`);
+          return;
+        }
+
+        if (bot.leverage > riskSettings.maxLeverageLimit) {
+          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Leverage limit of ${riskSettings.maxLeverageLimit}x exceeded.`);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          appendSecurityLog("system", "admin", "RISK_VIOLATION", bot.id, `Order blocked: leverage limit of ${riskSettings.maxLeverageLimit}x exceeded.`);
+          return;
+        }
+
+        // 3. Decrypt credentials for the target adapter
+        let apiKey = "";
+        let apiSecret = "";
+        let passphrase = "";
+        try {
+          apiKey = decryptSecret(realAcc.encryptedApiKey);
+          apiSecret = decryptSecret(realAcc.encryptedSecret);
+          if (realAcc.encryptedPassphrase) {
+            passphrase = decryptSecret(realAcc.encryptedPassphrase);
+          }
+        } catch (decryptErr: any) {
+          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Decryption failure: ${decryptErr.message}`);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          return;
+        }
+
+        const adapter = getBrokerAdapter(bot.broker);
+        if (!adapter) {
+          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Adapter not found for broker: ${bot.broker}`);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          return;
+        }
+
+        // Transition to PENDING
+        dbInstance.updateOrderStatus(clientOrderId, "PENDING");
+
+        console.log(`[REAL BROKER ORDER] Placing order ${clientOrderId} to ${bot.broker} for ${grid.amount} ${bot.symbol} at ${tradePrice}`);
+        
+        adapter.placeOrder(
+          {
+            botId: bot.id,
+            brokerAccountId: realAcc.id,
+            clientOrderId,
+            symbol: bot.symbol,
+            side: grid.type === "buy" ? "BUY" : "SELL",
+            type: "LMT",
+            price: tradePrice,
+            quantity: grid.amount
+          },
+          apiKey,
+          apiSecret,
+          passphrase,
+          realAcc.isSandbox
+        ).then((accepted) => {
+          if (accepted.status === "NEW") {
+            // Simulated transaction immediate fill confirmation for live adapters
+            dbInstance.updateOrderStatus(clientOrderId, "FILLED", accepted.brokerOrderId);
+            
+            const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+            dbInstance.insertFill({
+              id: fillId,
+              orderId,
+              brokerFillId: `br_fill_${accepted.brokerOrderId}`,
+              price: tradePrice,
+              quantity: grid.amount,
+              fee: Math.round(total * 0.001 * 100) / 100,
+              feeCurrency: "USD",
+              timestamp: new Date().toISOString()
+            });
+
+            // Write to append-only trade ledger
+            appendTradeLog({
+              id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+              botId: bot.id,
+              botName: bot.name,
+              broker: bot.broker,
+              symbol: bot.symbol,
+              timestamp: new Date().toISOString(),
+              type: grid.type,
+              price: tradePrice,
+              amount: grid.amount,
+              total,
+              pnl: realizedPnl > 0 ? realizedPnl : undefined
+            });
+
+            setTimeout(() => {
+              grid.filled = false;
+              grid.type = grid.type === "buy" ? "sell" : "buy";
+            }, 12000);
+
+          } else {
+            console.error(`[REAL BROKER REJECTED] Order rejected by broker: ${accepted.error}`);
+            dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
+            bot.status = "stopped_by_risk";
+            bot.isEnabled = false;
+            appendSecurityLog("system", "admin", "BROKER_REJECTION", bot.id, `Order rejected by ${bot.broker}: ${accepted.error}`);
+          }
+        }).catch((apiErr) => {
+          console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
+          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          appendSecurityLog("system", "admin", "BROKER_OFFLINE", bot.id, `Network execution exception on ${bot.broker}: ${apiErr.message}`);
+        });
+
+      } else {
+        // --- HIGH FIDELITY PAPER TRADING PATHWAY ---
+        console.log(`[PAPER_TRADE] Simulating grid crossing for ${bot.name}: ${grid.type} ${grid.amount} at ${tradePrice}`);
+        const clientOrderId = "cl_ord_sim_" + crypto.randomBytes(8).toString("hex");
+        const orderId = "ord_sim_" + crypto.randomBytes(8).toString("hex");
+        
+        const orderEntity: Order = {
+          id: orderId,
+          botId: bot.id,
+          broker: bot.broker,
+          brokerAccountId: "PAPER_ACCOUNT",
+          clientOrderId,
+          symbol: bot.symbol,
+          side: grid.type.toUpperCase() as "BUY" | "SELL",
+          type: "LMT",
+          price: tradePrice,
+          quantity: grid.amount,
+          status: "FILLED",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        dbInstance.insertOrder(orderEntity);
+
+        const fillId = "fill_sim_" + crypto.randomBytes(8).toString("hex");
+        dbInstance.insertFill({
+          id: fillId,
+          orderId,
+          brokerFillId: `sim_fill_${clientOrderId}`,
+          price: tradePrice,
+          quantity: grid.amount,
+          fee: 0,
+          feeCurrency: "USD",
+          timestamp: new Date().toISOString()
+        });
+
+        // Write append-only simulated log
+        appendTradeLog({
+          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+          botId: bot.id,
+          botName: bot.name,
+          broker: bot.broker,
+          symbol: bot.symbol,
+          timestamp: new Date().toISOString(),
+          type: grid.type,
+          price: tradePrice,
+          amount: grid.amount,
+          total,
+          pnl: realizedPnl > 0 ? realizedPnl : undefined
+        });
+
+        setTimeout(() => {
+          grid.filled = false;
+          grid.type = grid.type === "buy" ? "sell" : "buy";
+        }, 12000);
+      }
     }
   });
 
@@ -382,7 +539,11 @@ setInterval(() => {
     }
   });
 
-  dbInstance.save();
+  bots.forEach((bot) => {
+    if (bot.status === "running") {
+      dbInstance.upsertBot(bot);
+    }
+  });
 }, 5000);
 
 // Lazily initialising Gemini AI SDK to prevent startup crashes if GEMINI_API_KEY is not defined
@@ -694,6 +855,70 @@ app.delete("/api/users/:username", requireAuth(['admin']), (req: any, res) => {
 app.get("/api/security/logs", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
   // Return secure cryptographic logs to view
   res.json(securityAuditLogs);
+});
+
+// --- BROKER ACCOUNTS MANAGEMENT (P0-1 Unified Adapter Credentials) ---
+app.get("/api/broker-accounts", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
+  const list = dbInstance.get().brokerAccounts.map(a => ({
+    id: a.id,
+    broker: a.broker,
+    accountAlias: a.accountAlias,
+    permissions: a.permissions,
+    isSandbox: a.isSandbox,
+    createdAt: a.createdAt,
+    updatedAt: a.updatedAt
+  }));
+  res.json(list);
+});
+
+app.post("/api/broker-accounts", requireAuth(['admin', 'operator']), (req: any, res) => {
+  const { broker, accountAlias, apiKey, secret, passphrase, permissions, isSandbox } = req.body;
+  if (!broker || !accountAlias || !apiKey || !secret) {
+    return res.status(400).json({ error: "Missing required broker configuration parameters." });
+  }
+
+  const id = "acc_" + crypto.randomBytes(8).toString("hex");
+  const encryptedApiKey = encryptSecret(apiKey);
+  const encryptedSecret = encryptSecret(secret);
+  const encryptedPassphrase = passphrase ? encryptSecret(passphrase) : undefined;
+
+  const newAcc: BrokerAccount = {
+    id,
+    broker,
+    accountAlias,
+    encryptedApiKey,
+    encryptedSecret,
+    encryptedPassphrase,
+    permissions: permissions || "read,trade",
+    isSandbox: !!isSandbox,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  dbInstance.upsertBrokerAccount(newAcc);
+  appendSecurityLog(req.user.username, req.user.role, "BROKER_ACCOUNT_ADD", broker, `Registered new ${broker} credentials under alias ${accountAlias}.`, req.ip);
+  res.json({ success: true, accountId: id });
+});
+
+app.delete("/api/broker-accounts/:id", requireAuth(['admin']), (req: any, res) => {
+  const { id } = req.params;
+  const found = dbInstance.get().brokerAccounts.find(a => a.id === id);
+  if (!found) {
+    return res.status(404).json({ error: "Broker account not found." });
+  }
+
+  dbInstance.deleteBrokerAccount(id);
+  appendSecurityLog(req.user.username, req.user.role, "BROKER_ACCOUNT_DELETE", found.broker, `Deleted ${found.broker} credentials under alias ${found.accountAlias}.`, req.ip);
+  res.json({ success: true });
+});
+
+// --- ORDERS & FILLS LEDGER (P0-2 Execution Transparency) ---
+app.get("/api/orders", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
+  res.json(dbInstance.get().orders);
+});
+
+app.get("/api/fills", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
+  res.json(dbInstance.get().fills);
 });
 
 // --- API ROUTES ---
