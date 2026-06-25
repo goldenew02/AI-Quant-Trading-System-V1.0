@@ -13,6 +13,9 @@ import https from "https";
 import { BotConfig, TradeLog, RiskSettings, GridLine, Order, Fill, BrokerAccount } from "./src/types";
 import { getBrokerAdapter } from "./server/brokers";
 
+// Shared State via AegisDB Instance - Import DB first so .env is bootstrapped/loaded before anything else
+import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
+
 dotenv.config();
 
 const app = express();
@@ -55,8 +58,8 @@ app.use(validateCsrf);
 app.get("/api/auth/csrf", (req, res) => {
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
+    secure: true,
+    sameSite: "none",
     maxAge: 30 * 60 * 1000
   });
   res.json({ success: true });
@@ -86,8 +89,6 @@ const generalRateLimiter = rateLimit({
 const PORT = 3000;
 
 // Shared State via AegisDB Instance
-import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
-
 const db = dbInstance.get();
 const bots = db.bots;
 const tradeLogs = db.tradeLogs;
@@ -665,16 +666,16 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
   res.cookie("sid", token, {
     httpOnly: true,
     signed: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
+    secure: true,
+    sameSite: "none",
     maxAge: 30 * 60 * 1000
   });
 
   // Distribute CSRF double-submit cookie (P0-2.9)
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
+    secure: true,
+    sameSite: "none",
     maxAge: 30 * 60 * 1000
   });
 
