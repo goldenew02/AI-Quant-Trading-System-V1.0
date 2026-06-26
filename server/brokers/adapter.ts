@@ -30,6 +30,7 @@ export interface OrderRequest {
   price: number;
   quantity: number;
   secType?: string; // e.g. "STK" for IB
+  leverage?: number;
 }
 
 export interface OrderAccepted {

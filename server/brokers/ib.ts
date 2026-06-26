@@ -34,6 +34,13 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
     }
   }
 
+  async getAccountSummary(apiKey?: string): Promise<any> {
+    const baseUrl = this.getBaseUrl(apiKey);
+    const agent = this.getAgent(apiKey);
+    const res = await axios.get(`${baseUrl}/portfolio/accounts`, { httpsAgent: agent, timeout: 2000 });
+    return res.data;
+  }
+
   async getBalances(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<Balance[]> {
     const baseUrl = this.getBaseUrl(apiKey);
     const agent = this.getAgent(apiKey);

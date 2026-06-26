@@ -63,6 +63,10 @@ export interface BotConfig {
   timezone?: string;
   cgroupsCpuLimit?: string;
   cgroupsMemoryLimit?: string;
+  executionMode?: 'paper' | 'live';
+  gridType?: 'spot' | 'perpetual';
+  perpetualLeverage?: number;
+  fundingRateCheck?: boolean;
 }
 
 export interface TradeLog {

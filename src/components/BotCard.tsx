@@ -32,6 +32,10 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
     cpuAffinity: bot.cpuAffinity || "CPU Core 0",
     cgroupsCpuLimit: bot.cgroupsCpuLimit || "Uncapped",
     cgroupsMemoryLimit: bot.cgroupsMemoryLimit || "Uncapped",
+    executionMode: bot.executionMode || "paper",
+    gridType: bot.gridType || "spot",
+    perpetualLeverage: bot.perpetualLeverage || 5,
+    fundingRateCheck: bot.fundingRateCheck !== false,
   });
 
   const handleSave = () => {
@@ -44,6 +48,10 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
       leverage: Number(editingConfig.leverage),
       stopLoss: editingConfig.stopLoss ? Number(editingConfig.stopLoss) : undefined,
       takeProfit: editingConfig.takeProfit ? Number(editingConfig.takeProfit) : undefined,
+      executionMode: editingConfig.executionMode || "paper",
+      gridType: editingConfig.gridType || "spot",
+      perpetualLeverage: Number(editingConfig.perpetualLeverage || 5),
+      fundingRateCheck: editingConfig.fundingRateCheck,
     });
     setIsConfiguring(false);
   };
@@ -270,6 +278,72 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
               </select>
             </div>
 
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Contract Grid Type</label>
+              <select
+                value={editingConfig.gridType || "spot"}
+                onChange={(e) => handleValueChange("gridType", e.target.value as 'spot' | 'perpetual')}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="spot">Spot (专业现货网格)</option>
+                <option value="perpetual">Perpetual (多币种永续合约网格)</option>
+              </select>
+            </div>
+
+            {editingConfig.gridType === "perpetual" && (
+              <div className="col-span-2 grid grid-cols-2 gap-3 bg-[#0A0A0B] p-3 border border-[#2A2A2C] mt-1 mb-1">
+                <div className="col-span-2">
+                  <span className="text-[9px] text-[#00FF66] uppercase font-mono font-bold tracking-wider">Perpetual Contract Parameters</span>
+                </div>
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="text-[10px] text-zinc-500 uppercase font-mono">Perpetual Leverage: {editingConfig.perpetualLeverage}x</label>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    value={editingConfig.perpetualLeverage || 5}
+                    onChange={(e) => handleValueChange("perpetualLeverage", parseInt(e.target.value))}
+                    className="w-full h-1 bg-[#1E1E20] appearance-none cursor-pointer accent-[#00FF66]"
+                  />
+                  <div className="flex justify-between text-[8px] text-zinc-600 font-mono mt-1">
+                    <span>1x</span>
+                    <span>50x</span>
+                    <span>100x</span>
+                  </div>
+                </div>
+                <div className="flex flex-col justify-center">
+                  <label className="flex items-center gap-2 text-[10px] text-zinc-500 uppercase font-mono cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.fundingRateCheck}
+                      onChange={(e) => handleValueChange("fundingRateCheck", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5 animate-none"
+                    />
+                    <span>Funding Rate Check</span>
+                  </label>
+                  <p className="text-[8px] text-zinc-600 mt-1 font-mono leading-tight">
+                    Avoid entry if 8h funding rate exceeds 0.3%
+                  </p>
+                </div>
+                <div className="col-span-2 border-t border-[#2A2A2C]/60 pt-2 grid grid-cols-2 gap-2 text-[10px] font-mono">
+                  <div className="bg-rose-950/20 border border-rose-900/30 p-2">
+                    <span className="text-[8px] text-[#FF3333] uppercase block font-bold">Est. Liquidation Price</span>
+                    <span className="text-white font-bold block mt-0.5">
+                      Long: ${Math.round(((editingConfig.rangeMin + editingConfig.rangeMax) / 2) * (1 - 0.9 / (editingConfig.perpetualLeverage || 5)) * 100) / 100} / Short: ${Math.round(((editingConfig.rangeMin + editingConfig.rangeMax) / 2) * (1 + 0.9 / (editingConfig.perpetualLeverage || 5)) * 100) / 100}
+                    </span>
+                  </div>
+                  <div className="bg-[#141416] border border-[#2A2A2C] p-2">
+                    <span className="text-[8px] text-[#6FF] uppercase block font-bold">Estimated Required Margin</span>
+                    <span className="text-white font-bold block mt-0.5">
+                      ${((editingConfig.investment || 1000) / (editingConfig.perpetualLeverage || 5)).toFixed(2)} USD
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {editingConfig.type === "futures_grid" && (
               <>
                 <div>
@@ -420,6 +494,18 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                 <option value="Asia/Hong_Kong">HKT (Hong Kong Longbridge)</option>
               </select>
             </div>
+
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Execution Mode</label>
+              <select
+                value={editingConfig.executionMode || "paper"}
+                onChange={(e) => handleValueChange("executionMode", e.target.value)}
+                className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+              >
+                <option value="paper">Paper (模拟测试)</option>
+                <option value="live">Live (实盘交易)</option>
+              </select>
+            </div>
           </div>
 
           <div className="flex gap-2 justify-end mt-3">
@@ -479,7 +565,11 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
               <span className="text-[#666666] uppercase tracking-wider text-[9px]">Grids / Leverage</span>
               <span>
                 {bot.gridCount} Layers{" "}
-                {bot.type === "futures_grid" ? `| MULTI ${bot.leverage}X (${bot.direction.toUpperCase()})` : "| SPOT RAW"}
+                {bot.gridType === "perpetual" 
+                  ? `| PERPETUAL ${bot.perpetualLeverage}X` 
+                  : bot.type === "futures_grid" 
+                    ? `| MULTI ${bot.leverage}X (${bot.direction.toUpperCase()})` 
+                    : "| SPOT RAW"}
               </span>
             </div>
             <div className="flex justify-between items-center text-[11px]">
@@ -499,6 +589,13 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
               </div>
             </div>
 
+            <div className="flex justify-between items-center text-[11px]">
+              <span className="text-[#666666] uppercase tracking-wider text-[9px]">Execution Mode</span>
+              <span className={`font-bold uppercase text-[10px] ${bot.executionMode === "live" ? "text-amber-500" : "text-emerald-500"}`}>
+                {bot.executionMode === "live" ? "Live (实盘)" : "Paper (模拟)"}
+              </span>
+            </div>
+
             {/* Futures specific liquidation & margin indicators */}
             {bot.type === "futures_grid" && (
               <div className="grid grid-cols-2 gap-2 mt-2 pt-2 border-t border-[#2A2A2C]/40 text-[10px]">
@@ -510,6 +607,30 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                   <span className="text-[8px] text-amber-500 block font-bold">MAINTENANCE MARGIN</span>
                   <span className="text-white font-black block mt-0.5">${bot.maintenanceMargin?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                 </div>
+              </div>
+            )}
+
+            {/* Perpetual specific liquidation, leverage & funding rate indicators */}
+            {bot.gridType === "perpetual" && (
+              <div className="grid grid-cols-2 gap-2 mt-2 pt-2 border-t border-[#2A2A2C]/40 text-[10px]">
+                <div className="bg-rose-950/20 border border-rose-900/30 p-2 rounded-none">
+                  <span className="text-[8px] text-[#FF3333] uppercase block font-bold">EST. PERP LIQUIDATION</span>
+                  <span className="text-white font-black block mt-0.5">
+                    ${bot.liquidationPrice?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || "N/A"}
+                  </span>
+                </div>
+                <div className="bg-amber-950/20 border border-amber-900/30 p-2 rounded-none">
+                  <span className="text-[8px] text-amber-500 block font-bold">REQUIRED MARGIN ({bot.perpetualLeverage || 5}X)</span>
+                  <span className="text-white font-black block mt-0.5">
+                    ${(bot.investment / (bot.perpetualLeverage || 5)).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+                {bot.fundingRateCheck && (
+                  <div className="col-span-2 bg-emerald-950/20 border border-emerald-900/30 p-2 rounded-none flex justify-between items-center text-[9px]">
+                    <span className="text-[#00FF66] font-bold uppercase">FUNDING RATE SAFETY SHIELD ACTIVE</span>
+                    <span className="text-zinc-400 font-mono">Max: 0.30% / 8h</span>
+                  </div>
+                )}
               </div>
             )}
 

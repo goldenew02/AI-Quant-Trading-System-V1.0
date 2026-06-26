@@ -20,18 +20,15 @@ dotenv.config();
 
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
-  const configured = (process.env.COOKIE_SAMESITE || "lax").toLowerCase();
-  if (!["lax", "strict", "none"].includes(configured)) return "lax";
-  if (configured === "none" && process.env.COOKIE_SECURE !== "true" && process.env.NODE_ENV !== "production") {
-    return "lax";
-  }
+  const configured = (process.env.COOKIE_SAMESITE || "none").toLowerCase();
+  if (!["lax", "strict", "none"].includes(configured)) return "none";
   return configured as "lax" | "strict" | "none";
 }
 
 function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
-  const isProd = process.env.NODE_ENV === "production";
-  const secure = process.env.COOKIE_SECURE === "true" || isProd;
   const sameSite = resolveSameSite();
+  // cookies inside cross-origin iframe context must be secure if sameSite is none
+  const secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
   return {
     httpOnly: true,
     signed: true,
@@ -42,9 +39,9 @@ function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
 }
 
 function getCsrfCookieOptions(maxAge: number = 30 * 60 * 1000) {
-  const isProd = process.env.NODE_ENV === "production";
-  const secure = process.env.COOKIE_SECURE === "true" || isProd;
   const sameSite = resolveSameSite();
+  // cookies inside cross-origin iframe context must be secure if sameSite is none
+  const secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
   return {
     secure,
     sameSite,
@@ -54,6 +51,9 @@ function getCsrfCookieOptions(maxAge: number = 30 * 60 * 1000) {
 }
 
 const app = express();
+
+// Trust proxy for rate limiting behind Cloud Run/Nginx proxies
+app.set("trust proxy", 1);
 
 // Set Content Security Policy in production and protect against clickjacking / iframe nesting (P1-5)
 app.use(helmet({
@@ -84,11 +84,6 @@ app.use(cors({
     if (!isProd && origin.endsWith(".run.app")) {
       return cb(null, true);
     }
-    
-    // Fallback if origin matches any entry of allowedOrigins with prefix/suffix (helpful for double subdomains)
-    if (allowedOrigins.some(ao => origin === ao || ao.startsWith(origin) || origin.startsWith(ao))) {
-      return cb(null, true);
-    }
 
     return cb(new Error("CORS origin rejected"));
   },
@@ -113,7 +108,7 @@ function validateCsrf(req: any, res: any, next: any) {
     return next();
   }
   const csrfHeader = req.headers["x-csrf-token"];
-  const csrfCookie = req.signedCookies.csrf_token || req.cookies.csrf_token;
+  const csrfCookie = req.signedCookies.csrf_token;
   if (!csrfHeader || !csrfCookie || csrfHeader !== csrfCookie) {
     return res.status(403).json({ error: "Invalid or missing CSRF token (anti-CSRF shield triggered)." });
   }
@@ -296,9 +291,49 @@ function runIsolatedBotStep(bot: BotConfig) {
 
   // Unrealized PnL Calculation
   const units = bot.investment / bot.entryPrice;
-  if (bot.type === "futures_grid") {
-    const pnlMultiplier = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
-    bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * bot.leverage * pnlMultiplier * 100) / 100;
+  const currentLeverage = bot.gridType === "perpetual" ? (bot.perpetualLeverage || 5) : (bot.leverage || 1);
+  const directionFactor = bot.direction === "long" ? 1 : bot.direction === "short" ? -1 : 0;
+
+  if (bot.gridType === "perpetual") {
+    bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * currentLeverage * directionFactor * 100) / 100;
+    
+    // Dynamically calculate and check maintenance margin & liquidation price
+    bot.maintenanceMargin = Math.round((bot.investment / currentLeverage) * 0.05 * 100) / 100;
+    if (directionFactor !== 0) {
+      bot.liquidationPrice = Math.round(bot.entryPrice * (1 - (directionFactor * 0.9) / currentLeverage) * 100) / 100;
+    }
+
+    // Check perpetual liquidation
+    if (bot.liquidationPrice) {
+      const isLiquidated = (bot.direction === "long" && nextPrice <= bot.liquidationPrice) ||
+                           (bot.direction === "short" && nextPrice >= bot.liquidationPrice);
+      if (isLiquidated) {
+        console.warn(`[PERP LIQUIDATION] Bot ${bot.id} reached liquidation price ${bot.liquidationPrice} (Current: ${nextPrice}). Liquidating position.`);
+        bot.status = "stopped_by_risk";
+        bot.isEnabled = false;
+        bot.profitUsd = -bot.investment; // Full loss of margin
+        bot.profitPercent = -100;
+        bot.unrealizedProfitUsd = 0;
+        appendTradeLog({
+          id: `sys_liq_${bot.id}_${Date.now()}`,
+          botId: bot.id,
+          botName: bot.name,
+          broker: bot.broker,
+          symbol: bot.symbol,
+          timestamp: new Date().toISOString(),
+          type: "sell",
+          price: nextPrice,
+          amount: units,
+          total: 0,
+          pnl: -bot.investment
+        });
+        appendSecurityLog("system", "admin", "RISK_VIOLATION", bot.id, `Simulated liquidation triggered for perpetual bot ${bot.name} at price ${nextPrice}`);
+        dbInstance.save();
+        return;
+      }
+    }
+  } else if (bot.type === "futures_grid") {
+    bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * bot.leverage * directionFactor * 100) / 100;
   } else {
     bot.unrealizedProfitUsd = Math.round((nextPrice - bot.entryPrice) * units * 100) / 100;
   }
@@ -308,29 +343,34 @@ function runIsolatedBotStep(bot: BotConfig) {
     const alreadyFilled = grid.filled;
     const isCrossed = (grid.type === "buy" && nextPrice <= grid.price) || (grid.type === "sell" && nextPrice >= grid.price);
 
-    if (!alreadyFilled && isCrossed) {
-      grid.filled = true;
-      bot.tradesCount++;
+    if (isCrossed) {
+      const isLive = bot.executionMode === "live";
 
-      const tradePrice = grid.price;
-      const total = Math.round(grid.amount * tradePrice * 100) / 100;
+      if (isLive) {
+        // --- REAL BROKER PATHWAY (No Early Bookkeeping or Simulated Fills - P0-1) ---
+        // Look for configured real broker credentials matching current bot's broker
+        const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
+        if (!realAcc) {
+          console.warn(`[REAL BROKER] Bot ${bot.id} is set to Live mode but no API key configured/decrypted for ${bot.broker}. Skipping trigger.`);
+          return;
+        }
 
-      let realizedPnl = 0;
-      if (grid.type === "sell") {
-        realizedPnl = Math.round((tradePrice - bot.entryPrice) * grid.amount * 100) / 100;
-        if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
-        if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100;
-        bot.profitUsd += realizedPnl;
-      }
+        // To prevent duplicate order placements while an order is active at this grid level,
+        // check if there is an existing working or pending order for this bot/grid.
+        const activeOrders = dbInstance.get().orders || [];
+        const hasExistingOrder = activeOrders.some(o => 
+          o.botId === bot.id && 
+          Math.abs(o.price - grid.price) < 0.0001 && 
+          o.side.toLowerCase() === grid.type && 
+          ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED"].includes(o.status)
+        );
 
-      bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
-      bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+        if (hasExistingOrder) {
+          // Already have an active order for this price level on the broker. Do not duplicate.
+          return;
+        }
 
-      // 1. Look for configured real broker credentials matching current bot's broker
-      const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
-
-      if (realAcc) {
-        // --- REAL BROKER PATHWAY (Strict Order State Machine & No Mock Fallback - P0-2) ---
+        const tradePrice = grid.price;
         const clientOrderId = "cl_ord_" + crypto.randomBytes(8).toString("hex");
         const orderId = "ord_" + crypto.randomBytes(8).toString("hex");
         
@@ -352,7 +392,7 @@ function runIsolatedBotStep(bot: BotConfig) {
 
         dbInstance.insertOrder(orderEntity);
 
-        // 2. Perform automated strict risk checks before API execution (P1-1)
+        // Perform automated strict risk checks before API execution (P1-1)
         if (riskSettings.restrictedSymbols.includes(bot.symbol)) {
           dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, "Symbol restricted by risk parameters.");
           bot.status = "stopped_by_risk";
@@ -369,7 +409,7 @@ function runIsolatedBotStep(bot: BotConfig) {
           return;
         }
 
-        // 3. Decrypt credentials for the target adapter
+        // Decrypt credentials for the target adapter
         let apiKey = "";
         let apiSecret = "";
         let passphrase = "";
@@ -408,7 +448,8 @@ function runIsolatedBotStep(bot: BotConfig) {
             side: grid.type === "buy" ? "BUY" : "SELL",
             type: "LMT",
             price: tradePrice,
-            quantity: grid.amount
+            quantity: grid.amount,
+            leverage: bot.gridType === "perpetual" ? (bot.perpetualLeverage || 5) : bot.leverage
           },
           apiKey,
           apiSecret,
@@ -436,59 +477,78 @@ function runIsolatedBotStep(bot: BotConfig) {
 
       } else {
         // --- HIGH FIDELITY PAPER TRADING PATHWAY ---
-        console.log(`[PAPER_TRADE] Simulating grid crossing for ${bot.name}: ${grid.type} ${grid.amount} at ${tradePrice}`);
-        const clientOrderId = "cl_ord_sim_" + crypto.randomBytes(8).toString("hex");
-        const orderId = "ord_sim_" + crypto.randomBytes(8).toString("hex");
-        
-        const orderEntity: Order = {
-          id: orderId,
-          botId: bot.id,
-          broker: bot.broker,
-          brokerAccountId: "PAPER_ACCOUNT",
-          clientOrderId,
-          symbol: bot.symbol,
-          side: grid.type.toUpperCase() as "BUY" | "SELL",
-          type: "LMT",
-          price: tradePrice,
-          quantity: grid.amount,
-          status: "FILLED",
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
+        if (!alreadyFilled) {
+          grid.filled = true;
+          bot.tradesCount++;
 
-        dbInstance.insertOrder(orderEntity);
+          const tradePrice = grid.price;
+          const total = Math.round(grid.amount * tradePrice * 100) / 100;
 
-        const fillId = "fill_sim_" + crypto.randomBytes(8).toString("hex");
-        dbInstance.insertFill({
-          id: fillId,
-          orderId,
-          brokerFillId: `sim_fill_${clientOrderId}`,
-          price: tradePrice,
-          quantity: grid.amount,
-          fee: 0,
-          feeCurrency: "USD",
-          timestamp: new Date().toISOString()
-        });
+          let realizedPnl = 0;
+          if (grid.type === "sell") {
+            realizedPnl = Math.round((tradePrice - bot.entryPrice) * grid.amount * 100) / 100;
+            if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+            if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100;
+            bot.profitUsd += realizedPnl;
+          }
 
-        // Write append-only simulated log
-        appendTradeLog({
-          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-          botId: bot.id,
-          botName: bot.name,
-          broker: bot.broker,
-          symbol: bot.symbol,
-          timestamp: new Date().toISOString(),
-          type: grid.type,
-          price: tradePrice,
-          amount: grid.amount,
-          total,
-          pnl: realizedPnl > 0 ? realizedPnl : undefined
-        });
+          bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+          bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
 
-        setTimeout(() => {
-          grid.filled = false;
-          grid.type = grid.type === "buy" ? "sell" : "buy";
-        }, 12000);
+          console.log(`[PAPER_TRADE] Simulating grid crossing for ${bot.name}: ${grid.type} ${grid.amount} at ${tradePrice}`);
+          const clientOrderId = "cl_ord_sim_" + crypto.randomBytes(8).toString("hex");
+          const orderId = "ord_sim_" + crypto.randomBytes(8).toString("hex");
+          
+          const orderEntity: Order = {
+            id: orderId,
+            botId: bot.id,
+            broker: bot.broker,
+            brokerAccountId: "PAPER_ACCOUNT",
+            clientOrderId,
+            symbol: bot.symbol,
+            side: grid.type.toUpperCase() as "BUY" | "SELL",
+            type: "LMT",
+            price: tradePrice,
+            quantity: grid.amount,
+            status: "FILLED",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+
+          dbInstance.insertOrder(orderEntity);
+
+          const fillId = "fill_sim_" + crypto.randomBytes(8).toString("hex");
+          dbInstance.insertFill({
+            id: fillId,
+            orderId,
+            brokerFillId: `sim_fill_${clientOrderId}`,
+            price: tradePrice,
+            quantity: grid.amount,
+            fee: 0,
+            feeCurrency: "USD",
+            timestamp: new Date().toISOString()
+          });
+
+          // Write append-only simulated log
+          appendTradeLog({
+            id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+            botId: bot.id,
+            botName: bot.name,
+            broker: bot.broker,
+            symbol: bot.symbol,
+            timestamp: new Date().toISOString(),
+            type: grid.type,
+            price: tradePrice,
+            amount: grid.amount,
+            total,
+            pnl: realizedPnl > 0 ? realizedPnl : undefined
+          });
+
+          setTimeout(() => {
+            grid.filled = false;
+            grid.type = grid.type === "buy" ? "sell" : "buy";
+          }, 12000);
+        }
       }
     }
   });
@@ -1339,8 +1399,13 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
     lastUpdated: new Date().toISOString(),
   };
 
-  // Calculate Futures liquidation metrics
-  if (config.type === "futures_grid") {
+  // Calculate Futures or Perpetual liquidation metrics
+  if (config.gridType === "perpetual") {
+    const directionFactor = config.direction === "long" ? 1 : config.direction === "short" ? -1 : 0;
+    const lev = Number(config.perpetualLeverage || 5);
+    bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.9) / lev) * 100) / 100;
+    bots[botIndex].maintenanceMargin = Math.round((Number(config.investment) / lev) * 0.05 * 100) / 100;
+  } else if (config.type === "futures_grid") {
     const directionFactor = config.direction === "long" ? 1 : config.direction === "short" ? -1 : 0;
     bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.8) / Number(config.leverage || 1)) * 100) / 100;
     bots[botIndex].maintenanceMargin = Math.round(Number(config.investment) * 0.05 * 100) / 100;
@@ -1359,6 +1424,13 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), (req: any, r
   if (botIndex !== -1) {
     if (riskSettings.globalKillSwitch) {
       return res.status(400).json({ error: "Risk Control Triggered: Global Kill Switch is Active." });
+    }
+    const bot = bots[botIndex];
+    if (bot.executionMode === "live") {
+      const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
+      if (!realAcc) {
+        return res.status(400).json({ error: `无法启动实盘机器人: 未检测到关联并解密的 [${bot.broker}] 真实券商账户密钥。请前往券商密钥模块配置后再试。` });
+      }
     }
     bots[botIndex].status = "running";
     bots[botIndex].isEnabled = true;
@@ -1387,85 +1459,8 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), (req: any, re
   }
 });
 
-// Real Interactive Brokers Web API / Client Portal integration client (P0-4)
-class InteractiveBrokersClient {
-  private baseUrl: string;
-  private agent: https.Agent;
-
-  constructor() {
-    // Default local IB Gateway / Client Portal API endpoint
-    this.baseUrl = process.env.IB_GATEWAY_URL || "https://127.0.0.1:5000/v1/api";
-    this.agent = new https.Agent({
-      rejectUnauthorized: false // IB Web API gateway uses local self-signed SSL certificates
-    });
-  }
-
-  // Check connection status with real IB Client Portal endpoint
-  async checkConnection(): Promise<{ connected: boolean; username?: string; error?: string }> {
-    try {
-      const res = await axios.get(`${this.baseUrl}/one/user`, {
-        httpsAgent: this.agent,
-        timeout: 1500
-      });
-      if (res.status === 200 && res.data) {
-        return { connected: true, username: res.data.username || "IB_USER" };
-      }
-      return { connected: false, error: "Authentication session not initialized on IB Gateway" };
-    } catch (err: any) {
-      return { connected: false, error: `IB Gateway unreachable on ${this.baseUrl}: ${err.message}` };
-    }
-  }
-
-  // Fetch real-time account summary from IB
-  async getAccountSummary(): Promise<any> {
-    try {
-      const res = await axios.get(`${this.baseUrl}/portfolio/accounts`, {
-        httpsAgent: this.agent,
-        timeout: 1500
-      });
-      return res.data;
-    } catch (err: any) {
-      throw new Error(`Failed to retrieve IB portfolio: ${err.message}`);
-    }
-  }
-
-  // Place a real trade order via IB Client Portal
-  async placeOrder(account: string, symbol: string, secType: string, side: string, quantity: number, price: number): Promise<any> {
-    try {
-      // Resolve conid (Contract ID) from IB symbol search
-      const searchRes = await axios.get(`${this.baseUrl}/iserver/secdef/search?symbol=${symbol}`, {
-        httpsAgent: this.agent
-      });
-      const conid = searchRes.data?.[0]?.conid;
-      if (!conid) {
-        throw new Error(`Contract ID for symbol ${symbol} not found on Interactive Brokers`);
-      }
-
-      const orderPayload = {
-        orders: [
-          {
-            conid,
-            secType,
-            orderType: "LMT",
-            price,
-            side: side.toUpperCase(),
-            quantity,
-            tif: "GTC"
-          }
-        ]
-      };
-
-      const res = await axios.post(`${this.baseUrl}/iserver/account/${account}/orders`, orderPayload, {
-        httpsAgent: this.agent
-      });
-      return res.data;
-    } catch (err: any) {
-      throw new Error(`IB order transmission failed: ${err.message}`);
-    }
-  }
-}
-
-export const ibClient = new InteractiveBrokersClient();
+import { InteractiveBrokersAdapter } from "./server/brokers/ib";
+export const ibAdapter = new InteractiveBrokersAdapter();
 
 // Interactive Brokers (IB) Connection Mode Endpoints (Audit Point 1.1 ARM Bypass)
 app.get("/api/ib-mode", requireAuth(['admin', 'operator', 'viewer']), (req, res) => {
@@ -1487,7 +1482,7 @@ app.post("/api/ib-mode", requireAuth(['admin', 'operator']), (req: any, res) => 
 
 // Interactive Brokers (IB) Connection Status and Live Integration Endpoint
 app.get("/api/ib/status", requireAuth(['admin', 'operator', 'viewer']), async (req, res) => {
-  const status = await ibClient.checkConnection();
+  const status = await ibAdapter.connect();
   res.json({
     status,
     connectionMode: ibConnectionMode,
@@ -1497,7 +1492,7 @@ app.get("/api/ib/status", requireAuth(['admin', 'operator', 'viewer']), async (r
 
 app.get("/api/ib/portfolio", requireAuth(['admin', 'operator', 'viewer']), async (req, res) => {
   try {
-    const summary = await ibClient.getAccountSummary();
+    const summary = await ibAdapter.getAccountSummary();
     res.json({ success: true, data: summary });
   } catch (err: any) {
     res.status(502).json({

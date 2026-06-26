@@ -389,23 +389,47 @@ export class AegisDB {
     }
     if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
 
-    // Synchronize admin password with .env to prevent out-of-sync credential lockouts
+    // Synchronize admin password and TOTP secret with .env to prevent out-of-sync credential lockouts
     const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
     const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+    const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
     if (seedUser && seedPass) {
       let adminUser = this.data.users.find(u => u.username === seedUser);
+      let needsSave = false;
       if (!adminUser) {
         adminUser = {
           username: seedUser,
           passwordHash: hashPassword(seedPass),
           role: "admin",
-          totpSecret: null,
+          totpSecret: seedTotp ? encryptSecret(seedTotp) : null,
           isActive: true,
-          mustEnrollTotp: true
+          mustEnrollTotp: seedTotp ? false : true
         };
         this.data.users.push(adminUser);
-      } else if (adminUser.mustEnrollTotp) {
-        adminUser.passwordHash = hashPassword(seedPass);
+        needsSave = true;
+      } else {
+        if (!verifyPassword(seedPass, adminUser.passwordHash)) {
+          adminUser.passwordHash = hashPassword(seedPass);
+          needsSave = true;
+        }
+        if (seedTotp) {
+          let currentTotp: string | null = null;
+          if (adminUser.totpSecret) {
+            try {
+              currentTotp = decryptSecret(adminUser.totpSecret);
+            } catch (e) {
+              // Decryption fail, overwrite below
+            }
+          }
+          if (currentTotp !== seedTotp || adminUser.mustEnrollTotp) {
+            adminUser.totpSecret = encryptSecret(seedTotp);
+            adminUser.mustEnrollTotp = false;
+            needsSave = true;
+          }
+        }
+      }
+      if (needsSave) {
+        this.save();
       }
     }
   }
@@ -587,6 +611,23 @@ export class AegisDB {
             if (err) console.error("Failed to create mfa_action_tokens table:", err);
           });
 
+          // Structured fills table for deduplication and persistence (P1-3)
+          sqliteDb.run(`
+            CREATE TABLE IF NOT EXISTS fills (
+              id TEXT PRIMARY KEY,
+              orderId TEXT NOT NULL,
+              brokerFillId TEXT NOT NULL,
+              price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              fee REAL NOT NULL,
+              feeCurrency TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              UNIQUE(orderId, brokerFillId)
+            )
+          `, (err) => {
+            if (err) console.error("Failed to create fills table:", err);
+          });
+
           // Fetch state
           sqliteDb.get("SELECT value FROM aegis_kv WHERE key = 'database_state'", (selectErr, row: any) => {
             if (selectErr) {
@@ -640,6 +681,9 @@ export class AegisDB {
         timezone: "UTC",
         cgroupsCpuLimit: "Max 50% CPU",
         cgroupsMemoryLimit: "Max 3G RAM",
+        executionMode: "paper",
+        gridType: "spot",
+        fundingRateCheck: false,
         pid: 4210,
         memoryHeapMb: 98.4,
         cpuAffinity: "CPU Core 0",
@@ -683,6 +727,10 @@ export class AegisDB {
         timezone: "UTC",
         cgroupsCpuLimit: "Max 50% CPU",
         cgroupsMemoryLimit: "Max 3G RAM",
+        executionMode: "paper",
+        gridType: "perpetual",
+        perpetualLeverage: 5,
+        fundingRateCheck: true,
         pid: 4211,
         memoryHeapMb: 112.1,
         cpuAffinity: "CPU Core 1",
@@ -970,11 +1018,33 @@ export class AegisDB {
            (f.orderId === fill.orderId && f.brokerFillId === fill.brokerFillId)
     );
     if (exists) {
-      console.log(`[DB] Fill ${fill.brokerFillId} for order ${fill.orderId} already exists. Skipping duplicate.`);
+      console.log(`[DB-Memory] Fill ${fill.brokerFillId} for order ${fill.orderId} already exists. Skipping duplicate.`);
       return;
     }
-    this.data.fills.unshift(fill);
-    this.save();
+
+    if (this.sqliteDbConn) {
+      this.sqliteDbConn.run(
+        "INSERT INTO fills (id, orderId, brokerFillId, price, quantity, fee, feeCurrency, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [fill.id, fill.orderId, fill.brokerFillId, fill.price, fill.quantity, fill.fee, fill.feeCurrency, fill.timestamp],
+        (err) => {
+          if (err) {
+            if (err.message.includes("UNIQUE constraint failed")) {
+              console.log(`[DB-SQLite] Unique constraint hit. Duplicate fill skipped: ${fill.brokerFillId} for order ${fill.orderId}`);
+            } else {
+              console.error("[DB-SQLite] Failed to insert fill:", err);
+            }
+            return;
+          }
+          // Only push to memory and save state after successful DB insert
+          this.data.fills.unshift(fill);
+          this.save();
+        }
+      );
+    } else {
+      // Memory fallback if sqlite is not connected (e.g. testing/bootstrap)
+      this.data.fills.unshift(fill);
+      this.save();
+    }
   }
 
   public getMfaTokensDb(callback: (err: any, rows: any[]) => void) {
