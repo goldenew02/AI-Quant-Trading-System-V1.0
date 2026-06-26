@@ -56,6 +56,14 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           setTempRole(data.role);
           setTempUsername(data.username);
           
+          // Verify session is successfully established before proceeding to setup (Audit P0-4)
+          const meRes = await apiFetch("/api/auth/me");
+          if (!meRes.ok) {
+            setError(`Password accepted, but session cookie was not established (HTTP ${meRes.status}). Check COOKIE_SECURE / COOKIE_SAMESITE / HTTPS settings.`);
+            setLoading(false);
+            return;
+          }
+
           const setupRes = await apiFetch("/api/auth/totp/setup", {
             method: "POST",
             headers: { "Content-Type": "application/json" }
@@ -66,7 +74,17 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
             setTempSecret(setupData.tempSecret);
             setMfaSetupMode(true);
           } else {
-            setError("Authentication succeeded but failed to initialize secure TOTP setup channel.");
+            let detail = `HTTP ${setupRes.status}`;
+            try {
+              const ct = setupRes.headers.get("content-type") || "";
+              if (ct.includes("application/json")) {
+                const errData = await setupRes.json();
+                detail = errData.error || detail;
+              } else {
+                detail = await setupRes.text() || detail;
+              }
+            } catch {}
+            setError(`Authentication succeeded but failed to initialize secure TOTP setup channel: ${detail}`);
           }
         } else {
           // Fallback (e.g. if TOTP is bypassed or disabled)

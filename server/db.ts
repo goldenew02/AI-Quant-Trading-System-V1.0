@@ -191,8 +191,8 @@ export function verifyTOTP(secret: string, token: string): boolean {
   const epoch = Math.floor(Date.now() / 1000);
   const timeStep = Math.floor(epoch / 30);
 
-  // Buffer check window for standard clock drifts (-1, 0, +1 step of 30 seconds)
-  for (let drift = -1; drift <= 1; drift++) {
+  // Buffer check window for standard clock drifts (-4 to +4 steps of 30 seconds, supporting up to 120 seconds mobile drift)
+  for (let drift = -4; drift <= 4; drift++) {
     const step = timeStep + drift;
     const msg = Buffer.alloc(8);
     
