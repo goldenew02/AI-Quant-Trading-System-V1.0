@@ -139,7 +139,7 @@ export interface Order {
   type: "LMT" | "MKT";
   price: number;
   quantity: number;
-  status: "ORDER_INTENT_CREATED" | "PENDING" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED";
+  status: "ORDER_INTENT_CREATED" | "PENDING" | "WORKING" | "NEW" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED";
   createdAt: string;
   updatedAt: string;
   lastError?: string;

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { ShieldAlert, Key, HelpCircle, RefreshCw, User, Lock, Terminal, Fingerprint, Copy, Check } from "lucide-react";
+import { apiFetch } from "../lib/api";
 
 interface AegisLoginProps {
   onLoginSuccess: (role: 'admin' | 'operator' | 'viewer', username: string) => void;
@@ -10,6 +11,7 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   // Dynamic TOTP enrollment states
   const [mfaSetupMode, setMfaSetupMode] = useState(false);
@@ -19,9 +21,15 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
   const [tempUsername, setTempUsername] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Split login states (for already-enrolled users)
+  const [loginMfaMode, setLoginMfaMode] = useState(false);
+  const [preauthId, setPreauthId] = useState<string | null>(null);
+  const [loginTotpCode, setLoginTotpCode] = useState("");
+
   const handleLoginSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     setError(null);
+    setSuccessMsg(null);
     if (!username.trim() || !password.trim()) {
       setError("Please fill in both telemetry access credentials.");
       return;
@@ -29,7 +37,7 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
 
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/login", {
+      const res = await apiFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password: password.trim() }),
@@ -39,12 +47,16 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
       if (res.ok && contentType && contentType.includes("application/json")) {
         const data = await res.json();
         
-        if (data.mustEnrollTotp) {
+        if (data.requiresTotp) {
+          // 2FA login phase 1 success: store preauthId and transition to stage 2 (P0-1)
+          setPreauthId(data.preauthId);
+          setLoginMfaMode(true);
+        } else if (data.mustEnrollTotp) {
           // Store temp credentials and trigger dynamic TOTP setup workflow (P0-1.5)
           setTempRole(data.role);
           setTempUsername(data.username);
           
-          const setupRes = await fetch("/api/auth/totp/setup", {
+          const setupRes = await apiFetch("/api/auth/totp/setup", {
             method: "POST",
             headers: { "Content-Type": "application/json" }
           });
@@ -57,7 +69,7 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
             setError("Authentication succeeded but failed to initialize secure TOTP setup channel.");
           }
         } else {
-          // Standard login when already enrolled
+          // Fallback (e.g. if TOTP is bypassed or disabled)
           onLoginSuccess(data.role, data.username);
         }
       } else {
@@ -72,9 +84,42 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
     }
   };
 
+  const handleLoginTotpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setSuccessMsg(null);
+    if (loginTotpCode.trim().length !== 6) {
+      setError("Dynamic MFA code must be exactly 6 digits.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await apiFetch("/api/auth/login/totp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preauthId, code: loginTotpCode.trim() })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        onLoginSuccess(data.role, data.username);
+      } else {
+        const data = await res.json();
+        setError(data.error || "Dynamic MFA code verification failed. Access denied.");
+      }
+    } catch (err) {
+      console.error(err);
+      setError("MFA authentication channel interrupted. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleMfaConfirmSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setSuccessMsg(null);
     if (totpCode.trim().length !== 6) {
       setError("Dynamic MFA code must be exactly 6 digits.");
       return;
@@ -82,19 +127,19 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
 
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/totp/confirm", {
+      const res = await apiFetch("/api/auth/totp/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: totpCode.trim() })
       });
 
       if (res.ok) {
-        if (tempRole && tempUsername) {
-          onLoginSuccess(tempRole, tempUsername);
-        } else {
-          setError("Session context lost. Please log in again.");
-          setMfaSetupMode(false);
-        }
+        // Enforce re-login after setup to comply with complete session rotation (P0-1.4)
+        setSuccessMsg("Google 2FA bound successfully! For security, your session has been rotated. Please enter your credentials and dynamic code again.");
+        setMfaSetupMode(false);
+        setUsername("");
+        setPassword("");
+        setTotpCode("");
       } else {
         const data = await res.json();
         setError(data.error || "Dynamic MFA code verification failed. Setup not complete.");
@@ -136,6 +181,14 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           </p>
         </div>
 
+        {/* System Success Message */}
+        {successMsg && (
+          <div className="bg-[#00FF66]/10 border border-[#00FF66] text-[#00FF66] p-3 text-xs font-mono uppercase rounded-none mb-6">
+            <strong className="block text-[10px] font-black tracking-wider mb-0.5">🟢 TRANSACTION SECURE:</strong>
+            {successMsg}
+          </div>
+        )}
+
         {/* System Error Message */}
         {error && (
           <div className="bg-[#FF3333]/15 border border-[#FF3333] text-[#FF3333] p-3 text-xs font-mono uppercase rounded-none mb-6">
@@ -144,7 +197,66 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
           </div>
         )}
 
-        {!mfaSetupMode ? (
+        {loginMfaMode ? (
+          /* Dynamic Login MFA/TOTP Form (P0-1 Phase 2 Challenge) */
+          <form onSubmit={handleLoginTotpSubmit} className="space-y-5">
+            <div className="bg-[#1C1C1E]/50 border border-[#2A2A2C] p-4 text-xs space-y-2 font-sans leading-relaxed text-zinc-300">
+              <div className="flex items-center gap-2 text-[#00FF66] font-bold font-mono text-[10px]">
+                <Fingerprint className="h-4 w-4 animate-pulse text-[#00FF66]" />
+                <span>DYNAMIC MULTI-FACTOR CHALLENGE</span>
+              </div>
+              <p>
+                Dynamic Google Authenticator code is required for operator account <strong>{username}</strong>. Please consult your Google Authenticator device.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-[10px] font-mono text-[#666666] uppercase font-black tracking-wider mb-1.5">
+                Dynamic 6-Digit Authenticator Code
+              </label>
+              <input
+                type="text"
+                maxLength={6}
+                value={loginTotpCode}
+                onChange={(e) => setLoginTotpCode(e.target.value.replace(/\D/g, ""))}
+                placeholder="000000"
+                disabled={loading}
+                autoFocus
+                className="bg-[#060608] border border-[#2A2A2C] text-white placeholder-[#444446] tracking-[0.8em] text-center font-bold font-mono text-lg py-3.5 w-full focus:outline-none focus:border-[#00FF66]"
+              />
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setLoginMfaMode(false);
+                  setLoginTotpCode("");
+                }}
+                className="w-1/3 border border-[#2A2A2C] text-[#666666] font-bold uppercase text-xs py-4 hover:bg-zinc-900 transition font-mono cursor-pointer"
+              >
+                BACK
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-2/3 bg-[#00FF66] text-black font-black uppercase text-xs tracking-wider py-4 hover:bg-[#00CC55] transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 font-mono"
+              >
+                {loading ? (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin text-black" />
+                    AUTHORIZING ACCESS...
+                  </>
+                ) : (
+                  <>
+                    <ShieldAlert className="h-4 w-4 text-black" />
+                    CONFIRM & ENTER
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+        ) : !mfaSetupMode ? (
           /* Credentials Form */
           <form onSubmit={handleLoginSubmit} className="space-y-4">
             <div>

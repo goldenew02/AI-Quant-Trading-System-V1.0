@@ -3,6 +3,27 @@ import fs from "fs";
 import path from "path";
 import { BotConfig, TradeLog, RiskSettings, BrokerAccount, Order, Fill } from "../src/types";
 
+// --- DYNAMIC SQLITE DETECTION & FALLBACK SETUP ---
+let sqlite3: any = null;
+let isSqliteSupported: boolean | null = null;
+
+async function checkSqliteSupport(): Promise<boolean> {
+  if (isSqliteSupported !== null) return isSqliteSupported;
+  try {
+    const sqliteModule = await import("sqlite3");
+    sqlite3 = sqliteModule.default || sqliteModule;
+    isSqliteSupported = true;
+  } catch (err: any) {
+    console.warn("==================================================================");
+    console.warn("  [NOTICE] SQLite3 native module is not supported in this environment.");
+    console.warn("  [REASON] GLIBC/dynamic linking error or missing native binary bindings.");
+    console.warn("  [FALLBACK] Gracefully falling back to file-based JSON storage.");
+    console.warn("==================================================================");
+    isSqliteSupported = false;
+  }
+  return isSqliteSupported;
+}
+
 // --- ENVIRONMENT INITIALIZATION & FAIL-FAST VALIDATION ---
 const envPath = path.join(process.cwd(), ".env");
 if (!fs.existsSync(envPath)) {
@@ -109,6 +130,12 @@ export interface AegisDatabase {
     bodyHash: string;
     expiresAt: number;
     usedAt?: number | null;
+  }[];
+  preauthSessions?: {
+    preauthIdHash: string;
+    username: string;
+    role: 'admin' | 'operator' | 'viewer';
+    expiresAt: number;
   }[];
 }
 
@@ -251,91 +278,300 @@ export function computeSecurityHash(log: SecurityAuditEntry, prevHash: string): 
 }
 
 export class AegisDB {
-  private data!: AegisDatabase;
+  private data: AegisDatabase = {
+    users: [],
+    sessions: [],
+    bots: [],
+    tradeLogs: [],
+    securityAuditLogs: [],
+    riskSettings: {
+      maxDailyDrawdown: 8.0,
+      maxAccountDrawdown: 15.0,
+      globalKillSwitch: false,
+      maxLeverageLimit: 10,
+      dailyLossLimitUSD: 800,
+      restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+      singleAssetMaxAllocationPercent: 40,
+      industryCryptoMaxPercent: 60,
+      autoMeltDrawdownThreshold: 12.0,
+      autoMeltSharpeThreshold: 0.8
+    },
+    ibConnectionMode: "web_api_proxy",
+    brokerAccounts: [],
+    orders: [],
+    fills: [],
+    mfaActionTokens: [],
+    preauthSessions: []
+  };
   public ready: Promise<void>;
 
   constructor() {
     this.ready = this.initDatabaseAsync();
   }
 
-  private initDatabaseAsync(): Promise<void> {
+  private updateDataInPlace(source: any) {
+    if (!source) return;
+    
+    // In-place update of arrays so references are perfectly preserved
+    const updateArrayInPlace = (key: string) => {
+      const targetArr = (this.data as any)[key] || [];
+      const sourceArr = source[key] || [];
+      targetArr.splice(0, targetArr.length, ...sourceArr);
+      (this.data as any)[key] = targetArr;
+    };
+
+    updateArrayInPlace("users");
+    updateArrayInPlace("sessions");
+    updateArrayInPlace("bots");
+    updateArrayInPlace("tradeLogs");
+    updateArrayInPlace("securityAuditLogs");
+    updateArrayInPlace("brokerAccounts");
+    updateArrayInPlace("orders");
+    updateArrayInPlace("fills");
+    updateArrayInPlace("mfaActionTokens");
+    updateArrayInPlace("preauthSessions");
+
+    // In-place update of riskSettings
+    if (source.riskSettings) {
+      for (const key of Object.keys(this.data.riskSettings)) {
+        delete (this.data.riskSettings as any)[key];
+      }
+      Object.assign(this.data.riskSettings, source.riskSettings);
+    }
+
+    if (source.ibConnectionMode) {
+      this.data.ibConnectionMode = source.ibConnectionMode;
+    }
+
+    this.ensureDataDefaults();
+  }
+
+  private ensureDataDefaults() {
+    if (!this.data.users) this.data.users = [];
+    if (!this.data.sessions) this.data.sessions = [];
+    if (!this.data.bots) this.data.bots = [];
+    if (!this.data.tradeLogs) this.data.tradeLogs = [];
+    if (!this.data.securityAuditLogs) this.data.securityAuditLogs = [];
+    if (!this.data.brokerAccounts) this.data.brokerAccounts = [];
+    if (!this.data.orders) this.data.orders = [];
+    if (!this.data.fills) this.data.fills = [];
+    if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
+    if (!this.data.preauthSessions) this.data.preauthSessions = [];
+    if (!this.data.riskSettings) {
+      this.data.riskSettings = {
+        maxDailyDrawdown: 8.0,
+        maxAccountDrawdown: 15.0,
+        globalKillSwitch: false,
+        maxLeverageLimit: 10,
+        dailyLossLimitUSD: 800,
+        restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+        singleAssetMaxAllocationPercent: 40,
+        industryCryptoMaxPercent: 60,
+        autoMeltDrawdownThreshold: 12.0,
+        autoMeltSharpeThreshold: 0.8
+      };
+    }
+    if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
+
+    // Synchronize admin password with .env to prevent out-of-sync credential lockouts
+    const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
+    const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+    if (seedUser && seedPass) {
+      let adminUser = this.data.users.find(u => u.username === seedUser);
+      if (!adminUser) {
+        adminUser = {
+          username: seedUser,
+          passwordHash: hashPassword(seedPass),
+          role: "admin",
+          totpSecret: null,
+          isActive: true,
+          mustEnrollTotp: true
+        };
+        this.data.users.push(adminUser);
+      } else if (adminUser.mustEnrollTotp) {
+        adminUser.passwordHash = hashPassword(seedPass);
+      }
+    }
+  }
+
+  private seedAndSave(sqliteDb: any, resolve: () => void, reject: (err: any) => void) {
+    try {
+      const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
+      const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+      const seedData = {
+        users: [
+          {
+            username: seedUser,
+            passwordHash: hashPassword(seedPass),
+            role: "admin",
+            totpSecret: null,
+            isActive: true,
+            mustEnrollTotp: true
+          }
+        ],
+        sessions: [],
+        bots: this.getSeedBots(),
+        tradeLogs: this.getSeedTradeLogs(),
+        securityAuditLogs: this.getSeedSecurityLogs(),
+        riskSettings: {
+          maxDailyDrawdown: 8.0,
+          maxAccountDrawdown: 15.0,
+          globalKillSwitch: false,
+          maxLeverageLimit: 10,
+          dailyLossLimitUSD: 800,
+          restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+          singleAssetMaxAllocationPercent: 40,
+          industryCryptoMaxPercent: 60,
+          autoMeltDrawdownThreshold: 12.0,
+          autoMeltSharpeThreshold: 0.8
+        },
+        ibConnectionMode: "web_api_proxy",
+        brokerAccounts: [],
+        orders: [],
+        fills: [],
+        mfaActionTokens: [],
+        preauthSessions: []
+      };
+      this.updateDataInPlace(seedData);
+
+      sqliteDb.run(
+        "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [JSON.stringify(this.data, null, 2)],
+        (err: any) => {
+          if (err) {
+            console.error("Failed to seed database in SQLite:", err);
+            return reject(err);
+          }
+          resolve();
+        }
+      );
+    } catch (err) {
+      reject(err);
+    }
+  }
+
+  private async initDatabaseAsync(): Promise<void> {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
 
-    const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
+    const sqliteSupported = await checkSqliteSupport();
+    if (!sqliteSupported) {
+      const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
+      if (fs.existsSync(JSON_FILE)) {
+        try {
+          const raw = fs.readFileSync(JSON_FILE, "utf-8");
+          this.updateDataInPlace(JSON.parse(raw));
+          return;
+        } catch (err) {
+          console.error("Failed to parse JSON state, fallback to seed:", err);
+        }
+      }
+      
+      const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
+      const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+      const seedData = {
+        users: [
+          {
+            username: seedUser,
+            passwordHash: hashPassword(seedPass),
+            role: "admin",
+            totpSecret: null,
+            isActive: true,
+            mustEnrollTotp: true
+          }
+        ],
+        sessions: [],
+        bots: this.getSeedBots(),
+        tradeLogs: this.getSeedTradeLogs(),
+        securityAuditLogs: this.getSeedSecurityLogs(),
+        riskSettings: {
+          maxDailyDrawdown: 8.0,
+          maxAccountDrawdown: 15.0,
+          globalKillSwitch: false,
+          maxLeverageLimit: 10,
+          dailyLossLimitUSD: 800,
+          restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+          singleAssetMaxAllocationPercent: 40,
+          industryCryptoMaxPercent: 60,
+          autoMeltDrawdownThreshold: 12.0,
+          autoMeltSharpeThreshold: 0.8
+        },
+        ibConnectionMode: "web_api_proxy",
+        brokerAccounts: [],
+        orders: [],
+        fills: [],
+        mfaActionTokens: [],
+        preauthSessions: []
+      };
+      this.updateDataInPlace(seedData);
+
+      const TEMP_FILE = JSON_FILE + ".tmp";
+      try {
+        fs.writeFileSync(TEMP_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+        fs.renameSync(TEMP_FILE, JSON_FILE);
+      } catch (err) {
+        console.error("Database save failed:", err);
+      }
+      return;
+    }
+
+    const SQLITE_FILE = path.join(DB_DIR, "aegis_secure.db");
 
     return new Promise<void>((resolve, reject) => {
-      try {
-        if (fs.existsSync(JSON_FILE)) {
-          const raw = fs.readFileSync(JSON_FILE, "utf-8");
-          this.data = JSON.parse(raw);
-          if (!this.data.users) this.data.users = [];
-          if (!this.data.sessions) this.data.sessions = [];
-          if (!this.data.bots) this.data.bots = [];
-          if (!this.data.tradeLogs) this.data.tradeLogs = [];
-          if (!this.data.securityAuditLogs) this.data.securityAuditLogs = [];
-          if (!this.data.brokerAccounts) this.data.brokerAccounts = [];
-          if (!this.data.orders) this.data.orders = [];
-          if (!this.data.fills) this.data.fills = [];
-          if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
-          if (!this.data.riskSettings) {
-            this.data.riskSettings = {
-              maxDailyDrawdown: 8.0,
-              maxAccountDrawdown: 15.0,
-              globalKillSwitch: false,
-              maxLeverageLimit: 10,
-              dailyLossLimitUSD: 800,
-              restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
-              singleAssetMaxAllocationPercent: 40,
-              industryCryptoMaxPercent: 60,
-              autoMeltDrawdownThreshold: 12.0,
-              autoMeltSharpeThreshold: 0.8
-            };
-          }
-          if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
-        } else {
-          const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
-          const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
-          this.data = {
-            users: [
-              {
-                username: seedUser,
-                passwordHash: hashPassword(seedPass),
-                role: "admin",
-                totpSecret: null,
-                isActive: true,
-                mustEnrollTotp: true
-              }
-            ],
-            sessions: [],
-            bots: this.getSeedBots(),
-            tradeLogs: this.getSeedTradeLogs(),
-            securityAuditLogs: this.getSeedSecurityLogs(),
-            riskSettings: {
-              maxDailyDrawdown: 8.0,
-              maxAccountDrawdown: 15.0,
-              globalKillSwitch: false,
-              maxLeverageLimit: 10,
-              dailyLossLimitUSD: 800,
-              restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
-              singleAssetMaxAllocationPercent: 40,
-              industryCryptoMaxPercent: 60,
-              autoMeltDrawdownThreshold: 12.0,
-              autoMeltSharpeThreshold: 0.8
-            },
-            ibConnectionMode: "web_api_proxy",
-            brokerAccounts: [],
-            orders: [],
-            fills: [],
-            mfaActionTokens: []
-          };
-          this.save();
+      const sqlite = sqlite3.verbose();
+      const sqliteDb = new sqlite.Database(SQLITE_FILE, (err) => {
+        if (err) {
+          console.error("Failed to connect to SQLite:", err);
+          return reject(err);
         }
-        resolve();
-      } catch (err) {
-        reject(err);
-      }
+        
+        sqliteDb.serialize(() => {
+          sqliteDb.run(
+            "CREATE TABLE IF NOT EXISTS aegis_kv (key TEXT PRIMARY KEY, value TEXT)",
+            (createErr) => {
+              if (createErr) {
+                console.error("Failed to create table in SQLite:", createErr);
+                sqliteDb.close();
+                return reject(createErr);
+              }
+              
+              sqliteDb.get("SELECT value FROM aegis_kv WHERE key = 'database_state'", (selectErr, row: any) => {
+                if (selectErr) {
+                  console.error("Failed to fetch state from SQLite:", selectErr);
+                  sqliteDb.close();
+                  return reject(selectErr);
+                }
+                
+                if (row && row.value) {
+                  try {
+                    this.updateDataInPlace(JSON.parse(row.value));
+                    sqliteDb.close();
+                    resolve();
+                  } catch (parseErr) {
+                    console.error("Failed to parse SQLite state, fallback to seed:", parseErr);
+                    this.seedAndSave(sqliteDb, () => {
+                      sqliteDb.close();
+                      resolve();
+                    }, (seedErr) => {
+                      sqliteDb.close();
+                      reject(seedErr);
+                    });
+                  }
+                } else {
+                  this.seedAndSave(sqliteDb, () => {
+                    sqliteDb.close();
+                    resolve();
+                  }, (seedErr) => {
+                    sqliteDb.close();
+                    reject(seedErr);
+                  });
+                }
+              });
+            }
+          );
+        });
+      });
     });
   }
 
@@ -520,12 +756,36 @@ export class AegisDB {
   }
 
   public save() {
-    const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
-    try {
-      fs.writeFileSync(JSON_FILE, JSON.stringify(this.data, null, 2), "utf-8");
-    } catch (err) {
-      console.error("Database save failed:", err);
+    if (!isSqliteSupported) {
+      const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
+      const TEMP_FILE = JSON_FILE + ".tmp";
+      try {
+        fs.writeFileSync(TEMP_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+        fs.renameSync(TEMP_FILE, JSON_FILE);
+      } catch (err) {
+        console.error("Database save failed:", err);
+      }
+      return;
     }
+
+    const SQLITE_FILE = path.join(DB_DIR, "aegis_secure.db");
+    const sqlite = sqlite3.verbose();
+    const sqliteDb = new sqlite.Database(SQLITE_FILE, (err) => {
+      if (err) {
+        console.error("Failed to open SQLite for saving:", err);
+        return;
+      }
+      sqliteDb.run(
+        "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [JSON.stringify(this.data, null, 2)],
+        (runErr) => {
+          if (runErr) {
+            console.error("Failed to save state to SQLite:", runErr);
+          }
+          sqliteDb.close();
+        }
+      );
+    });
   }
 
   public appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
@@ -696,6 +956,26 @@ export class AegisDB {
       this.save();
       resolve();
     });
+  }
+
+  public insertPreauthSession(preauthIdHash: string, username: string, role: 'admin' | 'operator' | 'viewer', expiresAt: number) {
+    if (!this.data.preauthSessions) this.data.preauthSessions = [];
+    this.data.preauthSessions.push({ preauthIdHash, username, role, expiresAt });
+    this.save();
+  }
+
+  public getPreauthSession(preauthIdHash: string) {
+    if (!this.data.preauthSessions) this.data.preauthSessions = [];
+    const now = Date.now();
+    // Filter out expired ones to keep it clean
+    this.data.preauthSessions = this.data.preauthSessions.filter(p => p.expiresAt >= now);
+    return this.data.preauthSessions.find(p => p.preauthIdHash === preauthIdHash);
+  }
+
+  public consumePreauthSession(preauthIdHash: string) {
+    if (!this.data.preauthSessions) this.data.preauthSessions = [];
+    this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+    this.save();
   }
 }
 

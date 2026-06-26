@@ -44,9 +44,10 @@ export interface OrderAccepted {
 export interface OrderStatus {
   brokerOrderId: string;
   clientOrderId: string;
-  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "CANCELED" | "REJECTED";
+  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "WORKING" | "CANCELED" | "REJECTED";
   filledPrice?: number;
   filledQuantity?: number;
+  error?: string;
 }
 
 export interface BrokerAdapter {

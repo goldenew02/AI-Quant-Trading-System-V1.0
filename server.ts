@@ -23,8 +23,9 @@ app.use(helmet({
   contentSecurityPolicy: false, // Ensure full React dev frame compatibility
   crossOriginEmbedderPolicy: false
 }));
+const corsOrigin = process.env.APP_URL || true;
 app.use(cors({
-  origin: true,
+  origin: corsOrigin,
   credentials: true
 }));
 app.use(express.json());
@@ -35,12 +36,11 @@ function validateCsrf(req: any, res: any, next: any) {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
     return next();
   }
-  // Exempt routes where user is logging in, getting a token, or enrolling in MFA
+  // Exempt routes where user is logging in, getting a token
   const exemptedRoutes = [
     "/api/auth/login",
-    "/api/auth/csrf",
-    "/api/auth/totp/setup",
-    "/api/auth/totp/confirm"
+    "/api/auth/login/totp",
+    "/api/auth/csrf"
   ];
   if (exemptedRoutes.includes(req.path)) {
     return next();
@@ -178,8 +178,7 @@ function appendTradeLog(log: Omit<TradeLog, "previousHash" | "currentHash">) {
     throw new Error("AUDIT_CHAIN_BROKEN: Cryptographic log chain is broken. Order execution blocked.");
   }
 
-  const newLog = dbInstance.appendTradeLog(log);
-  tradeLogs.unshift(newLog);
+  dbInstance.appendTradeLog(log);
 }
 
 function appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
@@ -352,41 +351,9 @@ function runIsolatedBotStep(bot: BotConfig) {
           realAcc.isSandbox
         ).then((accepted) => {
           if (accepted.status === "NEW") {
-            // Simulated transaction immediate fill confirmation for live adapters
-            dbInstance.updateOrderStatus(clientOrderId, "FILLED", accepted.brokerOrderId);
-            
-            const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
-            dbInstance.insertFill({
-              id: fillId,
-              orderId,
-              brokerFillId: `br_fill_${accepted.brokerOrderId}`,
-              price: tradePrice,
-              quantity: grid.amount,
-              fee: Math.round(total * 0.001 * 100) / 100,
-              feeCurrency: "USD",
-              timestamp: new Date().toISOString()
-            });
-
-            // Write to append-only trade ledger
-            appendTradeLog({
-              id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-              botId: bot.id,
-              botName: bot.name,
-              broker: bot.broker,
-              symbol: bot.symbol,
-              timestamp: new Date().toISOString(),
-              type: grid.type,
-              price: tradePrice,
-              amount: grid.amount,
-              total,
-              pnl: realizedPnl > 0 ? realizedPnl : undefined
-            });
-
-            setTimeout(() => {
-              grid.filled = false;
-              grid.type = grid.type === "buy" ? "sell" : "buy";
-            }, 12000);
-
+            // Live broker accepted the order. It is now active on the broker book (WORKING status per P0-6)
+            dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
+            console.log(`[REAL BROKER ORDER WORKING] Order ${clientOrderId} (${accepted.brokerOrderId}) successfully placed and marked as WORKING.`);
           } else {
             console.error(`[REAL BROKER REJECTED] Order rejected by broker: ${accepted.error}`);
             dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
@@ -547,6 +514,120 @@ setInterval(() => {
   });
 }, 5000);
 
+// Poll and update WORKING or PENDING orders from real brokers every 10 seconds (P0-6)
+setInterval(async () => {
+  const db = dbInstance.get();
+  const orders = db.orders || [];
+  const workingOrders = orders.filter(o => o.status === "WORKING" || o.status === "PENDING");
+  if (workingOrders.length === 0) return;
+
+  for (const ord of workingOrders) {
+    try {
+      const bot = bots.find(b => b.id === ord.botId);
+      if (!bot) continue;
+
+      const realAcc = db.brokerAccounts.find(acc => acc.id === ord.brokerAccountId);
+      if (!realAcc) continue;
+
+      const adapter = getBrokerAdapter(bot.broker);
+      if (!adapter) continue;
+
+      let apiKey = "";
+      let apiSecret = "";
+      let passphrase = "";
+      try {
+        apiKey = decryptSecret(realAcc.encryptedApiKey);
+        apiSecret = decryptSecret(realAcc.encryptedSecret);
+        if (realAcc.encryptedPassphrase) {
+          passphrase = decryptSecret(realAcc.encryptedPassphrase);
+        }
+      } catch (decryptErr) {
+        console.error(`[ORDER POLLING DECRYPTION ERROR] Failed to decrypt keys for account ${realAcc.id}:`, decryptErr);
+        continue;
+      }
+
+      const brokerOrderIdToQuery = ord.brokerOrderId || ord.clientOrderId;
+      console.log(`[ORDER POLLING] Querying status of order ${ord.clientOrderId} (${brokerOrderIdToQuery}) from ${bot.broker}`);
+      
+      const updatedOrder = await adapter.getOrder(
+        brokerOrderIdToQuery,
+        ord.symbol,
+        apiKey,
+        apiSecret,
+        passphrase,
+        realAcc.isSandbox
+      );
+
+      console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);
+
+      if (updatedOrder.status === "FILLED") {
+        dbInstance.updateOrderStatus(ord.clientOrderId, "FILLED", ord.brokerOrderId);
+
+        // Insert Fill
+        const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+        const total = ord.price * ord.quantity;
+        dbInstance.insertFill({
+          id: fillId,
+          orderId: ord.id,
+          brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}`,
+          price: ord.price,
+          quantity: ord.quantity,
+          fee: Math.round(total * 0.001 * 100) / 100,
+          feeCurrency: "USD",
+          timestamp: new Date().toISOString()
+        });
+
+        // Write to trade log
+        let realizedPnl = 0;
+        if (ord.side === "SELL") {
+          realizedPnl = Math.round((ord.price - bot.entryPrice) * ord.quantity * 100) / 100;
+          if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+          if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100;
+          bot.profitUsd += realizedPnl;
+        }
+
+        bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+        bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+        bot.tradesCount++;
+
+        appendTradeLog({
+          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+          botId: bot.id,
+          botName: bot.name,
+          broker: bot.broker,
+          symbol: bot.symbol,
+          timestamp: new Date().toISOString(),
+          type: ord.side.toLowerCase() as 'buy' | 'sell',
+          price: ord.price,
+          amount: ord.quantity,
+          total,
+          pnl: realizedPnl > 0 ? realizedPnl : undefined
+        });
+
+        // Update the grid filled state on the running bot so it flips!
+        const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
+        if (gridIndex !== -1) {
+          bot.grids[gridIndex].filled = false;
+          bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
+        }
+        dbInstance.upsertBot(bot);
+
+      } else if (updatedOrder.status === "REJECTED" || updatedOrder.status === "CANCELED") {
+        dbInstance.updateOrderStatus(ord.clientOrderId, updatedOrder.status, ord.brokerOrderId, updatedOrder.error);
+        
+        bot.status = "stopped_by_risk";
+        bot.isEnabled = false;
+        dbInstance.upsertBot(bot);
+        appendSecurityLog("system", "admin", "BROKER_REJECTION", bot.id, `Order ${ord.clientOrderId} rejected/canceled by broker: ${updatedOrder.error}`);
+      } else if (updatedOrder.status === "PARTIALLY_FILLED") {
+        dbInstance.updateOrderStatus(ord.clientOrderId, "PARTIALLY_FILLED", ord.brokerOrderId);
+      }
+    } catch (err: any) {
+      console.error(`[ORDER POLLING EXCEPTION] Error updating order status for ${ord.clientOrderId}:`, err.message);
+    }
+  }
+}, 10000);
+
 // Lazily initialising Gemini AI SDK to prevent startup crashes if GEMINI_API_KEY is not defined
 let aiClient: any = null;
 function getGeminiClient() {
@@ -646,7 +727,26 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
     return res.status(401).json({ error: "Invalid username or password. Please use correct credentials." });
   }
 
-  // Session rotation on login (P0-2.7)
+  // Check if TOTP is already configured (enrolled) for this user (and not mustEnrollTotp)
+  if (user.totpSecret && !user.mustEnrollTotp) {
+    // 2FA login phase 1: return requiresTotp and a temporary preauthId
+    const preauthId = crypto.randomBytes(24).toString("hex");
+    const preauthIdHash = crypto.createHash("sha256").update(preauthId + process.env.SESSION_SECRET).digest("hex");
+    
+    // Valid for 3 minutes
+    dbInstance.insertPreauthSession(preauthIdHash, username, user.role, Date.now() + 3 * 60 * 1000);
+    
+    appendSecurityLog(username, user.role, "LOGIN_STAGE_1_SUCCESS", "USER_AUTH", `Password correct. Initiated 2FA stage 2 challenge.`, req.ip);
+    return res.json({
+      success: true,
+      requiresTotp: true,
+      preauthId,
+      username
+    });
+  }
+
+  // Otherwise, user must enroll (first-time TOTP setup) or has no TOTP yet.
+  // Generate a limited enrollment session.
   const role = user.role;
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
@@ -660,7 +760,7 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
   activeSessions.push(session);
   dbInstance.save();
 
-  appendSecurityLog(username, role, "LOGIN_SUCCESS", "USER_AUTH", `Successfully logged in. Secure session generated.`, req.ip);
+  appendSecurityLog(username, role, "LOGIN_SUCCESS_ENROLL_PENDING", "USER_AUTH", `Logged in. Redirecting to dynamic MFA enrollment.`, req.ip);
 
   // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
@@ -679,12 +779,80 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
     maxAge: 30 * 60 * 1000
   });
 
-  // Do not return any token in response payload (anti-XSS)
   res.json({ 
     success: true, 
     role, 
     username, 
-    mustEnrollTotp: !!user.mustEnrollTotp 
+    mustEnrollTotp: true 
+  });
+});
+
+app.post("/api/auth/login/totp", authRateLimiter, (req, res) => {
+  const { preauthId, code } = req.body;
+  if (!preauthId || !code) {
+    return res.status(400).json({ error: "Missing required multi-factor credentials." });
+  }
+
+  const preauthIdHash = crypto.createHash("sha256").update(preauthId + process.env.SESSION_SECRET).digest("hex");
+  const preauth = dbInstance.getPreauthSession(preauthIdHash);
+
+  if (!preauth) {
+    return res.status(401).json({ error: "Pre-authorization session expired or invalid. Please re-enter credentials." });
+  }
+
+  const user = db.users.find(u => u.username === preauth.username && u.isActive);
+  if (!user || !user.totpSecret) {
+    return res.status(401).json({ error: "User profile or dynamic MFA keys not configured." });
+  }
+
+  // Decrypt secret and verify
+  const decryptedSecret = decryptSecret(user.totpSecret);
+  const isTotpValid = verifyTOTP(decryptedSecret, code);
+
+  if (!isTotpValid) {
+    appendSecurityLog(preauth.username, preauth.role, "LOGIN_MFA_FAILED", "MFA_GATE", `Login MFA verification failed. Code rejected.`, req.ip);
+    return res.status(400).json({ error: "Invalid dynamic MFA code. Please check Google Authenticator." });
+  }
+
+  // MFA verified! Consume the preauth session
+  dbInstance.consumePreauthSession(preauthIdHash);
+
+  // Rotate and generate formal session
+  const token = crypto.randomBytes(24).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+  
+  const session = {
+    tokenHash,
+    username: preauth.username,
+    role: preauth.role,
+    expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
+  };
+  activeSessions.push(session);
+  dbInstance.save();
+
+  appendSecurityLog(preauth.username, preauth.role, "LOGIN_MFA_SUCCESS", "MFA_GATE", `MFA verified. Formal terminal session established.`, req.ip);
+
+  // Set httpOnly secure signed cookie (P0-2)
+  res.cookie("sid", token, {
+    httpOnly: true,
+    signed: true,
+    secure: true,
+    sameSite: "none",
+    maxAge: 30 * 60 * 1000
+  });
+
+  // Distribute CSRF double-submit cookie (P0-2.9)
+  const csrfToken = crypto.randomBytes(24).toString("hex");
+  res.cookie("csrf_token", csrfToken, {
+    secure: true,
+    sameSite: "none",
+    maxAge: 30 * 60 * 1000
+  });
+
+  res.json({
+    success: true,
+    role: preauth.role,
+    username: preauth.username
   });
 });
 
@@ -764,8 +932,11 @@ app.post("/api/auth/totp/setup", requireAuth(['admin', 'operator', 'viewer']), (
   user.tempTotpExpiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
   dbInstance.save();
 
+  const issuer = "AegisQuant";
+  const otpauthUri = `otpauth://totp/${issuer}:${user.username}?secret=${tempSecret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+
   appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_INIT", "USER_AUTH", "Initiated TOTP setup/reset workflow.", req.ip);
-  res.json({ success: true, tempSecret });
+  res.json({ success: true, tempSecret, otpauthUri });
 });
 
 app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']), (req: any, res) => {
@@ -796,8 +967,21 @@ app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']),
   delete user.tempTotpExpiresAt;
   dbInstance.save();
 
-  appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM", "USER_AUTH", "Successfully bound new TOTP authenticator device.", req.ip);
-  res.json({ success: true, message: "TOTP setup successfully confirmed and secured." });
+  appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM", "USER_AUTH", "Successfully bound new TOTP authenticator device. Session rotated.", req.ip);
+
+  // Rotate and destroy the temporary enrollment session (P0-1.4)
+  const token = req.signedCookies.sid;
+  if (token) {
+    const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
+    const idx = activeSessions.findIndex(s => s.tokenHash === tokenHash);
+    if (idx !== -1) {
+      activeSessions.splice(idx, 1);
+    }
+  }
+  res.clearCookie("sid");
+  res.clearCookie("csrf_token");
+
+  res.json({ success: true, message: "TOTP bound successfully. Session rotated. Please login." });
 });
 
 // ADMIN DYNAMIC USER MANAGEMENT

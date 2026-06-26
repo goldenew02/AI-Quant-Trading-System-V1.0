@@ -145,10 +145,17 @@ export default function App() {
         const res = await fetch("/api/auth/me", { credentials: "include" });
         if (res.ok) {
           const data = await res.json();
-          setUsername(data.username);
-          setRole(data.role);
-          localStorage.setItem("aegis_username", data.username);
-          localStorage.setItem("aegis_role", data.role);
+          if (data.mustEnrollTotp) {
+            setUsername(null);
+            setRole(null);
+            localStorage.removeItem("aegis_username");
+            localStorage.removeItem("aegis_role");
+          } else {
+            setUsername(data.username);
+            setRole(data.role);
+            localStorage.setItem("aegis_username", data.username);
+            localStorage.setItem("aegis_role", data.role);
+          }
         } else {
           setUsername(null);
           setRole(null);
