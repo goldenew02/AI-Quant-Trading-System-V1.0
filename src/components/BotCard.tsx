@@ -36,6 +36,17 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
     gridType: bot.gridType || "spot",
     perpetualLeverage: bot.perpetualLeverage || 5,
     fundingRateCheck: bot.fundingRateCheck !== false,
+    spotGridMode: bot.spotGridMode || "arithmetic",
+    spotAmountStrategy: bot.spotAmountStrategy || "equal",
+    dynamicOrders: bot.dynamicOrders || false,
+    autoGridShift: bot.autoGridShift || false,
+    idleShift: bot.idleShift || false,
+    drawdownProtection: bot.drawdownProtection || false,
+    maxPositions: bot.maxPositions || 10,
+    multiSymbolPerpetual: bot.multiSymbolPerpetual || false,
+    gridTradeValueUSDT: bot.gridTradeValueUSDT || 100,
+    gridIntervalRatio: bot.gridIntervalRatio || 0.01,
+    maxSymbolNotionalUSDT: bot.maxSymbolNotionalUSDT || 1000,
   });
 
   const handleSave = () => {
@@ -52,6 +63,17 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
       gridType: editingConfig.gridType || "spot",
       perpetualLeverage: Number(editingConfig.perpetualLeverage || 5),
       fundingRateCheck: editingConfig.fundingRateCheck,
+      spotGridMode: editingConfig.spotGridMode || "arithmetic",
+      spotAmountStrategy: editingConfig.spotAmountStrategy || "equal",
+      dynamicOrders: editingConfig.dynamicOrders,
+      autoGridShift: editingConfig.autoGridShift,
+      idleShift: editingConfig.idleShift,
+      drawdownProtection: editingConfig.drawdownProtection,
+      maxPositions: Number(editingConfig.maxPositions || 10),
+      multiSymbolPerpetual: editingConfig.multiSymbolPerpetual,
+      gridTradeValueUSDT: Number(editingConfig.gridTradeValueUSDT || 100),
+      gridIntervalRatio: Number(editingConfig.gridIntervalRatio || 0.01),
+      maxSymbolNotionalUSDT: Number(editingConfig.maxSymbolNotionalUSDT || 1000),
     });
     setIsConfiguring(false);
   };
@@ -290,10 +312,102 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
               </select>
             </div>
 
-            {editingConfig.gridType === "perpetual" && (
+            {editingConfig.gridType === "spot" && (
               <div className="col-span-2 grid grid-cols-2 gap-3 bg-[#0A0A0B] p-3 border border-[#2A2A2C] mt-1 mb-1">
                 <div className="col-span-2">
-                  <span className="text-[9px] text-[#00FF66] uppercase font-mono font-bold tracking-wider">Perpetual Contract Parameters</span>
+                  <span className="text-[9px] text-[#00FF66] uppercase font-mono font-bold tracking-wider">Professional Spot Grid Parameters (P1-3)</span>
+                </div>
+                <div>
+                  <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Spot Grid Mode</label>
+                  <select
+                    value={editingConfig.spotGridMode}
+                    onChange={(e) => handleValueChange("spotGridMode", e.target.value)}
+                    className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+                  >
+                    <option value="arithmetic">Arithmetic (等差)</option>
+                    <option value="geometric">Geometric (等比)</option>
+                    <option value="tracking">Tracking (追踪)</option>
+                    <option value="reverse">Reverse Accumulate (屯币/反向)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Amount Strategy</label>
+                  <select
+                    value={editingConfig.spotAmountStrategy}
+                    onChange={(e) => handleValueChange("spotAmountStrategy", e.target.value)}
+                    className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+                  >
+                    <option value="equal">Equal Quantity (等量)</option>
+                    <option value="martingale">Martingale (马丁格尔)</option>
+                    <option value="reverse_martingale">Anti-Martingale (反马丁格尔)</option>
+                    <option value="pyramid">Pyramid (金字塔)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Max Positions</label>
+                  <input
+                    type="number"
+                    value={editingConfig.maxPositions}
+                    onChange={(e) => handleValueChange("maxPositions", parseInt(e.target.value))}
+                    className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-mono focus:border-[#00FF66] focus:outline-none"
+                  />
+                </div>
+                <div className="flex flex-col justify-end gap-2 text-[10px] text-zinc-400 font-mono">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.dynamicOrders}
+                      onChange={(e) => handleValueChange("dynamicOrders", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5"
+                    />
+                    <span>Dynamic Orders (动态挂单)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.autoGridShift}
+                      onChange={(e) => handleValueChange("autoGridShift", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5"
+                    />
+                    <span>Auto Grid Shift (自动移网)</span>
+                  </label>
+                </div>
+                <div className="col-span-2 flex gap-4 text-[10px] text-zinc-400 font-mono">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.idleShift}
+                      onChange={(e) => handleValueChange("idleShift", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5"
+                    />
+                    <span>Idle Shift (空闲移网)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.drawdownProtection}
+                      onChange={(e) => handleValueChange("drawdownProtection", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5"
+                    />
+                    <span>Drawdown Protection (回撤保护)</span>
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {editingConfig.gridType === "perpetual" && (
+              <div className="col-span-2 grid grid-cols-2 gap-3 bg-[#0A0A0B] p-3 border border-[#2A2A2C] mt-1 mb-1">
+                <div className="col-span-2 flex justify-between items-center">
+                  <span className="text-[9px] text-[#00FF66] uppercase font-mono font-bold tracking-wider">Perpetual Contract Parameters (P1-4)</span>
+                  <label className="flex items-center gap-1.5 text-[10px] text-zinc-400 uppercase font-mono cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={editingConfig.multiSymbolPerpetual}
+                      onChange={(e) => handleValueChange("multiSymbolPerpetual", e.target.checked)}
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3 h-3"
+                    />
+                    <span>Multi-Symbol Perpetual</span>
+                  </label>
                 </div>
                 <div>
                   <div className="flex justify-between items-center mb-1">
@@ -319,7 +433,7 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                       type="checkbox"
                       checked={editingConfig.fundingRateCheck}
                       onChange={(e) => handleValueChange("fundingRateCheck", e.target.checked)}
-                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5 animate-none"
+                      className="rounded-none border-[#2A2A2C] bg-[#141416] text-[#00FF66] focus:ring-0 focus:outline-none w-3.5 h-3.5"
                     />
                     <span>Funding Rate Check</span>
                   </label>
@@ -327,6 +441,40 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                     Avoid entry if 8h funding rate exceeds 0.3%
                   </p>
                 </div>
+
+                {editingConfig.multiSymbolPerpetual && (
+                  <div className="col-span-2 grid grid-cols-3 gap-2 border-t border-[#2A2A2C]/60 pt-2.5">
+                    <div>
+                      <label className="block text-[8px] text-zinc-500 uppercase font-mono mb-1">Trade Value (USDT)</label>
+                      <input
+                        type="number"
+                        value={editingConfig.gridTradeValueUSDT}
+                        onChange={(e) => handleValueChange("gridTradeValueUSDT", parseFloat(e.target.value))}
+                        className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1 text-white text-xs font-mono focus:border-[#00FF66] focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[8px] text-zinc-500 uppercase font-mono mb-1">Interval Ratio</label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={editingConfig.gridIntervalRatio}
+                        onChange={(e) => handleValueChange("gridIntervalRatio", parseFloat(e.target.value))}
+                        className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1 text-white text-xs font-mono focus:border-[#00FF66] focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[8px] text-zinc-500 uppercase font-mono mb-1">Max Notional (USDT)</label>
+                      <input
+                        type="number"
+                        value={editingConfig.maxSymbolNotionalUSDT}
+                        onChange={(e) => handleValueChange("maxSymbolNotionalUSDT", parseFloat(e.target.value))}
+                        className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1 text-white text-xs font-mono focus:border-[#00FF66] focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                )}
+
                 <div className="col-span-2 border-t border-[#2A2A2C]/60 pt-2 grid grid-cols-2 gap-2 text-[10px] font-mono">
                   <div className="bg-rose-950/20 border border-rose-900/30 p-2">
                     <span className="text-[8px] text-[#FF3333] uppercase block font-bold">Est. Liquidation Price</span>

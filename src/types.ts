@@ -67,6 +67,21 @@ export interface BotConfig {
   gridType?: 'spot' | 'perpetual';
   perpetualLeverage?: number;
   fundingRateCheck?: boolean;
+
+  // Professional Spot Grid (P1-3)
+  spotGridMode?: 'arithmetic' | 'geometric' | 'tracking' | 'reverse';
+  spotAmountStrategy?: 'equal' | 'martingale' | 'reverse_martingale' | 'pyramid';
+  dynamicOrders?: boolean;
+  autoGridShift?: boolean;
+  idleShift?: boolean;
+  drawdownProtection?: boolean;
+  maxPositions?: number;
+
+  // Multi-Symbol Perpetual Grid (P1-4)
+  multiSymbolPerpetual?: boolean;
+  gridTradeValueUSDT?: number;
+  gridIntervalRatio?: number;
+  maxSymbolNotionalUSDT?: number;
 }
 
 export interface TradeLog {

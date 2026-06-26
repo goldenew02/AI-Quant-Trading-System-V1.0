@@ -20,8 +20,8 @@ dotenv.config();
 
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
-  const configured = (process.env.COOKIE_SAMESITE || "none").toLowerCase();
-  if (!["lax", "strict", "none"].includes(configured)) return "none";
+  const configured = (process.env.COOKIE_SAMESITE || "lax").toLowerCase();
+  if (!["lax", "strict", "none"].includes(configured)) return "lax";
   return configured as "lax" | "strict" | "none";
 }
 
@@ -1366,6 +1366,13 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
   if (riskSettings.restrictedSymbols.some(s => s.toLowerCase() === (config.symbol || "").toLowerCase())) {
     return res.status(400).json({
       error: `标的禁投预警 (SYMBOL_RESTRICTED): 交易标的 [${config.symbol}] 属于高波动禁投资产，已被全局风控限制。`
+    });
+  }
+
+  // 5. Spot Grid Safety Restrictions - Short & Neutral Prohibited (P1-3)
+  if (config.type === "spot_grid" && (config.direction === "short" || config.direction === "neutral")) {
+    return res.status(400).json({
+      error: `现货风控限制 (SPOT_DIRECTION_RESTRICTED): 现货普通或专业现货网格 (Spot Grid) 不支持 '做空 (Short)' 或 '双向 (Neutral)' 交易模式。现货方向必须强制为 '做多 (Long)'。`
     });
   }
 

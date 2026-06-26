@@ -137,7 +137,15 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
         orderResult = confirmRes.data;
       }
 
-      const ordId = orderResult?.[0]?.order_id || `ib_order_${Math.floor(Math.random() * 1000000)}`;
+      const ordId = orderResult?.[0]?.order_id;
+      if (!ordId) {
+        return {
+          brokerOrderId: "",
+          clientOrderId: order.clientOrderId,
+          status: "REJECTED",
+          error: `Interactive Brokers did not return a broker order_id. Raw response: ${JSON.stringify(orderResult).slice(0, 500)}`
+        };
+      }
 
       return {
         brokerOrderId: ordId,

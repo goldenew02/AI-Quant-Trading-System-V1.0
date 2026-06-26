@@ -393,6 +393,11 @@ export class AegisDB {
     const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
     const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
     const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
+
+    // Safety switches for synchronizing credentials on boot
+    const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT !== "false"; // defaults to true for convenience
+    const syncTotpOnBoot = process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
+
     if (seedUser && seedPass) {
       let adminUser = this.data.users.find(u => u.username === seedUser);
       let needsSave = false;
@@ -401,18 +406,32 @@ export class AegisDB {
           username: seedUser,
           passwordHash: hashPassword(seedPass),
           role: "admin",
-          totpSecret: seedTotp ? encryptSecret(seedTotp) : null,
+          totpSecret: (seedTotp && syncTotpOnBoot) ? encryptSecret(seedTotp) : null,
           isActive: true,
-          mustEnrollTotp: seedTotp ? false : true
+          mustEnrollTotp: (seedTotp && syncTotpOnBoot) ? false : true
         };
         this.data.users.push(adminUser);
         needsSave = true;
+        this.appendSecurityLog(
+          "system",
+          "admin",
+          "ADMIN_BOOTSTRAP_CREATE",
+          seedUser,
+          "Administrator account initialized from environment config during system boot."
+        );
       } else {
-        if (!verifyPassword(seedPass, adminUser.passwordHash)) {
+        if (syncPasswordOnBoot && !verifyPassword(seedPass, adminUser.passwordHash)) {
           adminUser.passwordHash = hashPassword(seedPass);
           needsSave = true;
+          this.appendSecurityLog(
+            "system",
+            "admin",
+            "ADMIN_PASSWORD_ENV_SYNC",
+            seedUser,
+            "Administrator password synchronized from environment config during system boot."
+          );
         }
-        if (seedTotp) {
+        if (seedTotp && syncTotpOnBoot) {
           let currentTotp: string | null = null;
           if (adminUser.totpSecret) {
             try {
@@ -425,6 +444,13 @@ export class AegisDB {
             adminUser.totpSecret = encryptSecret(seedTotp);
             adminUser.mustEnrollTotp = false;
             needsSave = true;
+            this.appendSecurityLog(
+              "system",
+              "admin",
+              "ADMIN_TOTP_ENV_SYNC",
+              seedUser,
+              "Administrator TOTP secret synchronized from environment config during system boot."
+            );
           }
         }
       }
@@ -626,6 +652,29 @@ export class AegisDB {
             )
           `, (err) => {
             if (err) console.error("Failed to create fills table:", err);
+          });
+
+          // Structured orders table for database-level persistence and transaction protection (P1-5)
+          sqliteDb.run(`
+            CREATE TABLE IF NOT EXISTS orders (
+              id TEXT PRIMARY KEY,
+              botId TEXT NOT NULL,
+              broker TEXT NOT NULL,
+              brokerAccountId TEXT NOT NULL,
+              clientOrderId TEXT NOT NULL UNIQUE,
+              brokerOrderId TEXT,
+              symbol TEXT NOT NULL,
+              side TEXT NOT NULL,
+              type TEXT NOT NULL,
+              price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              status TEXT NOT NULL,
+              createdAt TEXT NOT NULL,
+              updatedAt TEXT NOT NULL,
+              lastError TEXT
+            )
+          `, (err) => {
+            if (err) console.error("Failed to create orders table:", err);
           });
 
           // Fetch state
@@ -996,8 +1045,27 @@ export class AegisDB {
   }
 
   public insertOrder(ord: Order) {
-    this.data.orders.unshift(ord);
-    this.save();
+    if (this.sqliteDbConn) {
+      this.sqliteDbConn.run(
+        "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
+        (err) => {
+          if (err) {
+            if (err.message.includes("UNIQUE constraint failed")) {
+              console.log(`[DB-SQLite] Unique constraint hit. Duplicate order skipped: ${ord.clientOrderId}`);
+            } else {
+              console.error("[DB-SQLite] Failed to insert order:", err);
+            }
+            return;
+          }
+          this.data.orders.unshift(ord);
+          this.save();
+        }
+      );
+    } else {
+      this.data.orders.unshift(ord);
+      this.save();
+    }
   }
 
   public updateOrderStatus(clientOrderId: string, status: Order["status"], brokerOrderId?: string, lastError?: string) {
@@ -1007,7 +1075,21 @@ export class AegisDB {
       if (brokerOrderId) ord.brokerOrderId = brokerOrderId;
       if (lastError) ord.lastError = lastError;
       ord.updatedAt = new Date().toISOString();
-      this.save();
+
+      if (this.sqliteDbConn) {
+        this.sqliteDbConn.run(
+          "UPDATE orders SET status = ?, brokerOrderId = COALESCE(?, brokerOrderId), lastError = COALESCE(?, lastError), updatedAt = ? WHERE clientOrderId = ?",
+          [status, brokerOrderId || null, lastError || null, ord.updatedAt, clientOrderId],
+          (err) => {
+            if (err) {
+              console.error("[DB-SQLite] Failed to update order status:", err);
+            }
+            this.save();
+          }
+        );
+      } else {
+        this.save();
+      }
     }
   }
 
@@ -1254,9 +1336,12 @@ export class AegisDB {
               // Immediately invalidate preauth session in SQLite to block further attempts from this context
               this.sqliteDbConn.run(
                 "UPDATE preauth_sessions SET used_at = ? WHERE preauth_id_hash = ? AND used_at IS NULL",
-                [now, preauthIdHash]
+                [now, preauthIdHash],
+                (updateErr: any) => {
+                  reject(new Error("Security context changed. IP or browser agent mismatch."));
+                }
               );
-              return reject(new Error("Security context changed. IP or browser agent mismatch."));
+              return;
             }
             resolve({ username: row.username, role: row.role });
           }
