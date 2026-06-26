@@ -18,16 +18,61 @@ import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, h
 
 dotenv.config();
 
+// Unified Cookie Options Helper for environmentalized secure cookies (P0-2)
+function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
+  const isProd = process.env.NODE_ENV === "production";
+  const secure = process.env.COOKIE_SECURE === "true" || isProd;
+  const sameSite = secure ? "none" : "lax";
+  return {
+    httpOnly: true,
+    signed: true,
+    secure,
+    sameSite: sameSite as "none" | "lax" | "strict",
+    maxAge
+  };
+}
+
+function getCsrfCookieOptions(maxAge: number = 30 * 60 * 1000) {
+  const isProd = process.env.NODE_ENV === "production";
+  const secure = process.env.COOKIE_SECURE === "true" || isProd;
+  const sameSite = secure ? "none" : "lax";
+  return {
+    secure,
+    sameSite: sameSite as "none" | "lax" | "strict",
+    maxAge
+  };
+}
+
 const app = express();
+
+// Set Content Security Policy in production and protect against clickjacking / iframe nesting (P1-5)
 app.use(helmet({
-  contentSecurityPolicy: false, // Ensure full React dev frame compatibility
+  contentSecurityPolicy: process.env.NODE_ENV === "production"
+    ? { useDefaults: true, directives: { "frame-ancestors": ["'none'"] } }
+    : false,
   crossOriginEmbedderPolicy: false
 }));
-const corsOrigin = process.env.APP_URL || true;
+
+const allowedOrigins = (process.env.APP_URL || "")
+  .split(",")
+  .map(v => v.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: corsOrigin,
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    // Allow localhost/127.0.0.1 and Cloud Run dev previews ending with run.app
+    const isDev = process.env.NODE_ENV !== "production";
+    const isAllowedRunApp = origin.endsWith(".run.app");
+    const isLocal = origin.includes("localhost") || origin.includes("127.0.0.1");
+    if (isDev || isLocal || isAllowedRunApp || allowedOrigins.includes(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error("CORS origin rejected"));
+  },
   credentials: true
 }));
+
 app.use(express.json());
 app.use(cookieParser(process.env.SESSION_SECRET));
 
@@ -58,9 +103,7 @@ app.use(validateCsrf);
 app.get("/api/auth/csrf", (req, res) => {
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    secure: true,
-    sameSite: "none",
-    maxAge: 30 * 60 * 1000
+    ...getCsrfCookieOptions(30 * 60 * 1000)
   });
   res.json({ success: true });
 });
@@ -563,54 +606,64 @@ setInterval(async () => {
       if (updatedOrder.status === "FILLED") {
         dbInstance.updateOrderStatus(ord.clientOrderId, "FILLED", ord.brokerOrderId);
 
-        // Insert Fill
-        const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
-        const total = ord.price * ord.quantity;
-        dbInstance.insertFill({
-          id: fillId,
-          orderId: ord.id,
-          brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}`,
-          price: ord.price,
-          quantity: ord.quantity,
-          fee: Math.round(total * 0.001 * 100) / 100,
-          feeCurrency: "USD",
-          timestamp: new Date().toISOString()
-        });
+        const filledPrice = updatedOrder.filledPrice ?? ord.price;
+        const totalFilledQty = updatedOrder.filledQuantity ?? ord.quantity;
 
-        // Write to trade log
-        let realizedPnl = 0;
-        if (ord.side === "SELL") {
-          realizedPnl = Math.round((ord.price - bot.entryPrice) * ord.quantity * 100) / 100;
-          if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
-          if (realizedPnl === 0) realizedPnl = Math.round(total * 0.012 * 100) / 100;
-          bot.profitUsd += realizedPnl;
+        // Check already recorded fills for this order to compute the final chunk (P1-4)
+        const existingFills = (db.fills || []).filter(f => f.orderId === ord.id);
+        const totalAlreadyRecordedQty = existingFills.reduce((sum, f) => sum + f.quantity, 0);
+        const finalChunkQty = Math.max(0, totalFilledQty - totalAlreadyRecordedQty);
+
+        if (finalChunkQty > 0.0001) {
+          const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+          const total = filledPrice * finalChunkQty;
+          
+          dbInstance.insertFill({
+            id: fillId,
+            orderId: ord.id,
+            brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}`,
+            price: filledPrice,
+            quantity: finalChunkQty,
+            fee: Math.round(total * 0.001 * 100) / 100,
+            feeCurrency: "USD",
+            timestamp: new Date().toISOString()
+          });
+
+          // Write to trade log
+          let realizedPnl = 0;
+          if (ord.side === "SELL") {
+            realizedPnl = Math.round((filledPrice - bot.entryPrice) * totalFilledQty * 100) / 100;
+            if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+            if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * totalFilledQty) * 0.012 * 100) / 100;
+            bot.profitUsd += realizedPnl;
+          }
+
+          bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+          bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+          bot.tradesCount++;
+
+          appendTradeLog({
+            id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+            botId: bot.id,
+            botName: bot.name,
+            broker: bot.broker,
+            symbol: bot.symbol,
+            timestamp: new Date().toISOString(),
+            type: ord.side.toLowerCase() as 'buy' | 'sell',
+            price: filledPrice,
+            amount: finalChunkQty,
+            total,
+            pnl: realizedPnl > 0 ? realizedPnl : undefined
+          });
+
+          // Update the grid filled state on the running bot so it flips!
+          const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
+          if (gridIndex !== -1) {
+            bot.grids[gridIndex].filled = false;
+            bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
+          }
+          dbInstance.upsertBot(bot);
         }
-
-        bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
-        bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
-        bot.tradesCount++;
-
-        appendTradeLog({
-          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-          botId: bot.id,
-          botName: bot.name,
-          broker: bot.broker,
-          symbol: bot.symbol,
-          timestamp: new Date().toISOString(),
-          type: ord.side.toLowerCase() as 'buy' | 'sell',
-          price: ord.price,
-          amount: ord.quantity,
-          total,
-          pnl: realizedPnl > 0 ? realizedPnl : undefined
-        });
-
-        // Update the grid filled state on the running bot so it flips!
-        const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
-        if (gridIndex !== -1) {
-          bot.grids[gridIndex].filled = false;
-          bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
-        }
-        dbInstance.upsertBot(bot);
 
       } else if (updatedOrder.status === "REJECTED" || updatedOrder.status === "CANCELED") {
         dbInstance.updateOrderStatus(ord.clientOrderId, updatedOrder.status, ord.brokerOrderId, updatedOrder.error);
@@ -621,6 +674,48 @@ setInterval(async () => {
         appendSecurityLog("system", "admin", "BROKER_REJECTION", bot.id, `Order ${ord.clientOrderId} rejected/canceled by broker: ${updatedOrder.error}`);
       } else if (updatedOrder.status === "PARTIALLY_FILLED") {
         dbInstance.updateOrderStatus(ord.clientOrderId, "PARTIALLY_FILLED", ord.brokerOrderId);
+        
+        const filledPrice = updatedOrder.filledPrice ?? ord.price;
+        const cumulativeFilledQty = updatedOrder.filledQuantity ?? 0;
+        
+        if (cumulativeFilledQty > 0) {
+          const existingFills = (db.fills || []).filter(f => f.orderId === ord.id);
+          const totalAlreadyRecordedQty = existingFills.reduce((sum, f) => sum + f.quantity, 0);
+          
+          const newFillQty = cumulativeFilledQty - totalAlreadyRecordedQty;
+          if (newFillQty > 0.0001) {
+            const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+            const total = filledPrice * newFillQty;
+            const uniqueFillId = `br_fill_partial_${ord.brokerOrderId || ord.clientOrderId}_${cumulativeFilledQty}`;
+            
+            dbInstance.insertFill({
+              id: fillId,
+              orderId: ord.id,
+              brokerFillId: uniqueFillId,
+              price: filledPrice,
+              quantity: newFillQty,
+              fee: Math.round(total * 0.001 * 100) / 100,
+              feeCurrency: "USD",
+              timestamp: new Date().toISOString()
+            });
+
+            appendTradeLog({
+              id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+              botId: bot.id,
+              botName: bot.name,
+              broker: bot.broker,
+              symbol: bot.symbol,
+              timestamp: new Date().toISOString(),
+              type: ord.side.toLowerCase() as 'buy' | 'sell',
+              price: filledPrice,
+              amount: newFillQty,
+              total,
+              pnl: undefined
+            });
+
+            console.log(`[ORDER POLLING] Recorded partial fill for order ${ord.clientOrderId}: ${newFillQty} units at ${filledPrice}`);
+          }
+        }
       }
     } catch (err: any) {
       console.error(`[ORDER POLLING EXCEPTION] Error updating order status for ${ord.clientOrderId}:`, err.message);
@@ -706,9 +801,14 @@ function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
       return res.status(403).json({ error: `Insufficient permissions. Role required: ${allowedRoles.join(" or ")}` });
     }
     
-    // Strict Dynamic TOTP MFA enrollment containment (P0-1.6)
-    const user = db.users.find(u => u.username === session.username);
+    // Strict Dynamic TOTP MFA enrollment containment (P0-1.6 and P1-2)
     const isTotpSetupRoute = req.path === "/api/auth/totp/setup" || req.path === "/api/auth/totp/confirm" || req.path === "/api/auth/logout" || req.path === "/api/auth/me";
+    
+    if (session.purpose === "enrollment" && !isTotpSetupRoute) {
+      return res.status(403).json({ error: "Your session is restricted to dynamic MFA enrollment. Access to system resources is blocked." });
+    }
+    
+    const user = db.users.find(u => u.username === session.username);
     if (user && user.mustEnrollTotp && !isTotpSetupRoute) {
       return res.status(403).json({ error: "Dynamic MFA enrollment is required before accessing system resources. Please configure your Google Authenticator." });
     }
@@ -733,8 +833,9 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
     const preauthId = crypto.randomBytes(24).toString("hex");
     const preauthIdHash = crypto.createHash("sha256").update(preauthId + process.env.SESSION_SECRET).digest("hex");
     
-    // Valid for 3 minutes
-    dbInstance.insertPreauthSession(preauthIdHash, username, user.role, Date.now() + 3 * 60 * 1000);
+    // Valid for 3 minutes, bound to client IP and browser User-Agent
+    const userAgent = req.headers["user-agent"] || "unknown";
+    dbInstance.insertPreauthSession(preauthIdHash, username, user.role, Date.now() + 3 * 60 * 1000, req.ip, userAgent);
     
     appendSecurityLog(username, user.role, "LOGIN_STAGE_1_SUCCESS", "USER_AUTH", `Password correct. Initiated 2FA stage 2 challenge.`, req.ip);
     return res.json({
@@ -746,7 +847,7 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
   }
 
   // Otherwise, user must enroll (first-time TOTP setup) or has no TOTP yet.
-  // Generate a limited enrollment session.
+  // Generate a limited enrollment session (purpose: "enrollment").
   const role = user.role;
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
@@ -755,7 +856,8 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
     tokenHash,
     username,
     role,
-    expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
+    expiresAt: Date.now() + 30 * 60 * 1000, // 30 minutes
+    purpose: "enrollment" as const
   };
   activeSessions.push(session);
   dbInstance.save();
@@ -764,19 +866,13 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
 
   // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
-    httpOnly: true,
-    signed: true,
-    secure: true,
-    sameSite: "none",
-    maxAge: 30 * 60 * 1000
+    ...getCookieOptions(30 * 60 * 1000)
   });
 
   // Distribute CSRF double-submit cookie (P0-2.9)
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    secure: true,
-    sameSite: "none",
-    maxAge: 30 * 60 * 1000
+    ...getCsrfCookieOptions(30 * 60 * 1000)
   });
 
   res.json({ 
@@ -787,17 +883,20 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
   });
 });
 
-app.post("/api/auth/login/totp", authRateLimiter, (req, res) => {
+app.post("/api/auth/login/totp", authRateLimiter, async (req, res) => {
   const { preauthId, code } = req.body;
   if (!preauthId || !code) {
     return res.status(400).json({ error: "Missing required multi-factor credentials." });
   }
 
   const preauthIdHash = crypto.createHash("sha256").update(preauthId + process.env.SESSION_SECRET).digest("hex");
-  const preauth = dbInstance.getPreauthSession(preauthIdHash);
+  const userAgent = req.headers["user-agent"] || "unknown";
 
-  if (!preauth) {
-    return res.status(401).json({ error: "Pre-authorization session expired or invalid. Please re-enter credentials." });
+  let preauth;
+  try {
+    preauth = await dbInstance.validatePreauthSessionAsync(preauthIdHash, req.ip, userAgent);
+  } catch (err: any) {
+    return res.status(401).json({ error: err.message });
   }
 
   const user = db.users.find(u => u.username === preauth.username && u.isActive);
@@ -810,14 +909,19 @@ app.post("/api/auth/login/totp", authRateLimiter, (req, res) => {
   const isTotpValid = verifyTOTP(decryptedSecret, code);
 
   if (!isTotpValid) {
+    await dbInstance.incrementPreauthFailuresAsync(preauthIdHash);
     appendSecurityLog(preauth.username, preauth.role, "LOGIN_MFA_FAILED", "MFA_GATE", `Login MFA verification failed. Code rejected.`, req.ip);
     return res.status(400).json({ error: "Invalid dynamic MFA code. Please check Google Authenticator." });
   }
 
-  // MFA verified! Consume the preauth session
-  dbInstance.consumePreauthSession(preauthIdHash);
+  // MFA verified! Consume the preauth session transactionally
+  try {
+    await dbInstance.consumePreauthSessionAsync(preauthIdHash);
+  } catch (err: any) {
+    return res.status(401).json({ error: err.message });
+  }
 
-  // Rotate and generate formal session
+  // Rotate and generate formal session (purpose: "full")
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
   
@@ -825,7 +929,8 @@ app.post("/api/auth/login/totp", authRateLimiter, (req, res) => {
     tokenHash,
     username: preauth.username,
     role: preauth.role,
-    expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
+    expiresAt: Date.now() + 30 * 60 * 1000, // 30 minutes
+    purpose: "full" as const
   };
   activeSessions.push(session);
   dbInstance.save();
@@ -834,19 +939,13 @@ app.post("/api/auth/login/totp", authRateLimiter, (req, res) => {
 
   // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
-    httpOnly: true,
-    signed: true,
-    secure: true,
-    sameSite: "none",
-    maxAge: 30 * 60 * 1000
+    ...getCookieOptions(30 * 60 * 1000)
   });
 
   // Distribute CSRF double-submit cookie (P0-2.9)
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    secure: true,
-    sameSite: "none",
-    maxAge: 30 * 60 * 1000
+    ...getCsrfCookieOptions(30 * 60 * 1000)
   });
 
   res.json({
