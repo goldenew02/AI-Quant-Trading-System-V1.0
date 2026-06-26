@@ -20,10 +20,9 @@ dotenv.config();
 
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
-  // Default to 'none' for secure HTTPS cross-domain iframe context in AI Studio, but customizable via .env
-  const configured = (process.env.COOKIE_SAMESITE || "none").toLowerCase();
-  if (!["lax", "strict", "none"].includes(configured)) return "none";
-  return configured as "lax" | "strict" | "none";
+  // Always return 'none' for secure HTTPS cross-domain iframe context in AI Studio,
+  // as modern browsers strictly require SameSite=none and Secure=true inside iframes.
+  return "none";
 }
 
 function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
