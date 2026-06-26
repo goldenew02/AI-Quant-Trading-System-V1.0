@@ -3,23 +3,26 @@ import https from "https";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class InteractiveBrokersAdapter implements BrokerAdapter {
-  private agent: https.Agent;
-
-  constructor() {
-    this.agent = new https.Agent({
-      rejectUnauthorized: false // IB Client Portal typically runs on local loopback with self-signed certs
-    });
-  }
+  constructor() {}
 
   private getBaseUrl(gatewayUrl?: string): string {
     return gatewayUrl || process.env.IB_GATEWAY_URL || "https://127.0.0.1:5000/v1/api";
   }
 
+  private getAgent(gatewayUrl?: string): https.Agent {
+    const url = this.getBaseUrl(gatewayUrl);
+    const isLoopback = url.includes("://127.0.0.1") || url.includes("://localhost");
+    return new https.Agent({
+      rejectUnauthorized: !isLoopback
+    });
+  }
+
   async connect(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<BrokerStatus> {
     const baseUrl = this.getBaseUrl(apiKey); // In IB, apiKey is used to override gateway URL if needed
+    const agent = this.getAgent(apiKey);
     try {
       const res = await axios.get(`${baseUrl}/one/user`, {
-        httpsAgent: this.agent,
+        httpsAgent: agent,
         timeout: 2000
       });
       if (res.status === 200 && res.data) {
@@ -33,7 +36,8 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
   async getBalances(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<Balance[]> {
     const baseUrl = this.getBaseUrl(apiKey);
-    const res = await axios.get(`${baseUrl}/portfolio/accounts`, { httpsAgent: this.agent });
+    const agent = this.getAgent(apiKey);
+    const res = await axios.get(`${baseUrl}/portfolio/accounts`, { httpsAgent: agent });
     const accounts = res.data || [];
     
     // Aggregate balances
@@ -52,8 +56,12 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
   async getPositions(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<Position[]> {
     const baseUrl = this.getBaseUrl(apiKey);
-    const accountId = passphrase || process.env.IB_ACCOUNT_ID || "DU123456";
-    const res = await axios.get(`${baseUrl}/portfolio/${accountId}/positions`, { httpsAgent: this.agent });
+    const agent = this.getAgent(apiKey);
+    const accountId = passphrase || process.env.IB_ACCOUNT_ID;
+    if (!accountId) {
+      throw new Error("Interactive Brokers error: Missing required IB_ACCOUNT_ID or account selection.");
+    }
+    const res = await axios.get(`${baseUrl}/portfolio/${accountId}/positions`, { httpsAgent: agent });
     const list = res.data || [];
     return list.map((p: any) => ({
       symbol: p.contractDesc || p.symbol,
@@ -66,13 +74,22 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
   async placeOrder(order: OrderRequest, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderAccepted> {
     const baseUrl = this.getBaseUrl(apiKey);
-    const accountId = order.brokerAccountId || passphrase || process.env.IB_ACCOUNT_ID || "DU123456";
+    const agent = this.getAgent(apiKey);
+    const accountId = order.brokerAccountId || passphrase || process.env.IB_ACCOUNT_ID;
+    if (!accountId) {
+      return {
+        brokerOrderId: "",
+        clientOrderId: order.clientOrderId,
+        status: "REJECTED",
+        error: "Interactive Brokers execution failure: Missing required IB_ACCOUNT_ID or account selection."
+      };
+    }
     
     try {
       // 1. Resolve contract ID (conid) from symbol search
       const encodedSymbol = encodeURIComponent(order.symbol.split("/")[0]);
       const searchRes = await axios.get(`${baseUrl}/iserver/secdef/search?symbol=${encodedSymbol}`, {
-        httpsAgent: this.agent
+        httpsAgent: agent
       });
       const conid = searchRes.data?.[0]?.conid;
       if (!conid) {
@@ -97,7 +114,7 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
       // 3. Post order
       const res = await axios.post(`${baseUrl}/iserver/account/${accountId}/orders`, orderPayload, {
-        httpsAgent: this.agent
+        httpsAgent: agent
       });
 
       let orderResult = res.data;
@@ -108,7 +125,7 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
         const replyId = orderResult[0].id;
         console.log(`[IB Confirmation] Handling order confirmation prompt ${replyId}...`);
         const confirmRes = await axios.post(`${baseUrl}/iserver/reply/${replyId}`, { confirmed: true }, {
-          httpsAgent: this.agent
+          httpsAgent: agent
         });
         orderResult = confirmRes.data;
       }
@@ -133,7 +150,8 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
   async getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
     const baseUrl = this.getBaseUrl(apiKey);
-    const res = await axios.get(`${baseUrl}/iserver/account/orders`, { httpsAgent: this.agent });
+    const agent = this.getAgent(apiKey);
+    const res = await axios.get(`${baseUrl}/iserver/account/orders`, { httpsAgent: agent });
     const ordersList = res.data?.orders || [];
     const found = ordersList.find((o: any) => String(o.orderId) === String(orderId));
     
@@ -162,7 +180,11 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
 
   async cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
     const baseUrl = this.getBaseUrl(apiKey);
-    const accountId = passphrase || process.env.IB_ACCOUNT_ID || "DU123456";
-    await axios.delete(`${baseUrl}/iserver/account/${accountId}/order/${orderId}`, { httpsAgent: this.agent });
+    const agent = this.getAgent(apiKey);
+    const accountId = passphrase || process.env.IB_ACCOUNT_ID;
+    if (!accountId) {
+      throw new Error("Interactive Brokers error: Missing required IB_ACCOUNT_ID or account selection for cancelling order.");
+    }
+    await axios.delete(`${baseUrl}/iserver/account/${accountId}/order/${orderId}`, { httpsAgent: agent });
   }
 }

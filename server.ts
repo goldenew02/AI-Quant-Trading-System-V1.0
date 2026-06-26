@@ -18,16 +18,25 @@ import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, h
 
 dotenv.config();
 
-// Unified Cookie Options Helper for environmentalized secure cookies (P0-2)
+// Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
+function resolveSameSite(): "lax" | "strict" | "none" {
+  const configured = (process.env.COOKIE_SAMESITE || "lax").toLowerCase();
+  if (!["lax", "strict", "none"].includes(configured)) return "lax";
+  if (configured === "none" && process.env.COOKIE_SECURE !== "true" && process.env.NODE_ENV !== "production") {
+    return "lax";
+  }
+  return configured as "lax" | "strict" | "none";
+}
+
 function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
   const isProd = process.env.NODE_ENV === "production";
   const secure = process.env.COOKIE_SECURE === "true" || isProd;
-  const sameSite = secure ? "none" : "lax";
+  const sameSite = resolveSameSite();
   return {
     httpOnly: true,
     signed: true,
     secure,
-    sameSite: sameSite as "none" | "lax" | "strict",
+    sameSite,
     maxAge
   };
 }
@@ -35,10 +44,11 @@ function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
 function getCsrfCookieOptions(maxAge: number = 30 * 60 * 1000) {
   const isProd = process.env.NODE_ENV === "production";
   const secure = process.env.COOKIE_SECURE === "true" || isProd;
-  const sameSite = secure ? "none" : "lax";
+  const sameSite = resolveSameSite();
   return {
     secure,
-    sameSite: sameSite as "none" | "lax" | "strict",
+    sameSite,
+    signed: true, // Signed!
     maxAge
   };
 }
@@ -53,6 +63,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
+const isProd = process.env.NODE_ENV === "production";
 const allowedOrigins = (process.env.APP_URL || "")
   .split(",")
   .map(v => v.trim())
@@ -61,13 +72,24 @@ const allowedOrigins = (process.env.APP_URL || "")
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
-    // Allow localhost/127.0.0.1 and Cloud Run dev previews ending with run.app
-    const isDev = process.env.NODE_ENV !== "production";
-    const isAllowedRunApp = origin.endsWith(".run.app");
-    const isLocal = origin.includes("localhost") || origin.includes("127.0.0.1");
-    if (isDev || isLocal || isAllowedRunApp || allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    
+    // Always allow localhost in dev
+    const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    if (!isProd && isLocal) {
       return cb(null, true);
     }
+    
+    // In dev, also allow preview run.app URLs
+    if (!isProd && origin.endsWith(".run.app")) {
+      return cb(null, true);
+    }
+    
+    // Fallback if origin matches any entry of allowedOrigins with prefix/suffix (helpful for double subdomains)
+    if (allowedOrigins.some(ao => origin === ao || ao.startsWith(origin) || origin.startsWith(ao))) {
+      return cb(null, true);
+    }
+
     return cb(new Error("CORS origin rejected"));
   },
   credentials: true
@@ -91,7 +113,7 @@ function validateCsrf(req: any, res: any, next: any) {
     return next();
   }
   const csrfHeader = req.headers["x-csrf-token"];
-  const csrfCookie = req.cookies.csrf_token;
+  const csrfCookie = req.signedCookies.csrf_token || req.cookies.csrf_token;
   if (!csrfHeader || !csrfCookie || csrfHeader !== csrfCookie) {
     return res.status(403).json({ error: "Invalid or missing CSRF token (anti-CSRF shield triggered)." });
   }
@@ -561,7 +583,7 @@ setInterval(() => {
 setInterval(async () => {
   const db = dbInstance.get();
   const orders = db.orders || [];
-  const workingOrders = orders.filter(o => o.status === "WORKING" || o.status === "PENDING");
+  const workingOrders = orders.filter(o => o.status === "WORKING" || o.status === "PENDING" || o.status === "PARTIALLY_FILLED");
   if (workingOrders.length === 0) return;
 
   for (const ord of workingOrders) {
@@ -603,6 +625,11 @@ setInterval(async () => {
 
       console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);
 
+      if (updatedOrder.status === "NEW" || updatedOrder.status === "WORKING") {
+        dbInstance.updateOrderStatus(ord.clientOrderId, "WORKING", updatedOrder.brokerOrderId || ord.brokerOrderId);
+        continue;
+      }
+
       if (updatedOrder.status === "FILLED") {
         dbInstance.updateOrderStatus(ord.clientOrderId, "FILLED", ord.brokerOrderId);
 
@@ -632,9 +659,9 @@ setInterval(async () => {
           // Write to trade log
           let realizedPnl = 0;
           if (ord.side === "SELL") {
-            realizedPnl = Math.round((filledPrice - bot.entryPrice) * totalFilledQty * 100) / 100;
+            realizedPnl = Math.round((filledPrice - bot.entryPrice) * finalChunkQty * 100) / 100;
             if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
-            if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * totalFilledQty) * 0.012 * 100) / 100;
+            if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * finalChunkQty) * 0.012 * 100) / 100;
             bot.profitUsd += realizedPnl;
           }
 
@@ -818,7 +845,7 @@ function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
   };
 }
 
-app.post("/api/auth/login", authRateLimiter, (req, res) => {
+app.post("/api/auth/login", authRateLimiter, async (req, res) => {
   const { username, password } = req.body;
   const user = db.users.find(u => u.username === username && u.isActive);
 
@@ -835,7 +862,7 @@ app.post("/api/auth/login", authRateLimiter, (req, res) => {
     
     // Valid for 3 minutes, bound to client IP and browser User-Agent
     const userAgent = req.headers["user-agent"] || "unknown";
-    dbInstance.insertPreauthSession(preauthIdHash, username, user.role, Date.now() + 3 * 60 * 1000, req.ip, userAgent);
+    await dbInstance.insertPreauthSession(preauthIdHash, username, user.role, Date.now() + 3 * 60 * 1000, req.ip, userAgent);
     
     appendSecurityLog(username, user.role, "LOGIN_STAGE_1_SUCCESS", "USER_AUTH", `Password correct. Initiated 2FA stage 2 challenge.`, req.ip);
     return res.json({
@@ -980,7 +1007,7 @@ app.get("/api/auth/me", requireAuth(['admin', 'operator', 'viewer']), (req: any,
   });
 });
 
-app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), authRateLimiter, (req: any, res) => {
+app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), authRateLimiter, async (req: any, res) => {
   const { code, action, bodyHash } = req.body;
   const user = db.users.find(u => u.username === req.user.username);
   if (!user || !user.totpSecret) {
@@ -997,7 +1024,7 @@ app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), 
     const actionTokenHash = crypto.createHash("sha256").update(actionToken + process.env.SESSION_SECRET).digest("hex");
     const sessionIdHash = crypto.createHash("sha256").update(req.signedCookies.sid + process.env.SESSION_SECRET).digest("hex");
 
-    dbInstance.insertMfaToken(
+    await dbInstance.insertMfaToken(
       actionTokenHash,
       sessionIdHash,
       req.user.username,

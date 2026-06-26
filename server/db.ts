@@ -66,6 +66,19 @@ for (const key of requiredEnvVars) {
   }
 }
 
+// Validate SESSION_SECRET size (at least 32 bytes in production, or fallback in dev)
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+if (process.env.NODE_ENV === "production" && (!SESSION_SECRET || Buffer.from(SESSION_SECRET).length < 32)) {
+  console.error("FATAL: SESSION_SECRET must be at least 32 bytes long in production!");
+  process.exit(1);
+}
+
+// Validate APP_URL is not default placeholder in production
+if (process.env.NODE_ENV === "production" && (!process.env.APP_URL || process.env.APP_URL === "MY_APP_URL" || process.env.APP_URL === "")) {
+  console.error("FATAL: APP_URL must be configured and cannot be 'MY_APP_URL' in production!");
+  process.exit(1);
+}
+
 // Validate ENCRYPTION_KEY format (must be 32 bytes when base64 decoded)
 const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY!;
 let decodedEncryptionKey: Buffer;
@@ -459,6 +472,10 @@ export class AegisDB {
     }
 
     const sqliteSupported = await checkSqliteSupport();
+    if (process.env.NODE_ENV === "production" && !sqliteSupported) {
+      throw new Error("SQLite is required in production; auth token JSON fallback is forbidden.");
+    }
+
     if (!sqliteSupported) {
       const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
       if (fs.existsSync(JSON_FILE)) {
@@ -775,11 +792,19 @@ export class AegisDB {
   }
 
   public save() {
+    const dataToSave = { ...this.data };
+    if (isSqliteSupported) {
+      delete (dataToSave as any).preauthSessions;
+      delete (dataToSave as any).mfaActionTokens;
+    }
+
+    const payload = JSON.stringify(dataToSave, null, 2);
+
     if (!isSqliteSupported) {
       const JSON_FILE = path.join(DB_DIR, "aegis_secure.json");
       const TEMP_FILE = JSON_FILE + ".tmp";
       try {
-        fs.writeFileSync(TEMP_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+        fs.writeFileSync(TEMP_FILE, payload, "utf-8");
         fs.renameSync(TEMP_FILE, JSON_FILE);
       } catch (err) {
         console.error("Database save failed:", err);
@@ -790,7 +815,7 @@ export class AegisDB {
     if (this.sqliteDbConn) {
       this.sqliteDbConn.run(
         "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [JSON.stringify(this.data, null, 2)],
+        [payload],
         (runErr: any) => {
           if (runErr) {
             console.error("Failed to save state to SQLite via connection:", runErr);
@@ -807,7 +832,7 @@ export class AegisDB {
         }
         sqliteDb.run(
           "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-          [JSON.stringify(this.data, null, 2)],
+          [payload],
           (runErr) => {
             if (runErr) {
               console.error("Failed to save state to SQLite fallback:", runErr);
@@ -939,6 +964,15 @@ export class AegisDB {
   }
 
   public insertFill(fill: Fill) {
+    if (!this.data.fills) this.data.fills = [];
+    const exists = this.data.fills.some(
+      f => f.id === fill.id || 
+           (f.orderId === fill.orderId && f.brokerFillId === fill.brokerFillId)
+    );
+    if (exists) {
+      console.log(`[DB] Fill ${fill.brokerFillId} for order ${fill.orderId} already exists. Skipping duplicate.`);
+      return;
+    }
     this.data.fills.unshift(fill);
     this.save();
   }
@@ -947,31 +981,48 @@ export class AegisDB {
     callback(null, this.data.mfaActionTokens || []);
   }
 
-  public insertMfaToken(tokenHash: string, sessionIdHash: string, username: string, action: string, bodyHash: string, expiresAt: number) {
-    if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
-    this.data.mfaActionTokens.push({
-      tokenHash,
-      sessionIdHash,
-      username,
-      action,
-      bodyHash,
-      expiresAt,
-      usedAt: null
-    });
-    this.save();
+  public insertMfaToken(
+    tokenHash: string,
+    sessionIdHash: string,
+    username: string,
+    action: string,
+    bodyHash: string,
+    expiresAt: number
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const doMemoryAndSave = () => {
+        if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
+        this.data.mfaActionTokens.push({
+          tokenHash,
+          sessionIdHash,
+          username,
+          action,
+          bodyHash,
+          expiresAt,
+          usedAt: null
+        });
+        this.save();
+      };
 
-    if (isSqliteSupported && this.sqliteDbConn) {
-      this.sqliteDbConn.run(
-        `INSERT INTO mfa_action_tokens (token_hash, session_id_hash, username, action, body_hash, expires_at, used_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-        [tokenHash, sessionIdHash, username, action, bodyHash, expiresAt],
-        (err: any) => {
-          if (err) {
-            console.error("Failed to insert mfa_action_token into SQLite table:", err);
+      if (isSqliteSupported && this.sqliteDbConn) {
+        this.sqliteDbConn.run(
+          `INSERT INTO mfa_action_tokens (token_hash, session_id_hash, username, action, body_hash, expires_at, used_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+          [tokenHash, sessionIdHash, username, action, bodyHash, expiresAt],
+          (err: any) => {
+            if (err) {
+              console.error("Failed to insert mfa_action_token into SQLite table:", err);
+              return reject(new Error("Failed to insert MFA token into secure SQLite storage: " + err.message));
+            }
+            doMemoryAndSave();
+            resolve();
           }
-        }
-      );
-    }
+        );
+      } else {
+        doMemoryAndSave();
+        resolve();
+      }
+    });
   }
 
   public consumeMfaTokenAsync(
@@ -1003,8 +1054,8 @@ export class AegisDB {
 
             // Atomic consume
             this.sqliteDbConn.run(
-              "UPDATE mfa_action_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at >= ?",
-              [now, tokenHash, now],
+              "UPDATE mfa_action_tokens SET used_at = ? WHERE token_hash = ? AND username = ? AND session_id_hash = ? AND action = ? AND body_hash = ? AND used_at IS NULL AND expires_at >= ?",
+              [now, tokenHash, username, sessionIdHash, action, bodyHash, now],
               function (this: any, updateErr: any) {
                 if (updateErr) {
                   return reject(new Error("Failed to consume MFA token transactionally."));
@@ -1046,26 +1097,36 @@ export class AegisDB {
     expiresAt: number,
     ip: string = "127.0.0.1",
     userAgent: string = "unknown"
-  ) {
-    if (!this.data.preauthSessions) this.data.preauthSessions = [];
-    this.data.preauthSessions.push({ preauthIdHash, username, role, expiresAt, failures: 0 });
-    this.save();
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const doMemoryAndSave = () => {
+        if (!this.data.preauthSessions) this.data.preauthSessions = [];
+        this.data.preauthSessions.push({ preauthIdHash, username, role, expiresAt, failures: 0 });
+        this.save();
+      };
 
-    if (isSqliteSupported && this.sqliteDbConn) {
-      const ip_hash = crypto.createHash("sha256").update(ip).digest("hex");
-      const user_agent_hash = crypto.createHash("sha256").update(userAgent).digest("hex");
-      
-      this.sqliteDbConn.run(
-        `INSERT INTO preauth_sessions (preauth_id_hash, username, role, ip_hash, user_agent_hash, expires_at, used_at, failures)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, 0)`,
-        [preauthIdHash, username, role, ip_hash, user_agent_hash, expiresAt],
-        (err: any) => {
-          if (err) {
-            console.error("Failed to insert preauth_session into SQLite table:", err);
+      if (isSqliteSupported && this.sqliteDbConn) {
+        const ip_hash = crypto.createHash("sha256").update(ip).digest("hex");
+        const user_agent_hash = crypto.createHash("sha256").update(userAgent).digest("hex");
+        
+        this.sqliteDbConn.run(
+          `INSERT INTO preauth_sessions (preauth_id_hash, username, role, ip_hash, user_agent_hash, expires_at, used_at, failures)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, 0)`,
+          [preauthIdHash, username, role, ip_hash, user_agent_hash, expiresAt],
+          (err: any) => {
+            if (err) {
+              console.error("Failed to insert preauth_session into SQLite table:", err);
+              return reject(new Error("Failed to create preauth session in secure SQLite storage: " + err.message));
+            }
+            doMemoryAndSave();
+            resolve();
           }
-        }
-      );
-    }
+        );
+      } else {
+        doMemoryAndSave();
+        resolve();
+      }
+    });
   }
 
   public getPreauthSession(preauthIdHash: string) {
@@ -1120,6 +1181,11 @@ export class AegisDB {
               return reject(new Error("Too many failed 2FA attempts. This login session has been locked."));
             }
             if (row.ip_hash !== ip_hash || row.user_agent_hash !== user_agent_hash) {
+              // Immediately invalidate preauth session in SQLite to block further attempts from this context
+              this.sqliteDbConn.run(
+                "UPDATE preauth_sessions SET used_at = ? WHERE preauth_id_hash = ? AND used_at IS NULL",
+                [now, preauthIdHash]
+              );
               return reject(new Error("Security context changed. IP or browser agent mismatch."));
             }
             resolve({ username: row.username, role: row.role });
@@ -1180,11 +1246,6 @@ export class AegisDB {
   public consumePreauthSessionAsync(preauthIdHash: string): Promise<void> {
     const now = Date.now();
     return new Promise((resolve, reject) => {
-      if (this.data.preauthSessions) {
-        this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
-        this.save();
-      }
-
       if (isSqliteSupported && this.sqliteDbConn) {
         this.sqliteDbConn.run(
           "UPDATE preauth_sessions SET used_at = ? WHERE preauth_id_hash = ? AND used_at IS NULL AND expires_at >= ?",
@@ -1196,10 +1257,18 @@ export class AegisDB {
             if (this.changes !== 1) {
               return reject(new Error("Pre-authorization double-use protection block triggered."));
             }
+            if (dbInstance.get().preauthSessions) {
+              dbInstance.get().preauthSessions = dbInstance.get().preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+              dbInstance.save();
+            }
             resolve();
           }
         );
       } else {
+        if (this.data.preauthSessions) {
+          this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+          this.save();
+        }
         resolve();
       }
     });

@@ -28,13 +28,26 @@ export default function SystemMetrics() {
       setLoading(true);
       const res = await apiFetch("/api/overview");
       if (res.status === 429) {
-        const data = await res.json();
+        let errMsg = "Too Many Requests - Circuit Breaker Triggered.";
+        try {
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const data = await res.json();
+            errMsg = data.error || errMsg;
+          } else {
+            const textMsg = await res.text();
+            if (textMsg) errMsg = textMsg;
+          }
+        } catch (parseErr) {
+          console.warn("Failed to parse 429 response body:", parseErr);
+        }
+
         setMetrics(prev => ({
           ...prev,
           apiRequestRate: 125,
           circuitBreakerActive: true,
         }));
-        setOverloadMessage(data.error || "Too Many Requests - Circuit Breaker Triggered.");
+        setOverloadMessage(errMsg);
         return;
       }
 
