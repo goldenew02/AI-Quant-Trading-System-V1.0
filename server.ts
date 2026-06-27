@@ -16,13 +16,18 @@ import { getBrokerAdapter } from "./server/brokers";
 // Shared State via AegisDB Instance - Import DB first so .env is bootstrapped/loaded before anything else
 import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
-  // Always return 'none' for secure HTTPS cross-domain iframe context in AI Studio,
-  // as modern browsers strictly require SameSite=none and Secure=true inside iframes.
-  return "none";
+  const configured = (process.env.COOKIE_SAMESITE || "lax").toLowerCase();
+  if (!["lax", "strict", "none"].includes(configured)) return "lax";
+  return configured as "lax" | "strict" | "none";
+}
+
+// Startup validation for SameSite=none cookies requiring secure HTTPS context
+if (resolveSameSite() === "none" && process.env.COOKIE_SECURE !== "true" && process.env.NODE_ENV !== "production") {
+  throw new Error("COOKIE_SAMESITE=none requires COOKIE_SECURE=true and HTTPS.");
 }
 
 function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
@@ -983,11 +988,13 @@ app.post("/api/auth/login/totp", authRateLimiter, async (req, res) => {
   try {
     preauth = await dbInstance.validatePreauthSessionAsync(preauthIdHash, req.ip, userAgent);
   } catch (err: any) {
+    appendSecurityLog("unknown", "viewer", "TOTP_LOGIN_FAILED_PREAUTH_EXPIRED", "MFA_GATE", `Preauth session validation failed: ${err.message}`, req.ip);
     return res.status(401).json({ error: err.message });
   }
 
   const user = db.users.find(u => u.username === preauth.username && u.isActive);
   if (!user || !user.totpSecret) {
+    appendSecurityLog(preauth.username, preauth.role, "TOTP_LOGIN_FAILED_SECRET_MISSING", "MFA_GATE", `Login MFA verification failed. TOTP secret missing.`, req.ip);
     return res.status(401).json({ error: "User profile or dynamic MFA keys not configured." });
   }
 
@@ -997,7 +1004,7 @@ app.post("/api/auth/login/totp", authRateLimiter, async (req, res) => {
 
   if (!isTotpValid) {
     await dbInstance.incrementPreauthFailuresAsync(preauthIdHash);
-    appendSecurityLog(preauth.username, preauth.role, "LOGIN_MFA_FAILED", "MFA_GATE", `Login MFA verification failed. Code rejected.`, req.ip);
+    appendSecurityLog(preauth.username, preauth.role, "TOTP_LOGIN_FAILED_CODE_MISMATCH", "MFA_GATE", `Login MFA verification failed. Code rejected.`, req.ip);
     return res.status(400).json({ error: "Invalid dynamic MFA code. Please check Google Authenticator." });
   }
 
@@ -1129,6 +1136,7 @@ app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']),
   const { code } = req.body;
   const user = db.users.find(u => u.username === req.user.username);
   if (!user || !user.tempTotpSecret || !user.tempTotpExpiresAt) {
+    appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM_FAILED_TEMP_SECRET_MISSING", "USER_AUTH", "TOTP confirmation failed: setup not initialized.", req.ip);
     return res.status(400).json({ error: "TOTP setup workflow has not been initialized." });
   }
 
@@ -1136,6 +1144,7 @@ app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']),
     delete user.tempTotpSecret;
     delete user.tempTotpExpiresAt;
     dbInstance.save();
+    appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM_FAILED_TEMP_SECRET_EXPIRED", "USER_AUTH", "TOTP confirmation failed: temporary secret expired.", req.ip);
     return res.status(400).json({ error: "TOTP setup secret has expired. Please re-initiate setup." });
   }
 
@@ -1143,6 +1152,7 @@ app.post("/api/auth/totp/confirm", requireAuth(['admin', 'operator', 'viewer']),
   const tempDecrypted = decryptSecret(user.tempTotpSecret);
   const isValid = verifyTOTP(tempDecrypted, code);
   if (!isValid) {
+    appendSecurityLog(req.user.username, req.user.role, "TOTP_SETUP_CONFIRM_FAILED_CODE_MISMATCH", "USER_AUTH", "TOTP confirmation failed: verification code mismatch.", req.ip);
     return res.status(400).json({ error: "Invalid verification code. TOTP setup confirm failed." });
   }
 
