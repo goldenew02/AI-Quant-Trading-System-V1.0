@@ -16,7 +16,7 @@ import { getBrokerAdapter } from "./server/brokers";
 // Shared State via AegisDB Instance - Import DB first so .env is bootstrapped/loaded before anything else
 import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
 
-dotenv.config({ override: true });
+dotenv.config({ override: false });
 
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
@@ -25,15 +25,35 @@ function resolveSameSite(): "lax" | "strict" | "none" {
   return configured as "lax" | "strict" | "none";
 }
 
-// Startup validation for SameSite=none cookies requiring secure HTTPS context
-if (resolveSameSite() === "none" && process.env.COOKIE_SECURE !== "true" && process.env.NODE_ENV !== "production") {
-  throw new Error("COOKIE_SAMESITE=none requires COOKIE_SECURE=true and HTTPS.");
+// Startup validation for SameSite=none cookies requiring secure HTTPS context (P1-1 / P1-5)
+const appUrl = process.env.APP_URL || "";
+const isHttpsUrl = appUrl.startsWith("https://");
+const isDevelopmentLocal = process.env.NODE_ENV !== "production" && (appUrl.includes("localhost") || appUrl.includes("127.0.0.1"));
+
+if (resolveSameSite() === "none" && !isDevelopmentLocal && (!isHttpsUrl || process.env.COOKIE_SECURE !== "true")) {
+  throw new Error("COOKIE_SAMESITE=none requires APP_URL=https://... and COOKIE_SECURE=true.");
 }
 
-function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
-  const sameSite = resolveSameSite();
-  // cookies inside cross-origin iframe context must be secure if sameSite is none
-  const secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
+if (process.env.COOKIE_SECURE === "true" && !isDevelopmentLocal && appUrl.startsWith("http://")) {
+  throw new Error("COOKIE_SECURE=true cannot be used with HTTP APP_URL during local testing.");
+}
+
+function getCookieOptions(req: express.Request | any, maxAge: number = 30 * 60 * 1000) {
+  const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https" || req.headers["x-forwarded-ssl"] === "on";
+  
+  let sameSite = resolveSameSite();
+  let secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
+
+  // Auto-escalate or de-escalate based on actual protocol to prevent authentication lockouts
+  if (isHttps) {
+    sameSite = "none";
+    secure = true;
+  } else {
+    // Plain HTTP local development/testing fallback
+    secure = false;
+    sameSite = "lax";
+  }
+
   return {
     httpOnly: true,
     signed: true,
@@ -43,10 +63,20 @@ function getCookieOptions(maxAge: number = 30 * 60 * 1000) {
   };
 }
 
-function getCsrfCookieOptions(maxAge: number = 30 * 60 * 1000) {
-  const sameSite = resolveSameSite();
-  // cookies inside cross-origin iframe context must be secure if sameSite is none
-  const secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
+function getCsrfCookieOptions(req: express.Request | any, maxAge: number = 30 * 60 * 1000) {
+  const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https" || req.headers["x-forwarded-ssl"] === "on";
+  
+  let sameSite = resolveSameSite();
+  let secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
+
+  if (isHttps) {
+    sameSite = "none";
+    secure = true;
+  } else {
+    secure = false;
+    sameSite = "lax";
+  }
+
   return {
     secure,
     sameSite,
@@ -60,10 +90,15 @@ const app = express();
 // Trust proxy for rate limiting behind Cloud Run/Nginx proxies
 app.set("trust proxy", 1);
 
-// Set Content Security Policy in production and protect against clickjacking / iframe nesting (P1-5)
+// Set Content Security Policy in production and protect against clickjacking / iframe nesting (P1-5 / P1-4)
+// Allow embedding inside AI Studio's preview and google domains
+const frameAncestors = process.env.FRAME_ANCESTORS
+  ? process.env.FRAME_ANCESTORS.split(",").map(v => v.trim())
+  : ["'self'", "https://ai.studio", "https://*.google.com", "https://*.googleusercontent.com"];
+
 app.use(helmet({
   contentSecurityPolicy: process.env.NODE_ENV === "production"
-    ? { useDefaults: true, directives: { "frame-ancestors": ["'none'"] } }
+    ? { useDefaults: true, directives: { "frame-ancestors": frameAncestors } }
     : false,
   crossOriginEmbedderPolicy: false
 }));
@@ -125,7 +160,7 @@ app.use(validateCsrf);
 app.get("/api/auth/csrf", (req, res) => {
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    ...getCsrfCookieOptions(30 * 60 * 1000)
+    ...getCsrfCookieOptions(req, 30 * 60 * 1000)
   });
   res.json({ success: true });
 });
@@ -958,13 +993,13 @@ app.post("/api/auth/login", authRateLimiter, async (req, res) => {
 
   // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
-    ...getCookieOptions(30 * 60 * 1000)
+    ...getCookieOptions(req, 30 * 60 * 1000)
   });
 
   // Distribute CSRF double-submit cookie (P0-2.9)
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    ...getCsrfCookieOptions(30 * 60 * 1000)
+    ...getCsrfCookieOptions(req, 30 * 60 * 1000)
   });
 
   res.json({ 
@@ -1033,13 +1068,13 @@ app.post("/api/auth/login/totp", authRateLimiter, async (req, res) => {
 
   // Set httpOnly secure signed cookie (P0-2)
   res.cookie("sid", token, {
-    ...getCookieOptions(30 * 60 * 1000)
+    ...getCookieOptions(req, 30 * 60 * 1000)
   });
 
   // Distribute CSRF double-submit cookie (P0-2.9)
   const csrfToken = crypto.randomBytes(24).toString("hex");
   res.cookie("csrf_token", csrfToken, {
-    ...getCsrfCookieOptions(30 * 60 * 1000)
+    ...getCsrfCookieOptions(req, 30 * 60 * 1000)
   });
 
   res.json({

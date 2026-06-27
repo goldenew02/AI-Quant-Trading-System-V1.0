@@ -22,38 +22,41 @@ async function checkSqliteSupport(): Promise<boolean> {
 
 // --- ENVIRONMENT INITIALIZATION & FAIL-FAST VALIDATION ---
 const envPath = path.join(process.cwd(), ".env");
-const envExamplePath = path.join(process.cwd(), ".env.example");
-if (!fs.existsSync(envPath)) {
-  if (fs.existsSync(envExamplePath)) {
-    fs.copyFileSync(envExamplePath, envPath);
-    console.log("==================================================================");
-    console.log("  RESTORED: Created .env by copying .env.example.                ");
-    console.log("  Secure administrator credentials:                              ");
-    console.log("  User: admin                                                   ");
-    console.log("  Password: Aegis_c391e4dfc009!                                 ");
-    console.log("==================================================================");
-  } else {
-    const adminUser = "admin";
-    const adminPass = "Aegis_c391e4dfc009!";
-    const encKey = "jH9QOrwCFaEGVtNrWQFIPHDOz0PML/R6YAk/63QjlC4=";
-    const sessSec = "pxzqDZBa/K6WOaXZQUbqi1sIE15WaJ+3Jthm4tIAnTs=";
+const isProd = process.env.NODE_ENV === "production";
 
-    const envContent = `# AegisQuant Secure Environment Configuration
+if (!fs.existsSync(envPath) && !isProd) {
+  // Development only: dynamically bootstrap a highly secure .env with strong random secrets
+  const adminUser = "admin";
+  const adminPass = "Aegis_" + crypto.randomBytes(6).toString("hex") + "!";
+  const encKey = crypto.randomBytes(32).toString("base64");
+  const sessSec = crypto.randomBytes(32).toString("base64");
+
+  const envContent = `# AegisQuant Secure Local Environment Configuration
 BOOTSTRAP_ADMIN_USER=${adminUser}
 BOOTSTRAP_ADMIN_PASSWORD=${adminPass}
+ADMIN_PASSWORD_SYNC_ON_BOOT=true
+ADMIN_TOTP_SYNC_ON_BOOT=false
 ENCRYPTION_KEY=${encKey}
 SESSION_SECRET=${sessSec}
+TOTP_WINDOW_STEPS=1
+NODE_ENV=development
+APP_URL=http://localhost:3000
+COOKIE_SAMESITE=none
+COOKIE_SECURE=true
 `;
-    fs.writeFileSync(envPath, envContent, "utf-8");
-    console.log("==================================================================");
-    console.log("  SECURE BOOTSTRAP: Created fresh .env with standard secrets.     ");
-    console.log("==================================================================");
-  }
+  fs.writeFileSync(envPath, envContent, "utf-8");
+  console.log("==================================================================");
+  console.log("  SECURE BOOTSTRAP: Created fresh local .env with random secrets. ");
+  console.log("  Administrator Account Initialized:                             ");
+  console.log(`  User: ${adminUser}                                             `);
+  console.log(`  Password: ${adminPass}                                         `);
+  console.log("  TOTP MFA Setup will be forced upon first login.                 ");
+  console.log("==================================================================");
 }
 
-// Load environment variables
+// Load environment variables (override is false, so platform Secrets take absolute precedence)
 import dotenv from "dotenv";
-dotenv.config({ override: true });
+dotenv.config({ override: false });
 
 // Fail-fast verification of required secrets as demanded by P0-1
 const requiredEnvVars = [
@@ -530,7 +533,7 @@ export class AegisDB {
 
     const sqliteSupported = await checkSqliteSupport();
     if (process.env.NODE_ENV === "production" && !sqliteSupported) {
-      console.log("[Aegis DB] Production mode active: database layer initialized with persistent JSON storage.");
+      throw new Error("SQLite is required in production; JSON fallback is forbidden.");
     }
 
     if (!sqliteSupported) {
