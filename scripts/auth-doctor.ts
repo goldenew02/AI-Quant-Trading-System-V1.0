@@ -114,7 +114,7 @@ async function main() {
     }
     const fileVal = envVarsFromFile[key];
     if (fileVal !== undefined && fileVal === val) {
-      return ".env File Configured";
+      return ".env contains same value as effective runtime value; actual source cannot be proven from process.env.";
     }
     if (fileVal !== undefined && fileVal !== val) {
       return "Platform / Container Environment Secret (Takes priority over different value in .env!)";
@@ -137,6 +137,11 @@ async function main() {
   console.log(`- Native sqlite3 Package Supported: ${sqliteSupported ? "YES" : "NO"}`);
   
   const isProduction = process.env.NODE_ENV === "production";
+  if (isProduction && !sqliteSupported) {
+    console.error("[CRITICAL] SQLite is required in production. JSON fallback is forbidden.");
+    process.exit(2);
+  }
+
   const dbBackend = isProduction || sqliteSupported ? "SQLite" : "JSON Fallback";
   console.log(`- Expected Database Backend: ${dbBackend}`);
 

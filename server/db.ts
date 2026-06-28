@@ -49,7 +49,11 @@ COOKIE_SECURE=false
   console.log("  SECURE BOOTSTRAP: Created fresh local .env with random secrets. ");
   console.log("  Administrator Account Initialized:                             ");
   console.log(`  User: ${adminUser}                                             `);
-  console.log(`  Password: ${adminPass}                                         `);
+  if (process.env.ALLOW_BOOTSTRAP_PASSWORD_LOG === "true") {
+    console.log(`  Password: ${adminPass}                                         `);
+  } else {
+    console.log("  Password generated and written to local .env. Open .env locally to retrieve it.");
+  }
   console.log("  TOTP MFA Setup will be forced upon first login.                 ");
   console.log("==================================================================");
 }
@@ -110,6 +114,7 @@ export interface DBUser {
   tempTotpSecret?: string | null;
   tempTotpExpiresAt?: number | null;
   mustEnrollTotp?: boolean;
+  passwordVersion?: number;
 }
 
 export interface DBSession {
@@ -118,6 +123,7 @@ export interface DBSession {
   role: 'admin' | 'operator' | 'viewer';
   expiresAt: number;
   purpose?: 'enrollment' | 'full';
+  passwordVersionAtLogin?: number;
 }
 
 export interface SecurityAuditEntry {
@@ -405,7 +411,7 @@ export class AegisDB {
     const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
 
     // Safety switches for synchronizing credentials on boot
-    const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT !== "false"; // defaults to true for convenience
+    const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
     const syncTotpOnBoot = process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
 
     if (seedUser && seedPass) {

@@ -46,8 +46,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Update password hash
+  // Update password hash and version
   user.passwordHash = hashPassword(bootstrapPass);
+  user.passwordVersion = (user.passwordVersion || 1) + 1;
 
   // Clear all sessions for this user to enforce logout/invalidation
   const originalSessionCount = db.sessions.length;

@@ -64,6 +64,7 @@ export interface BotConfig {
   cgroupsCpuLimit?: string;
   cgroupsMemoryLimit?: string;
   executionMode?: 'paper' | 'live';
+  brokerAccountId?: string;
   gridType?: 'spot' | 'perpetual';
   perpetualLeverage?: number;
   fundingRateCheck?: boolean;

@@ -938,7 +938,25 @@ function requireAuth(allowedRoles?: ('admin' | 'operator' | 'viewer')[]) {
     }
     
     const user = db.users.find(u => u.username === session.username);
-    if (user && user.mustEnrollTotp && !isTotpSetupRoute) {
+    if (!user) {
+      res.clearCookie("sid");
+      res.clearCookie("csrf_token");
+      return res.status(401).json({ error: "User profile associated with this session no longer exists." });
+    }
+
+    // Check credential version synchronization (P1-2)
+    if ((session.passwordVersionAtLogin || 1) !== (user.passwordVersion || 1)) {
+      const idx = activeSessions.findIndex(s => s.tokenHash === tokenHash);
+      if (idx !== -1) {
+        activeSessions.splice(idx, 1);
+        dbInstance.save();
+      }
+      res.clearCookie("sid");
+      res.clearCookie("csrf_token");
+      return res.status(401).json({ error: "Session expired after credential modification. Please authenticate again." });
+    }
+    
+    if (user.mustEnrollTotp && !isTotpSetupRoute) {
       return res.status(403).json({ error: "Dynamic MFA enrollment is required before accessing system resources. Please configure your Google Authenticator." });
     }
     
@@ -991,7 +1009,8 @@ app.post("/api/auth/login", authRateLimiter, async (req, res) => {
     username,
     role,
     expiresAt: Date.now() + 30 * 60 * 1000, // 30 minutes
-    purpose: "enrollment" as const
+    purpose: "enrollment" as const,
+    passwordVersionAtLogin: user.passwordVersion || 1
   };
   activeSessions.push(session);
   dbInstance.save();
@@ -1066,7 +1085,8 @@ app.post("/api/auth/login/totp", authRateLimiter, async (req, res) => {
     username: preauth.username,
     role: preauth.role,
     expiresAt: Date.now() + 30 * 60 * 1000, // 30 minutes
-    purpose: "full" as const
+    purpose: "full" as const,
+    passwordVersionAtLogin: user.passwordVersion || 1
   };
   activeSessions.push(session);
   dbInstance.save();
@@ -1116,11 +1136,28 @@ app.get("/api/auth/me", requireAuth(['admin', 'operator', 'viewer']), (req: any,
   });
 });
 
+const MFA_ACTIONS: Record<string, Array<"admin" | "operator" | "viewer">> = {
+  START_LIVE_BOT: ["admin", "operator"],
+  SAVE_RISK_LIMITS: ["admin"],
+  TOGGLE_GLOBAL_KILL_SWITCH: ["admin"]
+};
+
 app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), authRateLimiter, async (req: any, res) => {
-  const { code, action, bodyHash } = req.body;
+  const { code, action, payload } = req.body;
   const user = db.users.find(u => u.username === req.user.username);
   if (!user || !user.totpSecret) {
     return res.status(404).json({ error: "User profile or dynamic MFA keys not configured." });
+  }
+
+  if (!action || !MFA_ACTIONS[action] || !MFA_ACTIONS[action].includes(req.user.role)) {
+    return res.status(403).json({ error: "MFA action not allowed for this role." });
+  }
+
+  let bodyHash = "";
+  try {
+    bodyHash = computeMfaBodyHash(action, payload);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || "Invalid payload for dynamic MFA action validation." });
   }
 
   // Decrypt secret securely and throw immediately if decryption is tampered/fails
@@ -1137,8 +1174,8 @@ app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), 
       actionTokenHash,
       sessionIdHash,
       req.user.username,
-      action || "update_risk",
-      bodyHash || "",
+      action,
+      bodyHash,
       Date.now() + 3 * 60 * 1000 // Strictly 3 minutes!
     );
 
@@ -1507,9 +1544,19 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), async (req: 
         return res.status(400).json({ error: "Invalid, expired or tampered MFA action token. Live bot activation rejected." });
       }
 
-      const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
+      if (!bot.brokerAccountId) {
+        return res.status(400).json({ error: "无法启动实盘机器人: 机器人配置中缺少绑定的券商账户 (brokerAccountId)。" });
+      }
+
+      const realAcc = dbInstance.get().brokerAccounts.find(
+        acc => acc.id === bot.brokerAccountId && acc.broker === bot.broker
+      );
       if (!realAcc) {
-        return res.status(400).json({ error: `无法启动实盘机器人: 未检测到关联并解密的 [${bot.broker}] 真实券商账户密钥。请前往券商密钥模块配置后再试。` });
+        return res.status(400).json({ error: `无法启动实盘机器人: 未检测到匹配的券商账户 [ID: ${bot.brokerAccountId}, Broker: ${bot.broker}] 密钥配置。` });
+      }
+
+      if (realAcc.isSandbox) {
+        return res.status(400).json({ error: "无法启动实盘机器人: 实盘模式禁止使用模拟 (Sandbox/Testnet) 账户密钥配置。" });
       }
     }
     bots[botIndex].status = "running";
@@ -1608,20 +1655,35 @@ function stableStringify(obj: any): string {
   return JSON.stringify(obj, Object.keys(obj).sort());
 }
 
-function computeBodyHash(body: any): string {
-  const payload = {
-    maxDailyDrawdown: Number(body.maxDailyDrawdown),
-    maxAccountDrawdown: Number(body.maxAccountDrawdown),
-    globalKillSwitch: body.globalKillSwitch === true,
-    maxLeverageLimit: Number(body.maxLeverageLimit),
-    dailyLossLimitUSD: Number(body.dailyLossLimitUSD),
-    restrictedSymbols: body.restrictedSymbols || [],
-    singleAssetMaxAllocationPercent: Number(body.singleAssetMaxAllocationPercent),
-    industryCryptoMaxPercent: Number(body.industryCryptoMaxPercent),
-    autoMeltDrawdownThreshold: Number(body.autoMeltDrawdownThreshold),
-    autoMeltSharpeThreshold: Number(body.autoMeltSharpeThreshold)
-  };
-  const payloadStr = stableStringify(payload);
+function normalizeMfaPayload(action: string, payload: any) {
+  if (action === "START_LIVE_BOT") {
+    return {
+      botId: String(payload.botId || ""),
+      executionMode: payload.executionMode === "live" ? "live" : "invalid"
+    };
+  }
+
+  if (action === "SAVE_RISK_LIMITS" || action === "TOGGLE_GLOBAL_KILL_SWITCH") {
+    return {
+      maxDailyDrawdown: Number(payload.maxDailyDrawdown),
+      maxAccountDrawdown: Number(payload.maxAccountDrawdown),
+      globalKillSwitch: payload.globalKillSwitch === true,
+      maxLeverageLimit: Number(payload.maxLeverageLimit),
+      dailyLossLimitUSD: Number(payload.dailyLossLimitUSD),
+      restrictedSymbols: payload.restrictedSymbols || [],
+      singleAssetMaxAllocationPercent: Number(payload.singleAssetMaxAllocationPercent),
+      industryCryptoMaxPercent: Number(payload.industryCryptoMaxPercent),
+      autoMeltDrawdownThreshold: Number(payload.autoMeltDrawdownThreshold),
+      autoMeltSharpeThreshold: Number(payload.autoMeltSharpeThreshold)
+    };
+  }
+
+  throw new Error("Unsupported MFA action.");
+}
+
+function computeMfaBodyHash(action: string, payload: any): string {
+  const normalized = normalizeMfaPayload(action, payload);
+  const payloadStr = stableStringify(normalized);
   return crypto.createHash("sha256").update(payloadStr).digest("hex");
 }
 
@@ -1636,7 +1698,7 @@ async function consumeMfaTokenAsync(
   if (!token || !sessionId) return false;
   const tokenHash = crypto.createHash("sha256").update(token + process.env.SESSION_SECRET).digest("hex");
   const sessionIdHash = crypto.createHash("sha256").update(sessionId + process.env.SESSION_SECRET).digest("hex");
-  const bodyHash = computeBodyHash(bodyPayload);
+  const bodyHash = computeMfaBodyHash(action, bodyPayload);
 
   try {
     await dbInstance.consumeMfaTokenAsync(tokenHash, username, sessionIdHash, action, bodyHash);

@@ -234,21 +234,6 @@ export default function App() {
     if (!mfaTargetBotId) return;
     setLiveBotMfaError("");
     try {
-      // Cryptographically bind payload: { botId: id, executionMode: "live" }
-      const payload = {
-        botId: mfaTargetBotId,
-        executionMode: "live"
-      };
-      
-      const stableStringify = (obj: any) => JSON.stringify(obj, Object.keys(obj).sort());
-      const payloadStr = stableStringify(payload);
-      
-      const encoder = new TextEncoder();
-      const data = encoder.encode(payloadStr);
-      const hashBuffer = await window.crypto.subtle.digest("SHA-256", data);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const payloadHash = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-
       // Step 1: Verify TOTP and obtain the transient action token
       const res = await secureFetch("/api/auth/verify-totp", {
         method: "POST",
@@ -256,20 +241,23 @@ export default function App() {
         body: JSON.stringify({
           code: liveBotMfaCode,
           action: "START_LIVE_BOT",
-          bodyHash: payloadHash
+          payload: {
+            botId: mfaTargetBotId,
+            executionMode: "live"
+          }
         })
       });
 
       const resData = await res.json();
       if (!res.ok || !resData.success) {
-        setLiveBotMfaError(resData.error || "MFA 动态验证码校验失败。");
+        setLiveBotMfaError(resData.error || "MFA dynamic verification code check failed.");
         return;
       }
 
       // Step 2: Proceed with the startup
       await handleStartBot(mfaTargetBotId, resData.actionToken);
     } catch (err: any) {
-      setLiveBotMfaError(err.message || "MFA 校验过程中发生未知异常。");
+      setLiveBotMfaError(err.message || "An unexpected error occurred during MFA verification.");
     }
   };
 
