@@ -41,8 +41,8 @@ SESSION_SECRET=${sessSec}
 TOTP_WINDOW_STEPS=1
 NODE_ENV=development
 APP_URL=http://localhost:3000
-COOKIE_SAMESITE=none
-COOKIE_SECURE=true
+COOKIE_SAMESITE=lax
+COOKIE_SECURE=false
 `;
   fs.writeFileSync(envPath, envContent, "utf-8");
   console.log("==================================================================");

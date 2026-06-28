@@ -40,7 +40,7 @@ export default function AegisLogin({ onLoginSuccess }: AegisLoginProps) {
       const res = await apiFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: username.trim(), password: password.trim() }),
+        body: JSON.stringify({ username: username.trim(), password: password }),
       });
 
       const contentType = res.headers.get("content-type");

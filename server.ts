@@ -46,8 +46,9 @@ function getCookieOptions(req: express.Request | any, maxAge: number = 30 * 60 *
 
   // Auto-escalate or de-escalate based on actual protocol to prevent authentication lockouts
   if (isHttps) {
-    sameSite = "none";
-    secure = true;
+    if (sameSite === "none") {
+      secure = true;
+    }
   } else {
     // Plain HTTP local development/testing fallback
     secure = false;
@@ -70,8 +71,9 @@ function getCsrfCookieOptions(req: express.Request | any, maxAge: number = 30 * 
   let secure = sameSite === "none" ? true : (process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production");
 
   if (isHttps) {
-    sameSite = "none";
-    secure = true;
+    if (sameSite === "none") {
+      secure = true;
+    }
   } else {
     secure = false;
     sameSite = "lax";
@@ -949,8 +951,13 @@ app.post("/api/auth/login", authRateLimiter, async (req, res) => {
   const { username, password } = req.body;
   const user = db.users.find(u => u.username === username && u.isActive);
 
-  if (!user || !verifyPassword(password, user.passwordHash)) {
-    appendSecurityLog(username || "unknown", "viewer", "LOGIN_FAILED", "USER_AUTH", `Failed login attempt with username: ${username}`, req.ip);
+  if (!user) {
+    appendSecurityLog(username || "unknown", "viewer", "LOGIN_FAILED_USER_NOT_FOUND", "USER_AUTH", `Failed login attempt: User not found or inactive. Username: ${username}`, req.ip);
+    return res.status(401).json({ error: "Invalid username or password. Please use correct credentials." });
+  }
+
+  if (!verifyPassword(password, user.passwordHash)) {
+    appendSecurityLog(username, user.role, "LOGIN_FAILED_PASSWORD_MISMATCH", "USER_AUTH", `Failed login attempt: Password mismatch for user: ${username}`, req.ip);
     return res.status(401).json({ error: "Invalid username or password. Please use correct credentials." });
   }
 
