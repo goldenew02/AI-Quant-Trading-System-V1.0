@@ -1477,7 +1477,7 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
   res.json({ success: true, bot: bots[botIndex] });
 });
 
-app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), (req: any, res) => {
+app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), async (req: any, res) => {
   const { id } = req.params;
   const botIndex = bots.findIndex((b) => b.id === id);
   if (botIndex !== -1) {
@@ -1486,6 +1486,27 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), (req: any, r
     }
     const bot = bots[botIndex];
     if (bot.executionMode === "live") {
+      if (process.env.LIVE_TRADING_ENABLED !== "true") {
+        return res.status(400).json({ error: "Live trading is globally disabled in this environment. Set LIVE_TRADING_ENABLED=true in server configuration to unlock." });
+      }
+
+      const { actionToken } = req.body;
+      if (!actionToken) {
+        return res.status(400).json({ error: "MFA authentication is required to start a live trading bot. Please provide an MFA action token." });
+      }
+
+      const isMfaValid = await consumeMfaTokenAsync(
+        actionToken,
+        req.user.username,
+        req.signedCookies.sid,
+        "START_LIVE_BOT",
+        { botId: id, executionMode: "live" }
+      );
+
+      if (!isMfaValid) {
+        return res.status(400).json({ error: "Invalid, expired or tampered MFA action token. Live bot activation rejected." });
+      }
+
       const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
       if (!realAcc) {
         return res.status(400).json({ error: `无法启动实盘机器人: 未检测到关联并解密的 [${bot.broker}] 真实券商账户密钥。请前往券商密钥模块配置后再试。` });

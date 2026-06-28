@@ -42,6 +42,12 @@ export default function App() {
   const [ibMode, setIbMode] = useState<"gateway" | "web_api_proxy">("web_api_proxy");
   const [ibStatus, setIbStatus] = useState<{ connected: boolean; username?: string; error?: string } | null>(null);
 
+  // Live Bot Startup MFA prompt state variables
+  const [showLiveBotMfaModal, setShowLiveBotMfaModal] = useState(false);
+  const [mfaTargetBotId, setMfaTargetBotId] = useState<string | null>(null);
+  const [liveBotMfaCode, setLiveBotMfaCode] = useState("");
+  const [liveBotMfaError, setLiveBotMfaError] = useState("");
+
   // Secure HttpOnly session states
   const [username, setUsername] = useState<string | null>(localStorage.getItem("aegis_username"));
   const [role, setRole] = useState<'admin' | 'operator' | 'viewer' | null>(localStorage.getItem("aegis_role") as any);
@@ -179,22 +185,91 @@ export default function App() {
     return () => clearInterval(interval);
   }, [username]);
 
-  const handleStartBot = async (id: string) => {
+  const handleStartBot = async (id: string, actionToken?: string) => {
+    // Find target bot to see if it's run in live execution mode
+    const targetBot = bots.find(b => b.id === id);
+    if (targetBot && targetBot.executionMode === "live" && !actionToken) {
+      setMfaTargetBotId(id);
+      setLiveBotMfaCode("");
+      setLiveBotMfaError("");
+      setShowLiveBotMfaModal(true);
+      return;
+    }
+
     try {
-      const res = await secureFetch(`/api/bots/start/${id}`, { method: "POST" });
+      const options: RequestInit = { method: "POST" };
+      if (actionToken) {
+        options.headers = { "Content-Type": "application/json" };
+        options.body = JSON.stringify({ actionToken });
+      }
+      const res = await secureFetch(`/api/bots/start/${id}`, options);
       if (res.ok) {
         fetchBots();
+        setShowLiveBotMfaModal(false);
       } else {
         const contentType = res.headers.get("content-type");
         if (contentType && contentType.includes("application/json")) {
           const data = await res.json();
-          alert(data.error || "无法启动网格机器人交易对。");
+          const errMsg = data.error || "无法启动网格机器人交易对。";
+          if (actionToken) {
+            setLiveBotMfaError(errMsg);
+          } else {
+            alert(errMsg);
+          }
         } else {
-          alert("无法启动网格机器人交易对。");
+          const fallbackMsg = "无法启动网格机器人交易对。";
+          if (actionToken) {
+            setLiveBotMfaError(fallbackMsg);
+          } else {
+            alert(fallbackMsg);
+          }
         }
       }
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleConfirmLiveBotMfa = async () => {
+    if (!mfaTargetBotId) return;
+    setLiveBotMfaError("");
+    try {
+      // Cryptographically bind payload: { botId: id, executionMode: "live" }
+      const payload = {
+        botId: mfaTargetBotId,
+        executionMode: "live"
+      };
+      
+      const stableStringify = (obj: any) => JSON.stringify(obj, Object.keys(obj).sort());
+      const payloadStr = stableStringify(payload);
+      
+      const encoder = new TextEncoder();
+      const data = encoder.encode(payloadStr);
+      const hashBuffer = await window.crypto.subtle.digest("SHA-256", data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const payloadHash = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+
+      // Step 1: Verify TOTP and obtain the transient action token
+      const res = await secureFetch("/api/auth/verify-totp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          code: liveBotMfaCode,
+          action: "START_LIVE_BOT",
+          bodyHash: payloadHash
+        })
+      });
+
+      const resData = await res.json();
+      if (!res.ok || !resData.success) {
+        setLiveBotMfaError(resData.error || "MFA 动态验证码校验失败。");
+        return;
+      }
+
+      // Step 2: Proceed with the startup
+      await handleStartBot(mfaTargetBotId, resData.actionToken);
+    } catch (err: any) {
+      setLiveBotMfaError(err.message || "MFA 校验过程中发生未知异常。");
     }
   };
 
@@ -714,6 +789,74 @@ export default function App() {
           </span>
         </div>
       </footer>
+
+      {/* Live Trading Bot Startup MFA Dialog (P1-3 / P1-5) */}
+      {showLiveBotMfaModal && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center z-50 p-4">
+          <div className="bg-[#0D0D0E] border-2 border-amber-500/80 max-w-md w-full p-6 font-mono text-xs shadow-2xl relative">
+            <h3 className="text-amber-500 font-black text-[11px] uppercase tracking-wider border-b border-[#2A2A2C] pb-3 mb-4 flex items-center gap-2">
+              <span className="animate-ping inline-block h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
+              TACTICAL REAL-TIME LIVE ACTIVATION DEVIATION (实盘安全审计)
+            </h3>
+            
+            <p className="text-[#AAAAAA] uppercase leading-relaxed mb-4">
+              WARNING: You are about to authorize and activate a real money Live-Trading Bot on active exchanges. This action triggers direct financial exposure.
+            </p>
+
+            <div className="bg-[#141416] border border-[#2A2A2C] p-3 mb-4 rounded-none">
+              <p className="text-[#666666] font-bold text-[9px] uppercase tracking-wider mb-1">BOUND PAYLOAD DETAILS</p>
+              <div className="grid grid-cols-2 gap-y-1 text-[#CCCCCC] text-[10px]">
+                <span>BOT IDENTIFIER:</span>
+                <span className="text-amber-400 font-bold">ENG-{mfaTargetBotId?.toUpperCase()}</span>
+                <span>EXECUTION MODE:</span>
+                <span className="text-amber-400 font-bold">LIVE (实盘交易)</span>
+                <span>SECURITY PROTOCOL:</span>
+                <span className="text-zinc-500 font-bold">START_LIVE_BOT</span>
+              </div>
+            </div>
+
+            {liveBotMfaError && (
+              <div className="bg-[#2D1414] border border-[#CC3333] text-[#FF5555] p-3 mb-4 rounded-none text-[10px] uppercase font-bold tracking-tight">
+                CRITICAL WARNING: {liveBotMfaError}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <label className="block text-[10px] font-bold text-[#888888] uppercase tracking-wider">
+                ENTER 6-DIGIT GOOGLE AUTHENTICATOR CODE:
+              </label>
+              <input
+                type="text"
+                maxLength={6}
+                value={liveBotMfaCode}
+                onChange={(e) => setLiveBotMfaCode(e.target.value.replace(/\D/g, ""))}
+                placeholder="000000"
+                className="w-full bg-[#141416] border border-[#2A2A2C] text-white py-2.5 px-3 text-center text-lg tracking-widest focus:outline-none focus:border-amber-500 rounded-none placeholder-zinc-700"
+                id="live-bot-mfa-input"
+              />
+            </div>
+
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={() => {
+                  setShowLiveBotMfaModal(false);
+                  setMfaTargetBotId(null);
+                }}
+                className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-white font-bold py-2 px-3 uppercase tracking-wider text-[10px] rounded-none transition cursor-pointer"
+              >
+                ABORT DEVIATION
+              </button>
+              <button
+                onClick={handleConfirmLiveBotMfa}
+                disabled={liveBotMfaCode.length !== 6}
+                className="flex-1 bg-amber-500 hover:bg-amber-600 disabled:bg-amber-800/20 disabled:text-zinc-600 text-black font-black py-2 px-3 uppercase tracking-wider text-[10px] rounded-none transition cursor-pointer flex items-center justify-center gap-1.5"
+              >
+                AUTHORIZE SIGNATURE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

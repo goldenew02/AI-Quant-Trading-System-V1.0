@@ -71,6 +71,11 @@ async function main() {
   console.log(`- Password Hash: Updated to match BOOTSTRAP_ADMIN_PASSWORD`);
   console.log(`- Invalidated Sessions: ${invalidatedSessionCount} session(s) cleared`);
   console.log(`- Audit Log: Recorded secure entry under ADMIN_PASSWORD_RESET_CLI.`);
+  console.log(`\n[IMPORTANT RUNTIME SYNC NOTE]`);
+  console.log(`Because the Node.js development server runs as a separate persistent`);
+  console.log(`process with in-memory session caching, you MUST RESTART the development`);
+  console.log(`server for these changes to take effect immediately in the running app!`);
+  console.log(`Please run 'Restart Dev Server' or reload the container now.`);
   console.log(`==================================================================`);
 }
 
