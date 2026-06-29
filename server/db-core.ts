@@ -20,91 +20,6 @@ async function checkSqliteSupport(): Promise<boolean> {
   return isSqliteSupported;
 }
 
-// --- ENVIRONMENT INITIALIZATION & FAIL-FAST VALIDATION ---
-const envPath = path.join(process.cwd(), ".env");
-const isProd = process.env.NODE_ENV === "production";
-
-if (!fs.existsSync(envPath) && !isProd) {
-  // Development only: dynamically bootstrap a highly secure .env with strong random secrets
-  const adminUser = "admin";
-  const adminPass = "Aegis_" + crypto.randomBytes(6).toString("hex") + "!";
-  const encKey = crypto.randomBytes(32).toString("base64");
-  const sessSec = crypto.randomBytes(32).toString("base64");
-
-  const envContent = `# AegisQuant Secure Local Environment Configuration
-BOOTSTRAP_ADMIN_USER=${adminUser}
-BOOTSTRAP_ADMIN_PASSWORD=${adminPass}
-ADMIN_PASSWORD_SYNC_ON_BOOT=false
-ADMIN_TOTP_SYNC_ON_BOOT=false
-ENCRYPTION_KEY=${encKey}
-SESSION_SECRET=${sessSec}
-TOTP_WINDOW_STEPS=1
-NODE_ENV=development
-APP_URL=http://localhost:3000
-COOKIE_SAMESITE=lax
-COOKIE_SECURE=false
-`;
-  fs.writeFileSync(envPath, envContent, "utf-8");
-  console.log("==================================================================");
-  console.log("  SECURE BOOTSTRAP: Created fresh local .env with random secrets. ");
-  console.log("  Administrator Account Initialized:                             ");
-  console.log(`  User: ${adminUser}                                             `);
-  if (process.env.ALLOW_BOOTSTRAP_PASSWORD_LOG === "true") {
-    console.log(`  Password: ${adminPass}                                         `);
-  } else {
-    console.log("  Password generated and written to local .env. Open .env locally to retrieve it.");
-  }
-  console.log("  TOTP MFA Setup will be forced upon first login.                 ");
-  console.log("==================================================================");
-}
-
-// Load environment variables (override is false, so platform Secrets take absolute precedence)
-import dotenv from "dotenv";
-dotenv.config({ override: false });
-
-// Fail-fast verification of required secrets as demanded by P0-1
-const requiredEnvVars = [
-  "BOOTSTRAP_ADMIN_USER",
-  "BOOTSTRAP_ADMIN_PASSWORD",
-  "ENCRYPTION_KEY",
-  "SESSION_SECRET"
-];
-
-for (const key of requiredEnvVars) {
-  if (!process.env[key]) {
-    console.error(`FATAL: Missing critical security environment variable: ${key}`);
-    process.exit(1);
-  }
-}
-
-// Validate SESSION_SECRET size (at least 32 bytes in production, or fallback in dev)
-const SESSION_SECRET = process.env.SESSION_SECRET || "";
-if (process.env.NODE_ENV === "production" && (!SESSION_SECRET || Buffer.from(SESSION_SECRET).length < 32)) {
-  console.error("FATAL: SESSION_SECRET must be at least 32 bytes long in production!");
-  process.exit(1);
-}
-
-// Validate APP_URL is not default placeholder in production
-if (process.env.NODE_ENV === "production" && (!process.env.APP_URL || process.env.APP_URL === "MY_APP_URL" || process.env.APP_URL === "")) {
-  console.error("FATAL: APP_URL must be configured and cannot be 'MY_APP_URL' in production!");
-  console.error("APP_URL is still MY_APP_URL. For local testing use NODE_ENV=development and APP_URL=http://localhost:3000.");
-  process.exit(1);
-}
-
-// Validate ENCRYPTION_KEY format (must be 32 bytes when base64 decoded)
-const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY!;
-let decodedEncryptionKey: Buffer;
-try {
-  decodedEncryptionKey = Buffer.from(ENCRYPTION_KEY_RAW, "base64");
-} catch (err) {
-  console.error("FATAL: ENCRYPTION_KEY must be a valid base64 encoded string.");
-  process.exit(1);
-}
-if (decodedEncryptionKey.length !== 32) {
-  console.error(`FATAL: ENCRYPTION_KEY must decode to exactly 32 bytes (got ${decodedEncryptionKey.length} bytes).`);
-  process.exit(1);
-}
-
 export interface DBUser {
   username: string;
   passwordHash: string;
@@ -256,13 +171,19 @@ export function verifyPassword(password: string, stored: string): boolean {
   }
 }
 
+function getDecodedEncryptionKey(): Buffer {
+  const raw = process.env.ENCRYPTION_KEY;
+  if (!raw) throw new Error("ENCRYPTION_KEY environment variable is not defined");
+  return Buffer.from(raw, "base64");
+}
+
 // AES-256-GCM Secure Encryption complying with P0-3
 // Format: v1:k1:iv:ciphertext:authTag (No fallbacks or silent plaintext degradation)
 export function encryptSecret(plainText: string): string {
   try {
     const iv = crypto.randomBytes(12);
     // Use decoded 32-byte encryption key
-    const cipher = crypto.createCipheriv("aes-256-gcm", decodedEncryptionKey, iv);
+    const cipher = crypto.createCipheriv("aes-256-gcm", getDecodedEncryptionKey(), iv);
     let encrypted = cipher.update(plainText, "utf8", "hex");
     encrypted += cipher.final("hex");
     const authTag = cipher.getAuthTag().toString("hex");
@@ -286,7 +207,7 @@ export function decryptSecret(encryptedText: string): string {
     const iv = Buffer.from(ivHex, "hex");
     const authTag = Buffer.from(authTagHex, "hex");
     
-    const decipher = crypto.createDecipheriv("aes-256-gcm", decodedEncryptionKey, iv);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", getDecodedEncryptionKey(), iv);
     decipher.setAuthTag(authTag);
     let decrypted = decipher.update(encryptedHex, "hex", "utf8");
     decrypted += decipher.final("utf8");
@@ -418,74 +339,76 @@ export class AegisDB {
     }
     if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
 
-    // Synchronize admin password and TOTP secret with process.env to prevent out-of-sync credential lockouts
-    const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
-    const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-    const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
+    if (this.autoBootstrapEnv) {
+      // Synchronize admin password and TOTP secret with process.env to prevent out-of-sync credential lockouts
+      const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
+      const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+      const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
 
-    // Safety switches for synchronizing credentials on boot
-    const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
-    const syncTotpOnBoot = process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
+      // Safety switches for synchronizing credentials on boot
+      const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
+      const syncTotpOnBoot = process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
 
-    if (seedUser && seedPass) {
-      let adminUser = this.data.users.find(u => u.username === seedUser);
-      let needsSave = false;
-      if (!adminUser) {
-        adminUser = {
-          username: seedUser,
-          passwordHash: hashPassword(seedPass),
-          role: "admin",
-          totpSecret: (seedTotp && syncTotpOnBoot) ? encryptSecret(seedTotp) : null,
-          isActive: true,
-          mustEnrollTotp: (seedTotp && syncTotpOnBoot) ? false : true
-        };
-        this.data.users.push(adminUser);
-        needsSave = true;
-        this.appendSecurityLog(
-          "system",
-          "admin",
-          "ADMIN_BOOTSTRAP_CREATE",
-          seedUser,
-          "Administrator account initialized from environment config during system boot."
-        );
-      } else {
-        if (syncPasswordOnBoot && !verifyPassword(seedPass, adminUser.passwordHash)) {
-          adminUser.passwordHash = hashPassword(seedPass);
-          adminUser.passwordVersion = (adminUser.passwordVersion || 1) + 1;
+      if (seedUser && seedPass) {
+        let adminUser = this.data.users.find(u => u.username === seedUser);
+        let needsSave = false;
+        if (!adminUser) {
+          adminUser = {
+            username: seedUser,
+            passwordHash: hashPassword(seedPass),
+            role: "admin",
+            totpSecret: (seedTotp && syncTotpOnBoot) ? encryptSecret(seedTotp) : null,
+            isActive: true,
+            mustEnrollTotp: (seedTotp && syncTotpOnBoot) ? false : true
+          };
+          this.data.users.push(adminUser);
           needsSave = true;
           this.appendSecurityLog(
             "system",
             "admin",
-            "ADMIN_PASSWORD_ENV_SYNC",
+            "ADMIN_BOOTSTRAP_CREATE",
             seedUser,
-            "Administrator password synchronized from environment config during system boot."
+            "Administrator account initialized from environment config during system boot."
           );
-        }
-        if (seedTotp && syncTotpOnBoot) {
-          let currentTotp: string | null = null;
-          if (adminUser.totpSecret) {
-            try {
-              currentTotp = decryptSecret(adminUser.totpSecret);
-            } catch (e) {
-              // Decryption fail, overwrite below
-            }
-          }
-          if (currentTotp !== seedTotp || adminUser.mustEnrollTotp) {
-            adminUser.totpSecret = encryptSecret(seedTotp);
-            adminUser.mustEnrollTotp = false;
+        } else {
+          if (syncPasswordOnBoot && !verifyPassword(seedPass, adminUser.passwordHash)) {
+            adminUser.passwordHash = hashPassword(seedPass);
+            adminUser.passwordVersion = (adminUser.passwordVersion || 1) + 1;
             needsSave = true;
             this.appendSecurityLog(
               "system",
               "admin",
-              "ADMIN_TOTP_ENV_SYNC",
+              "ADMIN_PASSWORD_ENV_SYNC",
               seedUser,
-              "Administrator TOTP secret synchronized from environment config during system boot."
+              "Administrator password synchronized from environment config during system boot."
             );
           }
+          if (seedTotp && syncTotpOnBoot) {
+            let currentTotp: string | null = null;
+            if (adminUser.totpSecret) {
+              try {
+                currentTotp = decryptSecret(adminUser.totpSecret);
+              } catch (e) {
+                // Decryption fail, overwrite below
+              }
+            }
+            if (currentTotp !== seedTotp || adminUser.mustEnrollTotp) {
+              adminUser.totpSecret = encryptSecret(seedTotp);
+              adminUser.mustEnrollTotp = false;
+              needsSave = true;
+              this.appendSecurityLog(
+                "system",
+                "admin",
+                "ADMIN_TOTP_ENV_SYNC",
+                seedUser,
+                "Administrator TOTP secret synchronized from environment config during system boot."
+              );
+            }
+          }
         }
-      }
-      if (needsSave) {
-        this.save();
+        if (needsSave) {
+          this.save();
+        }
       }
     }
   }
@@ -1155,56 +1078,56 @@ export class AegisDB {
     "REJECTED": []
   };
 
-  public updateOrderState(clientOrderId: string, updates: Partial<Order>) {
-    const ord = this.data.orders.find((o: Order) => o.clientOrderId === clientOrderId);
-    if (ord) {
-      Object.assign(ord, updates);
-      ord.updatedAt = new Date().toISOString();
-      if (this.sqliteDbConn) {
-        this.sqliteDbConn.run(
-          "UPDATE orders SET status = ?, brokerOrderId = ?, lastError = ?, updatedAt = ?, cancelRetryCount = ?, cancelRequestedAt = ?, lastBrokerStatus = ?, manualReviewRequired = ? WHERE clientOrderId = ?",
-          [ord.status, ord.brokerOrderId || null, ord.lastError || null, ord.updatedAt, ord.cancelRetryCount || 0, ord.cancelRequestedAt || null, ord.lastBrokerStatus || null, ord.manualReviewRequired ? 1 : 0, clientOrderId],
-          (err: any) => {
-            if (err) console.error("[DB-SQLite] Failed to update order state:", err);
-            else this.save();
-          }
-        );
-      } else {
-        this.save();
-      }
+  private assertOrderTransition(from: string, to: string, clientOrderId: string, bypassTransition: boolean = false): boolean {
+    if (bypassTransition) return true;
+    const allowedTransitions = this.ORDER_TRANSITIONS[from] || [];
+    if (!allowedTransitions.includes(to) && from !== to) {
+      console.error(`[ORDER STATE MACHINE ERROR] Invalid transition ${from} -> ${to} for order ${clientOrderId}`);
+      this.appendSecurityLog("system", "admin", "ORDER_STATE_MACHINE_VIOLATION", clientOrderId, `Attempted invalid transition from ${from} to ${to}`);
+      return false;
     }
+    return true;
+  }
+
+  public updateOrderState(clientOrderId: string, updates: Partial<Order> & { bypassTransition?: boolean }): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const ord = this.data.orders.find((o: Order) => o.clientOrderId === clientOrderId);
+      if (ord) {
+        if (updates.status && updates.status !== ord.status) {
+          if (!this.assertOrderTransition(ord.status, updates.status, clientOrderId, updates.bypassTransition)) {
+            return reject(new Error("Invalid state transition"));
+          }
+        }
+        
+        Object.assign(ord, updates);
+        delete (ord as any).bypassTransition;
+        ord.updatedAt = new Date().toISOString();
+        if (this.sqliteDbConn) {
+          this.sqliteDbConn.run(
+            "UPDATE orders SET status = ?, brokerOrderId = ?, lastError = ?, updatedAt = ?, cancelRetryCount = ?, cancelRequestedAt = ?, lastBrokerStatus = ?, manualReviewRequired = ? WHERE clientOrderId = ?",
+            [ord.status, ord.brokerOrderId || null, ord.lastError || null, ord.updatedAt, ord.cancelRetryCount || 0, ord.cancelRequestedAt || null, ord.lastBrokerStatus || null, ord.manualReviewRequired ? 1 : 0, clientOrderId],
+            (err: any) => {
+              if (err) {
+                console.error("[DB-SQLite] Failed to update order state:", err);
+                reject(err);
+              } else {
+                this.save();
+                resolve();
+              }
+            }
+          );
+        } else {
+          this.save();
+          resolve();
+        }
+      } else {
+        resolve();
+      }
+    });
   }
 
   public updateOrderStatus(clientOrderId: string, status: Order["status"], brokerOrderId?: string, lastError?: string) {
-    const ord = this.data.orders.find(o => o.clientOrderId === clientOrderId);
-    if (ord) {
-      const allowedTransitions = this.ORDER_TRANSITIONS[ord.status] || [];
-      if (!allowedTransitions.includes(status) && ord.status !== status) {
-        console.error(`[ORDER STATE MACHINE ERROR] Invalid transition ${ord.status} -> ${status} for order ${clientOrderId}`);
-        this.appendSecurityLog("system", "admin", "ORDER_STATE_MACHINE_VIOLATION", clientOrderId, `Attempted invalid transition from ${ord.status} to ${status}`);
-        return;
-      }
-      
-      ord.status = status;
-      if (brokerOrderId) ord.brokerOrderId = brokerOrderId;
-      if (lastError) ord.lastError = lastError;
-      ord.updatedAt = new Date().toISOString();
-
-      if (this.sqliteDbConn) {
-        this.sqliteDbConn.run(
-          "UPDATE orders SET status = ?, brokerOrderId = COALESCE(?, brokerOrderId), lastError = COALESCE(?, lastError), updatedAt = ? WHERE clientOrderId = ?",
-          [status, brokerOrderId || null, lastError || null, ord.updatedAt, clientOrderId],
-          (err) => {
-            if (err) {
-              console.error("[DB-SQLite] Failed to update order status:", err);
-            }
-            this.save();
-          }
-        );
-      } else {
-        this.save();
-      }
-    }
+    this.updateOrderState(clientOrderId, { status, brokerOrderId, lastError }).catch(() => {});
   }
 
   public insertFill(fill: Fill): Promise<boolean> {
@@ -1248,7 +1171,7 @@ export class AegisDB {
     });
   }
 
-  public async recordExecutionTransaction(params: {
+  public async recordExecutionUpdateSequentially(params: {
     orderId: string;
     clientOrderId: string;
     nextStatus: string;

@@ -803,7 +803,7 @@ async function recordBrokerExecutionUpdate(ord: Order, updatedOrder: OrderStatus
     };
   }
 
-  await dbInstance.recordExecutionTransaction({
+  await dbInstance.recordExecutionUpdateSequentially({
     orderId: ord.id,
     clientOrderId: ord.clientOrderId,
     nextStatus: updatedOrder.status,
@@ -843,6 +843,17 @@ setInterval(async () => {
         }
       } catch (decryptErr) {
         console.error(`[ORDER POLLING DECRYPTION ERROR] Failed to decrypt keys for account ${realAcc.id}:`, decryptErr);
+        continue;
+      }
+
+      if (ord.status === "CANCEL_REQUESTED" && !ord.brokerOrderId) {
+        dbInstance.updateOrderState(ord.clientOrderId, {
+          status: "CANCEL_FAILED",
+          manualReviewRequired: true,
+          lastError: "Missing brokerOrderId; cannot query/cancel by broker order id",
+          cancelRetryCount: (ord.cancelRetryCount || 0) + 1,
+          bypassTransition: true
+        });
         continue;
       }
 
@@ -1805,18 +1816,35 @@ async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport
     try {
       if (!ord.brokerOrderId) {
         console.log(`[ORDER CANCEL] Order ${ord.clientOrderId} has no brokerOrderId, marking CANCEL_REQUESTED`);
-        dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_REQUESTED", undefined, "Cancellation requested; awaiting broker confirmation.");
+        await dbInstance.updateOrderState(ord.clientOrderId, { 
+          status: "CANCEL_REQUESTED", 
+          lastError: "Cancellation requested; awaiting broker confirmation.",
+          cancelRequestedAt: new Date().toISOString(),
+          cancelRetryCount: 0
+        });
         report.skipped.push({ clientOrderId: ord.clientOrderId, reason: "No broker order ID" });
         continue;
       }
 
       console.log(`[ORDER CANCEL] Canceling order ${ord.brokerOrderId} for bot ${botId}`);
       await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
-      dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", ord.brokerOrderId, "Canceled due to bot stop/kill switch");
+      await dbInstance.updateOrderState(ord.clientOrderId, { 
+        status: "CANCELED", 
+        brokerOrderId: ord.brokerOrderId, 
+        lastError: "Canceled due to bot stop/kill switch",
+        cancelRequestedAt: new Date().toISOString(),
+        cancelRetryCount: 1
+      });
       report.canceled++;
     } catch (err: any) {
       console.error(`[ORDER CANCEL FAILED] Failed to cancel order ${ord.clientOrderId} for bot ${botId}: ${err.message}`);
-      dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_FAILED", ord.brokerOrderId, err.message);
+      await dbInstance.updateOrderState(ord.clientOrderId, {
+        status: "CANCEL_FAILED", 
+        brokerOrderId: ord.brokerOrderId, 
+        lastError: err.message,
+        cancelRequestedAt: new Date().toISOString(),
+        cancelRetryCount: 1
+      });
       report.failed.push({ clientOrderId: ord.clientOrderId, brokerOrderId: ord.brokerOrderId, reason: err.message });
     }
   }

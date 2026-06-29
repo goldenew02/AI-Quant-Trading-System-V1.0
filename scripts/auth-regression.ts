@@ -1,34 +1,38 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
 import { hashPassword, verifyPassword, encryptSecret, decryptSecret } from "../server/db-core";
+
+function statOrNull(filepath: string) {
+  try {
+    return fs.statSync(filepath).mtimeMs;
+  } catch (e) {
+    return null;
+  }
+}
 
 async function runTests() {
   console.log("Running Auth Regression Tests (with real DB instance)...");
   let passed = 0;
   let failed = 0;
 
+  const rootEnvPath = path.join(process.cwd(), ".env");
+  const rootDataPath = path.join(process.cwd(), "data");
+  const rootEnvBefore = statOrNull(rootEnvPath);
+  const rootDataBefore = statOrNull(rootDataPath);
+
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aegis-auth-reg-"));
   process.env.DB_DIR = tempDir;
+  process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
+
+  const randPass = crypto.randomBytes(16).toString("hex");
+  const randTotp = crypto.randomBytes(16).toString("base64");
 
   try {
     // Stage 1: Initialize existing DB state manually to simulate an older deployment
-    const dbFile = path.join(tempDir, "aegis.db");
-    
-    // Original credentials that the user set via UI and wants to KEEP
-    const originalPasswordHash = hashPassword("UserCustomPassword123!");
-    const originalTotpSecretEncrypted = encryptSecret("ORIGINAL_TOTP_SECRET_123");
-    
-    const mockInitialData = {
-      users: [{
-        username: "admin",
-        passwordHash: originalPasswordHash,
-        role: "admin",
-        totpSecret: originalTotpSecretEncrypted,
-        isActive: true,
-        mustEnrollTotp: false
-      }]
-    };
+    const originalPasswordHash = hashPassword(randPass);
+    const originalTotpSecretEncrypted = encryptSecret(randTotp);
     
     // We create a dummy DB instance just to write this initial state to disk
     const { AegisDB } = await import("../server/db-core");
@@ -47,9 +51,11 @@ async function runTests() {
     console.log("Stage 1: Seeded existing database with custom user credentials.");
 
     // Stage 2: Boot system with different env credentials, but SYNC_ON_BOOT = false
+    const newRandPass = crypto.randomBytes(16).toString("hex");
+    const newRandTotp = crypto.randomBytes(16).toString("base64");
     process.env.BOOTSTRAP_ADMIN_USER = "admin";
-    process.env.BOOTSTRAP_ADMIN_PASSWORD = "EnvPasswordThatShouldBeIgnored";
-    process.env.BOOTSTRAP_ADMIN_TOTP_SECRET = "ENV_TOTP_THAT_SHOULD_BE_IGNORED";
+    process.env.BOOTSTRAP_ADMIN_PASSWORD = newRandPass;
+    process.env.BOOTSTRAP_ADMIN_TOTP_SECRET = newRandTotp;
     process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "false";
     process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
 
@@ -92,7 +98,7 @@ async function runTests() {
 
     adminUser = testDb2.get().users.find(u => u.username === "admin");
 
-    if (adminUser?.passwordHash !== originalPasswordHash && verifyPassword("EnvPasswordThatShouldBeIgnored", adminUser?.passwordHash || "")) {
+    if (adminUser?.passwordHash !== originalPasswordHash && verifyPassword(newRandPass, adminUser?.passwordHash || "")) {
       console.log("✅ Test 4 Passed: passwordHash overwritten when SYNC_ON_BOOT=true");
       passed++;
     } else {
@@ -100,7 +106,7 @@ async function runTests() {
       failed++;
     }
 
-    if (adminUser?.totpSecret !== originalTotpSecretEncrypted && decryptSecret(adminUser?.totpSecret || "") === "ENV_TOTP_THAT_SHOULD_BE_IGNORED") {
+    if (adminUser?.totpSecret !== originalTotpSecretEncrypted && decryptSecret(adminUser?.totpSecret || "") === newRandTotp) {
       console.log("✅ Test 5 Passed: totpSecret overwritten when SYNC_ON_BOOT=true");
       passed++;
     } else {
@@ -116,6 +122,26 @@ async function runTests() {
       failed++;
     }
     
+    // Stage 4: Assert root files unchanged
+    const rootEnvAfter = statOrNull(rootEnvPath);
+    const rootDataAfter = statOrNull(rootDataPath);
+    
+    if (rootEnvBefore === rootEnvAfter) {
+      console.log("✅ Test 7 Passed: Root .env unchanged");
+      passed++;
+    } else {
+      console.error("❌ Test 7 Failed: Root .env was modified!");
+      failed++;
+    }
+
+    if (rootDataBefore === rootDataAfter) {
+      console.log("✅ Test 8 Passed: Root data/ unchanged");
+      passed++;
+    } else {
+      console.error("❌ Test 8 Failed: Root data/ was modified!");
+      failed++;
+    }
+
   } catch (err) {
     console.error("Exception during tests:", err);
     failed++;
