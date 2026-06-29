@@ -2,13 +2,31 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
-import { hashPassword, verifyPassword, encryptSecret, decryptSecret } from "../server/db-core";
 
-function statOrNull(filepath: string) {
+function hashFile(filepath: string): string {
   try {
-    return fs.statSync(filepath).mtimeMs;
-  } catch (e) {
-    return null;
+    return crypto.createHash("sha256").update(fs.readFileSync(filepath)).digest("hex");
+  } catch {
+    return "missing";
+  }
+}
+
+function fingerprintTree(dirPath: string): string {
+  try {
+    const files = fs.readdirSync(dirPath, { withFileTypes: true });
+    let content = "";
+    for (const f of files.sort((a, b) => a.name.localeCompare(b.name))) {
+      const fullPath = path.join(dirPath, f.name);
+      if (f.isDirectory()) {
+        content += fingerprintTree(fullPath);
+      } else {
+        const stat = fs.statSync(fullPath);
+        content += `${f.name}|${stat.size}|${hashFile(fullPath)}\n`;
+      }
+    }
+    return crypto.createHash("sha256").update(content).digest("hex");
+  } catch {
+    return "missing_dir";
   }
 }
 
@@ -17,14 +35,19 @@ async function runTests() {
   let passed = 0;
   let failed = 0;
 
-  const rootEnvPath = path.join(process.cwd(), ".env");
-  const rootDataPath = path.join(process.cwd(), "data");
-  const rootEnvBefore = statOrNull(rootEnvPath);
-  const rootDataBefore = statOrNull(rootDataPath);
-
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aegis-auth-reg-"));
   process.env.DB_DIR = tempDir;
-  process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
+  
+  const testEncryptionKey = crypto.randomBytes(32);
+  delete process.env.ENCRYPTION_KEY;
+
+  const { AegisDB, setEncryptionKey, encryptSecret, hashPassword, verifyPassword, decryptSecret } = await import("../server/db-core");
+  setEncryptionKey(testEncryptionKey);
+
+  const rootEnvPath = path.join(process.cwd(), ".env");
+  const rootDataPath = path.join(process.cwd(), "data");
+  const rootEnvBefore = hashFile(rootEnvPath);
+  const rootDataBefore = fingerprintTree(rootDataPath);
 
   const randPass = crypto.randomBytes(16).toString("hex");
   const randTotp = crypto.randomBytes(16).toString("base64");
@@ -35,18 +58,20 @@ async function runTests() {
     const originalTotpSecretEncrypted = encryptSecret(randTotp);
     
     // We create a dummy DB instance just to write this initial state to disk
-    const { AegisDB } = await import("../server/db-core");
-    const initialDb = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: false });
+    const initialDb = new AegisDB({ 
+      dbDir: tempDir, 
+      autoBootstrapEnv: false,
+      encryptionKey: testEncryptionKey,
+      seedUsers: [{
+        username: "admin",
+        passwordHash: originalPasswordHash,
+        role: "admin",
+        totpSecret: originalTotpSecretEncrypted,
+        isActive: true,
+        mustEnrollTotp: false
+      }]
+    });
     await initialDb.ready;
-    initialDb.get().users = [{
-      username: "admin",
-      passwordHash: originalPasswordHash,
-      role: "admin",
-      totpSecret: originalTotpSecretEncrypted,
-      isActive: true,
-      mustEnrollTotp: false
-    }];
-    initialDb.save();
 
     console.log("Stage 1: Seeded existing database with custom user credentials.");
 
@@ -59,7 +84,7 @@ async function runTests() {
     process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "false";
     process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
 
-    const testDb1 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true });
+    const testDb1 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true, encryptionKey: testEncryptionKey });
     await testDb1.ready;
     
     let adminUser = testDb1.get().users.find(u => u.username === "admin");
@@ -93,7 +118,7 @@ async function runTests() {
     process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "true";
     process.env.ADMIN_TOTP_SYNC_ON_BOOT = "true";
 
-    const testDb2 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true });
+    const testDb2 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true, encryptionKey: testEncryptionKey });
     await testDb2.ready;
 
     adminUser = testDb2.get().users.find(u => u.username === "admin");
@@ -123,8 +148,8 @@ async function runTests() {
     }
     
     // Stage 4: Assert root files unchanged
-    const rootEnvAfter = statOrNull(rootEnvPath);
-    const rootDataAfter = statOrNull(rootDataPath);
+    const rootEnvAfter = hashFile(rootEnvPath);
+    const rootDataAfter = fingerprintTree(rootDataPath);
     
     if (rootEnvBefore === rootEnvAfter) {
       console.log("✅ Test 7 Passed: Root .env unchanged");
@@ -139,6 +164,8 @@ async function runTests() {
       passed++;
     } else {
       console.error("❌ Test 8 Failed: Root data/ was modified!");
+      console.error("Before:", rootDataBefore);
+      console.error("After :", rootDataAfter);
       failed++;
     }
 

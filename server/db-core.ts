@@ -171,7 +171,15 @@ export function verifyPassword(password: string, stored: string): boolean {
   }
 }
 
+let _encryptionKey: Buffer | null = null;
+
+export function setEncryptionKey(key: Buffer) {
+  if (key.length !== 32) throw new Error("Encryption key must be exactly 32 bytes");
+  _encryptionKey = key;
+}
+
 function getDecodedEncryptionKey(): Buffer {
+  if (_encryptionKey) return _encryptionKey;
   const raw = process.env.ENCRYPTION_KEY;
   if (!raw) throw new Error("ENCRYPTION_KEY environment variable is not defined");
   return Buffer.from(raw, "base64");
@@ -260,9 +268,15 @@ export class AegisDB {
   private dbDir: string;
   private autoBootstrapEnv: boolean;
 
-  constructor(options?: { dbDir?: string; autoBootstrapEnv?: boolean }) {
+  private seedUsers: any[] | undefined;
+
+  constructor(options?: { dbDir?: string; autoBootstrapEnv?: boolean; seedUsers?: any[]; encryptionKey?: Buffer }) {
+    if (options?.encryptionKey) {
+      setEncryptionKey(options.encryptionKey);
+    }
     this.dbDir = options?.dbDir || path.join(process.cwd(), "data");
     this.autoBootstrapEnv = options?.autoBootstrapEnv ?? true;
+    this.seedUsers = options?.seedUsers;
     this.ready = this.initDatabaseAsync();
   }
 
@@ -415,19 +429,28 @@ export class AegisDB {
 
   private seedAndSave(sqliteDb: any, resolve: () => void, reject: (err: any) => void) {
     try {
-      const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
-      const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+      let initialUsers: any[] = [];
+      if (this.seedUsers) {
+        initialUsers = this.seedUsers;
+      } else if (this.autoBootstrapEnv) {
+        const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
+        const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+        if (seedUser && seedPass) {
+          initialUsers = [
+            {
+              username: seedUser,
+              passwordHash: hashPassword(seedPass),
+              role: "admin",
+              totpSecret: null,
+              isActive: true,
+              mustEnrollTotp: true
+            }
+          ];
+        }
+      }
+
       const seedData = {
-        users: [
-          {
-            username: seedUser,
-            passwordHash: hashPassword(seedPass),
-            role: "admin",
-            totpSecret: null,
-            isActive: true,
-            mustEnrollTotp: true
-          }
-        ],
+        users: initialUsers,
         sessions: [],
         bots: this.getSeedBots(),
         tradeLogs: this.getSeedTradeLogs(),
@@ -491,19 +514,28 @@ export class AegisDB {
         }
       }
       
-      const seedUser = process.env.BOOTSTRAP_ADMIN_USER!;
-      const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD!;
+      let initialUsers: any[] = [];
+      if (this.seedUsers) {
+        initialUsers = this.seedUsers;
+      } else if (this.autoBootstrapEnv) {
+        const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
+        const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+        if (seedUser && seedPass) {
+          initialUsers = [
+            {
+              username: seedUser,
+              passwordHash: hashPassword(seedPass),
+              role: "admin",
+              totpSecret: null,
+              isActive: true,
+              mustEnrollTotp: true
+            }
+          ];
+        }
+      }
+
       const seedData = {
-        users: [
-          {
-            username: seedUser,
-            passwordHash: hashPassword(seedPass),
-            role: "admin",
-            totpSecret: null,
-            isActive: true,
-            mustEnrollTotp: true
-          }
-        ],
+        users: initialUsers,
         sessions: [],
         bots: this.getSeedBots(),
         tradeLogs: this.getSeedTradeLogs(),
@@ -1126,8 +1158,8 @@ export class AegisDB {
     });
   }
 
-  public updateOrderStatus(clientOrderId: string, status: Order["status"], brokerOrderId?: string, lastError?: string) {
-    this.updateOrderState(clientOrderId, { status, brokerOrderId, lastError }).catch(() => {});
+  public async updateOrderStatus(clientOrderId: string, status: Order["status"], brokerOrderId?: string, lastError?: string): Promise<void> {
+    await this.updateOrderState(clientOrderId, { status, brokerOrderId, lastError });
   }
 
   public insertFill(fill: Fill): Promise<boolean> {
@@ -1220,7 +1252,7 @@ export class AegisDB {
     }
 
     // Update order status
-    this.updateOrderState(params.clientOrderId, { status: params.nextStatus as any, brokerOrderId: params.brokerOrderId });
+    await this.updateOrderState(params.clientOrderId, { status: params.nextStatus as any, brokerOrderId: params.brokerOrderId });
 
     // Update Bot
     if (bot) {
@@ -1511,9 +1543,9 @@ export class AegisDB {
             if (this.changes !== 1) {
               return reject(new Error("Pre-authorization double-use protection block triggered."));
             }
-            if (dbInstance.get().preauthSessions) {
-              dbInstance.get().preauthSessions = dbInstance.get().preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
-              dbInstance.save();
+            if (this.data.preauthSessions) {
+              this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+              this.save();
             }
             resolve();
           }

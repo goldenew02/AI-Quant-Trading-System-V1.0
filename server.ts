@@ -322,7 +322,7 @@ const lastKnownPrices: Record<string, number> = {
 };
 
 // Isolated step function for a single robot instance to prevent cascade crash (P0-7)
-function runIsolatedBotStep(bot: BotConfig) {
+async function runIsolatedBotStep(bot: BotConfig) {
   const currentPrice = lastKnownPrices[bot.symbol] || bot.currentPrice;
   // Drifts 0.15% max
   const driftPercent = (Math.random() - 0.49) * 0.003; 
@@ -381,7 +381,7 @@ function runIsolatedBotStep(bot: BotConfig) {
   }
 
   // Grid filling simulation matching
-  bot.grids.forEach((grid) => {
+  for (const grid of bot.grids) {
     const alreadyFilled = grid.filled;
     const isCrossed = (grid.type === "buy" && nextPrice <= grid.price) || (grid.type === "sell" && nextPrice >= grid.price);
 
@@ -449,7 +449,7 @@ function runIsolatedBotStep(bot: BotConfig) {
 
         // Perform automated strict risk checks before API execution (P1-1)
         if (riskSettings.restrictedSymbols.includes(bot.symbol)) {
-          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, "Symbol restricted by risk parameters.");
+          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, "Symbol restricted by risk parameters.");
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           appendSecurityLog("system", "admin", "RISK_VIOLATION", bot.id, `Order blocked: symbol ${bot.symbol} is restricted by risk management.`);
@@ -457,7 +457,7 @@ function runIsolatedBotStep(bot: BotConfig) {
         }
 
         if (bot.leverage > riskSettings.maxLeverageLimit) {
-          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Leverage limit of ${riskSettings.maxLeverageLimit}x exceeded.`);
+          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Leverage limit of ${riskSettings.maxLeverageLimit}x exceeded.`);
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           appendSecurityLog("system", "admin", "RISK_VIOLATION", bot.id, `Order blocked: leverage limit of ${riskSettings.maxLeverageLimit}x exceeded.`);
@@ -475,7 +475,7 @@ function runIsolatedBotStep(bot: BotConfig) {
             passphrase = decryptSecret(realAcc.encryptedPassphrase);
           }
         } catch (decryptErr: any) {
-          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Decryption failure: ${decryptErr.message}`);
+          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Decryption failure: ${decryptErr.message}`);
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           return;
@@ -483,14 +483,14 @@ function runIsolatedBotStep(bot: BotConfig) {
 
         const adapter = getBrokerAdapter(bot.broker);
         if (!adapter) {
-          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Adapter not found for broker: ${bot.broker}`);
+          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, `Adapter not found for broker: ${bot.broker}`);
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           return;
         }
 
         // Transition to PENDING
-        dbInstance.updateOrderStatus(clientOrderId, "PENDING");
+        await dbInstance.updateOrderStatus(clientOrderId, "PENDING");
 
         console.log(`[REAL BROKER ORDER] Placing order ${clientOrderId} to ${bot.broker} for ${grid.amount} ${bot.symbol} at ${tradePrice}`);
         
@@ -514,26 +514,26 @@ function runIsolatedBotStep(bot: BotConfig) {
         ).then(async (accepted) => {
           if (accepted.status === "NEW") {
             // Live broker accepted the order. It is now active on the broker book (WORKING status per P0-6)
-            dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
+            await dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
             console.log(`[REAL BROKER ORDER WORKING] Order ${clientOrderId} (${accepted.brokerOrderId}) successfully placed and marked as WORKING.`);
           } else if (accepted.status === "PARTIALLY_FILLED" || accepted.status === "FILLED") {
             const updatedOrd = dbInstance.get().orders.find((o: any) => o.clientOrderId === clientOrderId);
             if (updatedOrd) {
               await recordBrokerExecutionUpdate(updatedOrd, accepted, bot);
             } else {
-               dbInstance.updateOrderStatus(clientOrderId, accepted.status, accepted.brokerOrderId);
+               await dbInstance.updateOrderStatus(clientOrderId, accepted.status, accepted.brokerOrderId);
             }
             console.log(`[REAL BROKER ORDER ${accepted.status}] Order ${clientOrderId} immediately ${accepted.status}.`);
           } else {
             console.error(`[REAL BROKER REJECTED] Order rejected by broker: ${accepted.error}`);
-            dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
+            await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
             bot.status = "stopped_by_risk";
             bot.isEnabled = false;
             appendSecurityLog("system", "admin", "BROKER_REJECTION", bot.id, `Order rejected by ${bot.broker}: ${accepted.error}`);
           }
-        }).catch((apiErr) => {
+        }).catch(async (apiErr) => {
           console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
-          dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
+          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           appendSecurityLog("system", "admin", "BROKER_OFFLINE", bot.id, `Network execution exception on ${bot.broker}: ${apiErr.message}`);
@@ -616,7 +616,7 @@ function runIsolatedBotStep(bot: BotConfig) {
         }
       }
     }
-  });
+  }
 
   // Check Stop Loss and Take Profit
   if (bot.stopLoss && nextPrice <= bot.stopLoss) {
@@ -847,7 +847,7 @@ setInterval(async () => {
       }
 
       if (ord.status === "CANCEL_REQUESTED" && !ord.brokerOrderId) {
-        dbInstance.updateOrderState(ord.clientOrderId, {
+        await dbInstance.updateOrderState(ord.clientOrderId, {
           status: "CANCEL_FAILED",
           manualReviewRequired: true,
           lastError: "Missing brokerOrderId; cannot query/cancel by broker order id",
@@ -874,31 +874,25 @@ setInterval(async () => {
 
       if (ord.status === "CANCEL_REQUESTED") {
         if (updatedOrder.status === "CANCELED") {
-          dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", updatedOrder.brokerOrderId || ord.brokerOrderId);
+          await dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", updatedOrder.brokerOrderId || ord.brokerOrderId);
         } else if (updatedOrder.status === "FILLED" || updatedOrder.status === "PARTIALLY_FILLED") {
           await recordBrokerExecutionUpdate(ord, updatedOrder, bot);
         } else if (updatedOrder.status === "NEW" || updatedOrder.status === "WORKING") {
           const newRetryCount = (ord.cancelRetryCount || 0) + 1;
           
-          if (!ord.brokerOrderId) {
-            console.warn(`[ORDER CANCEL FAILED] No brokerOrderId for ${ord.clientOrderId}, requires manual review`);
-            dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", manualReviewRequired: true, lastError: "Missing brokerOrderId" });
-            continue;
-          }
-
           if (newRetryCount > 3) {
              console.warn(`[ORDER CANCEL FAILED] Exceeded retry count for ${ord.clientOrderId}`);
-             dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: "Exceeded retry count" });
+             await dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: "Exceeded retry count" });
           } else {
              try {
                await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
-               dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
+               await dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
              } catch (cancelErr: any) {
                console.error(`[ORDER CANCEL RETRY] Failed to retry cancel for ${ord.clientOrderId}: ${cancelErr.message}`);
                if (newRetryCount > 1) {
-                  dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: cancelErr.message });
+                  await dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: cancelErr.message });
                } else {
-                  dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
+                  await dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
                }
              }
           }
@@ -907,11 +901,11 @@ setInterval(async () => {
       }
 
       if (updatedOrder.status === "NEW" || updatedOrder.status === "WORKING") {
-        dbInstance.updateOrderStatus(ord.clientOrderId, "WORKING", updatedOrder.brokerOrderId || ord.brokerOrderId);
+        await dbInstance.updateOrderStatus(ord.clientOrderId, "WORKING", updatedOrder.brokerOrderId || ord.brokerOrderId);
       } else if (updatedOrder.status === "FILLED" || updatedOrder.status === "PARTIALLY_FILLED") {
         await recordBrokerExecutionUpdate(ord, updatedOrder, bot);
       } else if (updatedOrder.status === "REJECTED" || updatedOrder.status === "CANCELED") {
-        dbInstance.updateOrderStatus(ord.clientOrderId, updatedOrder.status, ord.brokerOrderId, updatedOrder.error);
+        await dbInstance.updateOrderStatus(ord.clientOrderId, updatedOrder.status, ord.brokerOrderId, updatedOrder.error);
         
         // Canceled or rejected while active triggers bot stop
         bot.status = "stopped_by_risk";
