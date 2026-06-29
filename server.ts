@@ -415,7 +415,7 @@ function runIsolatedBotStep(bot: BotConfig) {
           o.botId === bot.id && 
           Math.abs(o.price - grid.price) < 0.0001 && 
           o.side.toLowerCase() === grid.type && 
-          ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED"].includes(o.status)
+          ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status)
         );
 
         if (hasExistingOrder) {
@@ -426,6 +426,7 @@ function runIsolatedBotStep(bot: BotConfig) {
         const tradePrice = grid.price;
         const clientOrderId = "cl_ord_" + crypto.randomBytes(8).toString("hex");
         const orderId = "ord_" + crypto.randomBytes(8).toString("hex");
+        const marketType = (bot.gridType === "perpetual" || bot.type === "futures_grid") ? "perpetual" : "spot";
         
         const orderEntity: Order = {
           id: orderId,
@@ -434,6 +435,7 @@ function runIsolatedBotStep(bot: BotConfig) {
           brokerAccountId: realAcc.id,
           clientOrderId,
           symbol: bot.symbol,
+          marketType: marketType,
           side: grid.type.toUpperCase() as "BUY" | "SELL",
           type: "LMT",
           price: tradePrice,
@@ -498,6 +500,7 @@ function runIsolatedBotStep(bot: BotConfig) {
             brokerAccountId: realAcc.id,
             clientOrderId,
             symbol: bot.symbol,
+            marketType: marketType,
             side: grid.type === "buy" ? "BUY" : "SELL",
             type: "LMT",
             price: tradePrice,
@@ -513,6 +516,12 @@ function runIsolatedBotStep(bot: BotConfig) {
             // Live broker accepted the order. It is now active on the broker book (WORKING status per P0-6)
             dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
             console.log(`[REAL BROKER ORDER WORKING] Order ${clientOrderId} (${accepted.brokerOrderId}) successfully placed and marked as WORKING.`);
+          } else if (accepted.status === "PARTIALLY_FILLED") {
+            dbInstance.updateOrderStatus(clientOrderId, "PARTIALLY_FILLED", accepted.brokerOrderId);
+            console.log(`[REAL BROKER ORDER PARTIALLY FILLED] Order ${clientOrderId} immediately partially filled.`);
+          } else if (accepted.status === "FILLED") {
+            dbInstance.updateOrderStatus(clientOrderId, "FILLED", accepted.brokerOrderId);
+            console.log(`[REAL BROKER ORDER FILLED] Order ${clientOrderId} immediately filled.`);
           } else {
             console.error(`[REAL BROKER REJECTED] Order rejected by broker: ${accepted.error}`);
             dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
@@ -559,6 +568,7 @@ function runIsolatedBotStep(bot: BotConfig) {
             brokerAccountId: "PAPER_ACCOUNT",
             clientOrderId,
             symbol: bot.symbol,
+            marketType: (bot.gridType === "perpetual" || bot.type === "futures_grid") ? "perpetual" : "spot",
             side: grid.type.toUpperCase() as "BUY" | "SELL",
             type: "LMT",
             price: tradePrice,
@@ -696,7 +706,7 @@ setInterval(() => {
 setInterval(async () => {
   const db = dbInstance.get();
   const orders = db.orders || [];
-  const workingOrders = orders.filter(o => o.status === "WORKING" || o.status === "PENDING" || o.status === "PARTIALLY_FILLED");
+  const workingOrders = orders.filter(o => ["WORKING", "PENDING", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status));
   if (workingOrders.length === 0) return;
 
   for (const ord of workingOrders) {
@@ -730,6 +740,7 @@ setInterval(async () => {
       const updatedOrder = await adapter.getOrder(
         brokerOrderIdToQuery,
         ord.symbol,
+        ord.marketType,
         apiKey,
         apiSecret,
         passphrase,
@@ -1068,20 +1079,38 @@ setInterval(async () => {
         let riskReason = "";
 
         // 1. Check if spot balance is insufficient (placeholder logic for simplicity)
+        const quoteAsset = bot.symbol.split("/")[1] || "USDT";
+        const quoteBalance = balances.find(b => b.asset === quoteAsset);
+        
         // 2. Check if margin is insufficient
-        const totalUsdBalance = balances.reduce((sum, b) => sum + b.free, 0); 
-        if (totalUsdBalance < bot.investment * 0.1) {
-           riskTriggered = true;
-           riskReason = "Insufficient broker balance/margin.";
+        const totalUsdBalance = quoteBalance ? quoteBalance.free : balances.reduce((sum, b) => sum + b.free, 0); 
+        if (totalUsdBalance < bot.investment * 0.05) {
+           // Too risky to stop solely on this simplistic check without real mark-price
+           // We will log a warning instead of a hard stop to prevent false positives.
+           console.warn(`[RECONCILIATION] Low balance for bot ${bot.id}: ${totalUsdBalance} ${quoteAsset}`);
         }
 
         // 3. Check if broker has position but local has none (or vice versa)
-        const brokerPos = positions.find(p => p.symbol === bot.symbol);
-        const hasBrokerPos = brokerPos && Math.abs(brokerPos.amount) > 0;
-        const localPosSize = (db.fills || []).filter(f => f.orderId.includes(bot.id)).reduce((sum, f) => sum + f.quantity, 0); // Simplified calculation
+        const botOrders = (db.orders || []).filter(o => o.botId === bot.id);
+        const botOrderIds = new Set(botOrders.map(o => o.id));
+        const botFills = (db.fills || []).filter(f => botOrderIds.has(f.orderId));
         
-        // This is a naive check. For a production system, this would need to track direction and precise sizing
-        if (hasBrokerPos && localPosSize === 0 && bot.tradesCount === 0) {
+        let netQty = 0;
+        for (const fill of botFills) {
+          const order = botOrders.find(o => o.id === fill.orderId);
+          if (order?.side === "BUY") {
+            netQty += fill.quantity;
+          } else if (order?.side === "SELL") {
+            netQty -= fill.quantity;
+          }
+        }
+        const localPosSize = Math.abs(netQty);
+
+        const brokerPos = positions.find(p => p.symbol === bot.symbol || p.symbol.includes(bot.symbol.replace("/", "")));
+        const hasBrokerPos = brokerPos && Math.abs(brokerPos.amount) > 0.0001;
+        
+        // Tolerance for floating point diff
+        if (hasBrokerPos && localPosSize < 0.0001 && bot.tradesCount === 0 && bot.gridType === "perpetual") {
            riskTriggered = true;
            riskReason = "Broker has position but local bot has none.";
         }
@@ -1847,7 +1876,7 @@ async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport
   }
 
   const activeOrders = (db.orders || []).filter(
-    o => o.botId === botId && ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED"].includes(o.status)
+    o => o.botId === botId && ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status)
   );
 
   for (const ord of activeOrders) {
@@ -1861,7 +1890,7 @@ async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport
       }
 
       console.log(`[ORDER CANCEL] Canceling order ${ord.brokerOrderId} for bot ${botId}`);
-      await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
       dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", ord.brokerOrderId, "Canceled due to bot stop/kill switch");
       report.canceled++;
     } catch (err: any) {
@@ -1883,8 +1912,9 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: a
 
     // N3: Cancel pending orders when bot is stopped
     const cancelReport = await cancelAllPendingOrdersForBot(id);
+    const hasFailures = cancelReport.failed.length > 0 || cancelReport.skipped.length > 0;
     
-    if (cancelReport.failed.length > 0) {
+    if (hasFailures) {
       bots[botIndex].status = "stopped_with_open_orders";
     } else {
       bots[botIndex].status = "stopped";
@@ -1893,7 +1923,7 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: a
     bots[botIndex].isEnabled = false;
     bots[botIndex].lastUpdated = new Date().toISOString();
     
-    if (cancelReport.failed.length > 0) {
+    if (hasFailures) {
       appendSecurityLog(req.user.username, req.user.role, "BOT_STOP_FAILED", id, `Deactivated bot ${bots[botIndex].name} but order cancel failed`, req.ip);
     } else {
       appendSecurityLog(req.user.username, req.user.role, "BOT_STOP", id, `Deactivated bot: ${bots[botIndex].name}`, req.ip);
@@ -1901,10 +1931,11 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: a
     dbInstance.save();
 
     res.json({ 
-      success: cancelReport.failed.length === 0, 
+      success: !hasFailures, 
       bot: bots[botIndex],
       cancelReport,
-      warning: cancelReport.failed.length > 0 ? "Some broker orders could not be canceled." : undefined
+      unresolvedOrders: [...cancelReport.failed, ...cancelReport.skipped],
+      warning: hasFailures ? "Some broker orders could not be canceled." : undefined
     });
   } else {
     res.status(404).json({ error: "Bot not found" });
@@ -2079,14 +2110,27 @@ app.post("/api/risk", requireAuth(['admin']), async (req: any, res) => {
       return report;
     }));
 
-    const hasFailures = cancelReports.some(r => r.failed.length > 0);
+    const hasFailures = cancelReports.some(r => r.failed.length > 0 || r.skipped.length > 0);
+    const unresolvedOrders = cancelReports.flatMap(r => [
+      ...r.failed.map(f => ({ ...f, botId: r.botId })),
+      ...r.skipped.map(s => ({ ...s, botId: r.botId }))
+    ]);
+
     if (hasFailures) {
       appendSecurityLog(req.user.username, req.user.role, "KILL_SWITCH_CANCEL_INCOMPLETE", "Global Risk Settings", `Global Kill Switch activated but some orders failed to cancel.`);
     }
     
     appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);
     dbInstance.save();
-    return res.json({ success: true, settings: db.riskSettings, cancelReports, warning: hasFailures ? "Global Kill Switch activated, but some broker orders could not be canceled." : undefined });
+    return res.json({ 
+      success: !hasFailures, 
+      killSwitchEnabled: true,
+      cancelComplete: !hasFailures,
+      unresolvedOrders,
+      settings: db.riskSettings, 
+      cancelReports, 
+      warning: hasFailures ? "Global Kill Switch activated, but some broker orders could not be canceled." : undefined 
+    });
   }
 
   appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);

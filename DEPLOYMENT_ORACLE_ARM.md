@@ -32,8 +32,9 @@ cd /path/to/aegis-quant
 # Install dependencies and build sqlite3 for arm64
 npm ci
 ```
-If sqlite3 fails to build native bindings, the system will securely degrade to a JSON fallback mode, but performance will be severely degraded. Verify native bindings:
+In production, sqlite3 native support is mandatory. If sqlite3 cannot load on arm64, the service must fail fast. JSON fallback is only allowed for local development and must not be used with LIVE_TRADING_ENABLED=true. Verify native bindings:
 ```bash
+node -e "require('sqlite3'); console.log(process.arch)"
 npx tsx scripts/auth-doctor.ts
 # Ensure "Native sqlite3 Package Supported: YES"
 ```
@@ -63,12 +64,18 @@ After=network.target
 
 [Service]
 Environment=NODE_ENV=production
+EnvironmentFile=/opt/aegis/aegis.env
 Type=simple
 User=ubuntu
-WorkingDirectory=/path/to/aegis-quant
+WorkingDirectory=/opt/aegis
 ExecStart=/usr/bin/npm run start
 Restart=on-failure
 RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/aegis/data /opt/aegis/logs
 
 [Install]
 WantedBy=multi-user.target
@@ -85,19 +92,54 @@ Install Nginx and certbot for HTTPS. The app requires HTTPS to secure cookies an
 
 ```bash
 sudo apt install nginx certbot python3-certbot-nginx -y
+```
 
-# Configure Nginx (/etc/nginx/sites-available/aegis)
-# Proxy pass to http://127.0.0.1:3000
+Configure Nginx (`/etc/nginx/sites-available/aegis`):
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 10M;
+    }
+}
 ```
 
 ## 8. UFW Firewall Setup
 
 ```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
 sudo ufw allow 'Nginx Full'
 sudo ufw allow from <YOUR_IP> to any port 22
 sudo ufw enable
 ```
+*Note: Make sure to also allow ports 80, 443, and 22 from your management IP in the Oracle Cloud Security List.*
 
 ## 9. Backup Strategy
 - Create an automated cron job to backup the `data/` directory (which contains `aegis.db` and secure logs).
-- Example: `tar -czvf /backup/aegis_data_$(date +%F).tar.gz /path/to/aegis-quant/data`
+- Backups must be encrypted.
+- Example Backup:
+  ```bash
+  tar -czvf - /opt/aegis/data | openssl enc -aes-256-cbc -salt -pass pass:YOUR_PASSWORD -out /backup/aegis_data_$(date +%F).tar.gz.enc
+  ```
+- Example Restore Drill:
+  ```bash
+  openssl enc -aes-256-cbc -d -in /backup/aegis_data_2026-06-29.tar.gz.enc -pass pass:YOUR_PASSWORD | tar -xzvf - -C /restore_location
+  ```

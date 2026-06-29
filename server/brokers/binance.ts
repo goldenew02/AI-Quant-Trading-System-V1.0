@@ -103,8 +103,7 @@ export class BinanceAdapter implements BrokerAdapter {
   async placeOrder(order: OrderRequest, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderAccepted> {
     if (!apiKey || !apiSecret) throw new Error("Binance credentials not provided.");
     
-    // Check if Futures order or Spot order based on symbol suffix or bot metadata
-    const isFutures = order.symbol.toLowerCase().includes("swap") || order.symbol.toLowerCase().includes("futures") || parseFloat(order.secType || "") > 1; 
+    const isFutures = order.marketType === "perpetual" || order.marketType === "futures";
     const baseUrl = this.getBaseUrl(isSandbox, isFutures);
     const formattedSymbol = order.symbol.replace("/", "").toUpperCase();
 
@@ -157,16 +156,17 @@ export class BinanceAdapter implements BrokerAdapter {
     }
   }
 
-  async getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+  async getOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
     if (!apiKey || !apiSecret) throw new Error("Binance credentials missing.");
     const formattedSymbol = symbol.replace("/", "").toUpperCase();
     
-    // Standard query spot status
-    const baseUrl = this.getBaseUrl(isSandbox, false);
+    const isFutures = marketType === "perpetual" || marketType === "futures";
+    const baseUrl = this.getBaseUrl(isSandbox, isFutures);
     const orderParams = { symbol: formattedSymbol, orderId };
     const query = this.buildSignedQuery(orderParams, apiSecret);
+    const endpoint = isFutures ? "/fapi/v1/order" : "/api/v3/order";
     
-    const res = await axios.get(`${baseUrl}/api/v3/order?${query}`, {
+    const res = await axios.get(`${baseUrl}${endpoint}?${query}`, {
       headers: { "X-MBX-APIKEY": apiKey }
     });
     
@@ -181,19 +181,21 @@ export class BinanceAdapter implements BrokerAdapter {
       brokerOrderId: String(data.orderId),
       clientOrderId: data.clientOrderId,
       status: finalStatus,
-      filledPrice: parseFloat(data.price),
-      filledQuantity: parseFloat(data.executedQty)
+      filledPrice: parseFloat(data.price || "0"),
+      filledQuantity: parseFloat(data.executedQty || "0")
     };
   }
 
-  async cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
+  async cancelOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
     if (!apiKey || !apiSecret) throw new Error("Binance credentials missing.");
     const formattedSymbol = symbol.replace("/", "").toUpperCase();
-    const baseUrl = this.getBaseUrl(isSandbox, false);
+    const isFutures = marketType === "perpetual" || marketType === "futures";
+    const baseUrl = this.getBaseUrl(isSandbox, isFutures);
     const orderParams = { symbol: formattedSymbol, orderId };
     const query = this.buildSignedQuery(orderParams, apiSecret);
+    const endpoint = isFutures ? "/fapi/v1/order" : "/api/v3/order";
     
-    await axios.delete(`${baseUrl}/api/v3/order?${query}`, {
+    await axios.delete(`${baseUrl}${endpoint}?${query}`, {
       headers: { "X-MBX-APIKEY": apiKey }
     });
   }

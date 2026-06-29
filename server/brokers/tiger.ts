@@ -129,7 +129,7 @@ export class TigerAdapter implements BrokerAdapter {
     }
   }
 
-  async getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+  async getOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
     if (!apiKey || !apiSecret) throw new Error("Tiger API credentials missing.");
     const baseUrl = this.getBaseUrl(isSandbox);
     const path = `/orders/${orderId}`;
@@ -153,7 +153,7 @@ export class TigerAdapter implements BrokerAdapter {
     };
   }
 
-  async cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
+  async cancelOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
     if (!apiKey || !apiSecret) throw new Error("Tiger API credentials missing.");
     const baseUrl = this.getBaseUrl(isSandbox);
     const path = `/orders/${orderId}`;

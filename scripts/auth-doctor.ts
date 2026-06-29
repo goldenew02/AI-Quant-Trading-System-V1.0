@@ -166,15 +166,25 @@ async function main() {
       let passwordMatchesBootstrap = "N/A (Not bootstrap user)";
 
       if (isBootstrapMatch) {
+        const syncOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true";
         if (bootstrapPass) {
           const matched = verifyPassword(bootstrapPass, u.passwordHash);
-          passwordMatchesBootstrap = matched ? "YES (Matches current env password)" : "NO (MISMATCH with current env password!)";
-          if (!matched) {
-            warnings.push(`[CRITICAL] Username matches bootstrap admin ('${bootstrapUser}'), but actual database password hash does NOT match BOOTSTRAP_ADMIN_PASSWORD from env! Login with the env password will fail.`);
+          
+          if (matched) {
+            passwordMatchesBootstrap = syncOnBoot ? "YES (Matches env password AND sync is enabled)" : "YES (Env password matches DB password)";
+          } else {
+            if (syncOnBoot) {
+              passwordMatchesBootstrap = "NO (MISMATCH, but will be OVERWRITTEN on next boot!)";
+              warnings.push(`[CRITICAL] Username matches bootstrap admin, password does NOT match env, and ADMIN_PASSWORD_SYNC_ON_BOOT is true. Password will be reset on boot.`);
+            } else {
+              passwordMatchesBootstrap = "NO (Boot sync disabled and existing credential preserved)";
+            }
           }
         } else {
           passwordMatchesBootstrap = "NO (BOOTSTRAP_ADMIN_PASSWORD env variable is empty/missing)";
-          warnings.push(`[CRITICAL] BOOTSTRAP_ADMIN_PASSWORD is not set or empty in environment!`);
+          if (syncOnBoot) {
+             warnings.push(`[CRITICAL] BOOTSTRAP_ADMIN_PASSWORD is empty but ADMIN_PASSWORD_SYNC_ON_BOOT is true! System cannot boot.`);
+          }
         }
       }
 

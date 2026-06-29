@@ -25,6 +25,10 @@ export interface OrderRequest {
   brokerAccountId: string;
   clientOrderId: string;
   symbol: string;
+  marketType: "spot" | "perpetual" | "futures";
+  marginMode?: "cash" | "cross" | "isolated";
+  positionSide?: "long" | "short" | "net";
+  exchangeSymbol?: string;
   side: "BUY" | "SELL";
   type: "LMT" | "MKT";
   price: number;
@@ -57,6 +61,6 @@ export interface BrokerAdapter {
   getBalances(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<Balance[]>;
   getPositions(apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<Position[]>;
   placeOrder(order: OrderRequest, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderAccepted>;
-  getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus>;
-  cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void>;
+  getOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus>;
+  cancelOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void>;
 }

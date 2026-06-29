@@ -102,23 +102,21 @@ export class OKXAdapter implements BrokerAdapter {
     
     // Format symbol: OKX uses BTC-USDT or BTC-USDT-SWAP, let's normalize
     let formattedInstId = order.symbol.replace("/", "-").toUpperCase();
-    if (order.symbol.toLowerCase().includes("swap")) {
-      formattedInstId = formattedInstId.replace("-SWAP", "") + "-SWAP";
+    if (order.marketType === "perpetual" || order.marketType === "futures") {
+      if (!formattedInstId.includes("SWAP")) {
+        formattedInstId = `${formattedInstId}-SWAP`;
+      }
     }
 
     const body = {
       instId: formattedInstId,
-      tdMode: "cash", // default cash mode for spot. Swap/futures would use 'cross' or 'isolated'
+      tdMode: (order.marketType === "perpetual" || order.marketType === "futures") ? "cross" : "cash",
       clOrdId: order.clientOrderId,
       side: order.side.toLowerCase(),
       ordType: order.type.toLowerCase(),
       sz: String(order.quantity),
       ...(order.type === "LMT" ? { px: String(order.price) } : {})
     };
-
-    if (order.symbol.toLowerCase().includes("swap") || order.symbol.toLowerCase().includes("futures")) {
-      body.tdMode = "cross"; // standard cross margin mode for derivatives
-    }
 
     const bodyStr = JSON.stringify(body);
     const headers = this.getHeaders("POST", requestPath, bodyStr, apiKey, apiSecret, passphrase, isSandbox);
@@ -152,10 +150,15 @@ export class OKXAdapter implements BrokerAdapter {
     }
   }
 
-  async getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+  async getOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
     if (!apiKey || !apiSecret) throw new Error("OKX credentials missing.");
     const baseUrl = this.getBaseUrl();
     let formattedInstId = symbol.replace("/", "-").toUpperCase();
+    if (marketType === "perpetual" || marketType === "futures") {
+      if (!formattedInstId.includes("SWAP")) {
+        formattedInstId = `${formattedInstId}-SWAP`;
+      }
+    }
     const requestPath = `/api/v5/trade/order?ordId=${orderId}&instId=${formattedInstId}`;
     const headers = this.getHeaders("GET", requestPath, "", apiKey, apiSecret, passphrase, isSandbox);
 
@@ -179,11 +182,16 @@ export class OKXAdapter implements BrokerAdapter {
     };
   }
 
-  async cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
+  async cancelOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
     if (!apiKey || !apiSecret) throw new Error("OKX credentials missing.");
     const baseUrl = this.getBaseUrl();
     const requestPath = "/api/v5/trade/cancel-order";
     let formattedInstId = symbol.replace("/", "-").toUpperCase();
+    if (marketType === "perpetual" || marketType === "futures") {
+      if (!formattedInstId.includes("SWAP")) {
+        formattedInstId = `${formattedInstId}-SWAP`;
+      }
+    }
     
     const body = { ordId: orderId, instId: formattedInstId };
     const bodyStr = JSON.stringify(body);

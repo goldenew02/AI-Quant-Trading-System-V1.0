@@ -163,7 +163,7 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
     }
   }
 
-  async getOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+  async getOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
     const baseUrl = this.getBaseUrl(apiKey);
     const agent = this.getAgent(apiKey);
     const res = await axios.get(`${baseUrl}/iserver/account/orders`, { httpsAgent: agent });
@@ -193,7 +193,7 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
     };
   }
 
-  async cancelOrder(orderId: string, symbol: string, apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
+  async cancelOrder(orderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<void> {
     const baseUrl = this.getBaseUrl(apiKey);
     const agent = this.getAgent(apiKey);
     const accountId = passphrase || process.env.IB_ACCOUNT_ID;

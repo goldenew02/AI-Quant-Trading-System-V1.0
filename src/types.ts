@@ -154,6 +154,10 @@ export interface Order {
   brokerAccountId: string;
   clientOrderId: string;
   brokerOrderId?: string;
+  marketType: "spot" | "perpetual" | "futures";
+  marginMode?: "cash" | "cross" | "isolated";
+  positionSide?: "long" | "short" | "net";
+  exchangeSymbol?: string;
   symbol: string;
   side: "BUY" | "SELL";
   type: "LMT" | "MKT";
