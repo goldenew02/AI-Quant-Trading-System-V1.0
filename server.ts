@@ -747,69 +747,131 @@ setInterval(async () => {
         dbInstance.updateOrderStatus(ord.clientOrderId, "FILLED", ord.brokerOrderId);
 
         const filledPrice = updatedOrder.filledPrice ?? ord.price;
-        const totalFilledQty = updatedOrder.filledQuantity ?? ord.quantity;
+        if (updatedOrder.fills && updatedOrder.fills.length > 0) {
+          // N5: Use real broker execution IDs if available (P1-5)
+          for (const fill of updatedOrder.fills) {
+            // Idempotency check: Have we recorded this specific execution id?
+            const isAlreadyRecorded = (db.fills || []).some(f => f.brokerFillId === fill.id);
+            if (!isAlreadyRecorded) {
+              const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+              dbInstance.insertFill({
+                id: fillId,
+                orderId: ord.id,
+                brokerFillId: fill.id,
+                price: fill.price,
+                quantity: fill.qty,
+                fee: fill.fee,
+                feeCurrency: fill.feeCurrency,
+                timestamp: fill.timestamp || new Date().toISOString()
+              });
 
-        // Check already recorded fills for this order to compute the final chunk (P1-4)
-        const existingFills = (db.fills || []).filter(f => f.orderId === ord.id);
-        const totalAlreadyRecordedQty = existingFills.reduce((sum, f) => sum + f.quantity, 0);
-        const finalChunkQty = Math.max(0, totalFilledQty - totalAlreadyRecordedQty);
+              // Write to trade log
+              const total = fill.price * fill.qty;
+              let realizedPnl = 0;
+              if (ord.side === "SELL") {
+                realizedPnl = Math.round((fill.price - bot.entryPrice) * fill.qty * 100) / 100;
+                if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+                if (realizedPnl === 0) realizedPnl = Math.round((total) * 0.012 * 100) / 100;
+                realizedPnl -= fill.fee;
+                bot.profitUsd += realizedPnl;
+              } else {
+                bot.profitUsd -= fill.fee;
+              }
 
-        if (finalChunkQty > 0.0001) {
-          const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
-          const total = filledPrice * finalChunkQty;
-          
-          const feeUsd = Math.round(total * 0.001 * 100) / 100;
-          dbInstance.insertFill({
-            id: fillId,
-            orderId: ord.id,
-            brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}`,
-            price: filledPrice,
-            quantity: finalChunkQty,
-            fee: feeUsd,
-            feeCurrency: "USD",
-            timestamp: new Date().toISOString()
-          });
+              bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+              bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+              bot.tradesCount++;
 
-          // Write to trade log
-          let realizedPnl = 0;
-          if (ord.side === "SELL") {
-            realizedPnl = Math.round((filledPrice - bot.entryPrice) * finalChunkQty * 100) / 100;
-            if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
-            if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * finalChunkQty) * 0.012 * 100) / 100;
-            
-            // N2: Fee enters PnL
-            realizedPnl -= feeUsd;
-            bot.profitUsd += realizedPnl;
-          } else {
-            // N2: Fee enters PnL for BUY side as well
-            bot.profitUsd -= feeUsd;
+              appendTradeLog({
+                id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+                botId: bot.id,
+                botName: bot.name,
+                broker: bot.broker,
+                symbol: bot.symbol,
+                timestamp: new Date().toISOString(),
+                type: ord.side.toLowerCase() as 'buy' | 'sell',
+                price: fill.price,
+                amount: fill.qty,
+                total,
+                pnl: realizedPnl > 0 ? realizedPnl : undefined
+              });
+            }
           }
-
-          bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
-          bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
-          bot.tradesCount++;
-
-          appendTradeLog({
-            id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-            botId: bot.id,
-            botName: bot.name,
-            broker: bot.broker,
-            symbol: bot.symbol,
-            timestamp: new Date().toISOString(),
-            type: ord.side.toLowerCase() as 'buy' | 'sell',
-            price: filledPrice,
-            amount: finalChunkQty,
-            total,
-            pnl: realizedPnl > 0 ? realizedPnl : undefined
-          });
-
-          // Update the grid filled state on the running bot so it flips!
-          const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
-          if (gridIndex !== -1) {
-            bot.grids[gridIndex].filled = false;
-            bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
+          // Flip grid state if order fully filled
+          if (updatedOrder.status === "FILLED") {
+            const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
+            if (gridIndex !== -1) {
+              bot.grids[gridIndex].filled = false;
+              bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
+            }
           }
           dbInstance.upsertBot(bot);
+        } else {
+          // Fallback logic for adapters that don't return individual fills yet
+          const totalFilledQty = updatedOrder.filledQuantity ?? ord.quantity;
+
+          // Check already recorded fills for this order to compute the final chunk (P1-4)
+          const existingFills = (db.fills || []).filter(f => f.orderId === ord.id);
+          const totalAlreadyRecordedQty = existingFills.reduce((sum, f) => sum + f.quantity, 0);
+          const finalChunkQty = Math.max(0, totalFilledQty - totalAlreadyRecordedQty);
+
+          if (finalChunkQty > 0.0001) {
+            const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+            const total = filledPrice * finalChunkQty;
+            
+            const feeUsd = Math.round(total * 0.001 * 100) / 100;
+            dbInstance.insertFill({
+              id: fillId,
+              orderId: ord.id,
+              brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}_${totalFilledQty}`,
+              price: filledPrice,
+              quantity: finalChunkQty,
+              fee: feeUsd,
+              feeCurrency: "USD",
+              timestamp: new Date().toISOString()
+            });
+
+            // Write to trade log
+            let realizedPnl = 0;
+            if (ord.side === "SELL") {
+              realizedPnl = Math.round((filledPrice - bot.entryPrice) * finalChunkQty * 100) / 100;
+              if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+              if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * finalChunkQty) * 0.012 * 100) / 100;
+              
+              // N2: Fee enters PnL
+              realizedPnl -= feeUsd;
+              bot.profitUsd += realizedPnl;
+            } else {
+              // N2: Fee enters PnL for BUY side as well
+              bot.profitUsd -= feeUsd;
+            }
+
+            bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+            bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+            bot.tradesCount++;
+
+            appendTradeLog({
+              id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+              botId: bot.id,
+              botName: bot.name,
+              broker: bot.broker,
+              symbol: bot.symbol,
+              timestamp: new Date().toISOString(),
+              type: ord.side.toLowerCase() as 'buy' | 'sell',
+              price: filledPrice,
+              amount: finalChunkQty,
+              total,
+              pnl: realizedPnl > 0 ? realizedPnl : undefined
+            });
+
+            // Update the grid filled state on the running bot so it flips!
+            const gridIndex = bot.grids.findIndex(g => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
+            if (gridIndex !== -1) {
+              bot.grids[gridIndex].filled = false;
+              bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
+            }
+            dbInstance.upsertBot(bot);
+          }
         }
 
       } else if (updatedOrder.status === "REJECTED" || updatedOrder.status === "CANCELED") {
@@ -825,7 +887,57 @@ setInterval(async () => {
         const filledPrice = updatedOrder.filledPrice ?? ord.price;
         const cumulativeFilledQty = updatedOrder.filledQuantity ?? 0;
         
-        if (cumulativeFilledQty > 0) {
+        if (updatedOrder.fills && updatedOrder.fills.length > 0) {
+          // N5: Use real broker execution IDs if available (P1-5)
+          for (const fill of updatedOrder.fills) {
+            const isAlreadyRecorded = (db.fills || []).some(f => f.brokerFillId === fill.id);
+            if (!isAlreadyRecorded) {
+              const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
+              dbInstance.insertFill({
+                id: fillId,
+                orderId: ord.id,
+                brokerFillId: fill.id,
+                price: fill.price,
+                quantity: fill.qty,
+                fee: fill.fee,
+                feeCurrency: fill.feeCurrency,
+                timestamp: fill.timestamp || new Date().toISOString()
+              });
+
+              // Write to trade log
+              const total = fill.price * fill.qty;
+              let realizedPnl = 0;
+              if (ord.side === "SELL") {
+                realizedPnl = Math.round((fill.price - bot.entryPrice) * fill.qty * 100) / 100;
+                if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+                if (realizedPnl === 0) realizedPnl = Math.round((total) * 0.012 * 100) / 100;
+                realizedPnl -= fill.fee;
+                bot.profitUsd += realizedPnl;
+              } else {
+                bot.profitUsd -= fill.fee;
+              }
+
+              bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
+              bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
+              bot.tradesCount++;
+
+              appendTradeLog({
+                id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+                botId: bot.id,
+                botName: bot.name,
+                broker: bot.broker,
+                symbol: bot.symbol,
+                timestamp: new Date().toISOString(),
+                type: ord.side.toLowerCase() as 'buy' | 'sell',
+                price: fill.price,
+                amount: fill.qty,
+                total,
+                pnl: realizedPnl > 0 ? realizedPnl : undefined
+              });
+            }
+          }
+          dbInstance.upsertBot(bot);
+        } else if (cumulativeFilledQty > 0) {
           const existingFills = (db.fills || []).filter(f => f.orderId === ord.id);
           const totalAlreadyRecordedQty = existingFills.reduce((sum, f) => sum + f.quantity, 0);
           
@@ -914,6 +1026,82 @@ setInterval(() => {
   apiRequestCounter = 0;
   circuitBreakerActive = false;
 }, 60000);
+
+// N4: Reconciliation loop to verify real broker state against local state (P1-4)
+setInterval(async () => {
+  const db = dbInstance.get();
+  if (db.riskSettings.globalKillSwitch) return;
+
+  const liveBots = bots.filter(b => b.status === "running" && b.executionMode === "live" && b.brokerAccountId);
+  if (liveBots.length === 0) return;
+
+  const accountBotMap = new Map<string, typeof liveBots>();
+  for (const bot of liveBots) {
+    if (!accountBotMap.has(bot.brokerAccountId!)) {
+      accountBotMap.set(bot.brokerAccountId!, []);
+    }
+    accountBotMap.get(bot.brokerAccountId!)!.push(bot);
+  }
+
+  for (const [accountId, accBots] of accountBotMap.entries()) {
+    const realAcc = db.brokerAccounts.find(acc => acc.id === accountId);
+    if (!realAcc) continue;
+
+    const adapter = getBrokerAdapter(realAcc.broker as any);
+    if (!adapter) continue;
+
+    let apiKey = "", apiSecret = "", passphrase = "";
+    try {
+      apiKey = decryptSecret(realAcc.encryptedApiKey);
+      apiSecret = decryptSecret(realAcc.encryptedSecret);
+      if (realAcc.encryptedPassphrase) passphrase = decryptSecret(realAcc.encryptedPassphrase);
+    } catch (e) {
+      continue;
+    }
+
+    try {
+      const positions = await adapter.getPositions(apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      const balances = await adapter.getBalances(apiKey, apiSecret, passphrase, realAcc.isSandbox);
+
+      for (const bot of accBots) {
+        let riskTriggered = false;
+        let riskReason = "";
+
+        // 1. Check if spot balance is insufficient (placeholder logic for simplicity)
+        // 2. Check if margin is insufficient
+        const totalUsdBalance = balances.reduce((sum, b) => sum + b.free, 0); 
+        if (totalUsdBalance < bot.investment * 0.1) {
+           riskTriggered = true;
+           riskReason = "Insufficient broker balance/margin.";
+        }
+
+        // 3. Check if broker has position but local has none (or vice versa)
+        const brokerPos = positions.find(p => p.symbol === bot.symbol);
+        const hasBrokerPos = brokerPos && Math.abs(brokerPos.amount) > 0;
+        const localPosSize = (db.fills || []).filter(f => f.orderId.includes(bot.id)).reduce((sum, f) => sum + f.quantity, 0); // Simplified calculation
+        
+        // This is a naive check. For a production system, this would need to track direction and precise sizing
+        if (hasBrokerPos && localPosSize === 0 && bot.tradesCount === 0) {
+           riskTriggered = true;
+           riskReason = "Broker has position but local bot has none.";
+        }
+
+        // 4. Broker has open orders but local has none - we assume the polling catches this, but can also query open orders here
+        
+        if (riskTriggered) {
+          console.warn(`[RECONCILIATION] Stopping bot ${bot.id} due to risk: ${riskReason}`);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          appendSecurityLog("system", "admin", "RECONCILIATION_FAILED", bot.id, `Reconciliation failed: ${riskReason}`);
+          await cancelAllPendingOrdersForBot(bot.id);
+        }
+      }
+      dbInstance.save();
+    } catch (err: any) {
+      console.error(`[RECONCILIATION] Failed to fetch data for account ${accountId}: ${err.message}`);
+    }
+  }
+}, 30000);
 
 // Middleware to monitor API call frequency and prevent high frequency API overload risk
 app.use("/api/", (req, res, next) => {
@@ -1628,16 +1816,26 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), async (req: 
   }
 });
 
-async function cancelAllPendingOrdersForBot(botId: string) {
+type CancelReport = {
+  botId: string;
+  attempted: number;
+  canceled: number;
+  failed: Array<{ clientOrderId: string; brokerOrderId?: string; reason: string }>;
+  skipped: Array<{ clientOrderId: string; reason: string }>;
+};
+
+async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport> {
   const db = dbInstance.get();
   const bot = db.bots.find(b => b.id === botId);
-  if (!bot || bot.executionMode !== "live") return;
+  const report: CancelReport = { botId, attempted: 0, canceled: 0, failed: [], skipped: [] };
+  
+  if (!bot || bot.executionMode !== "live") return report;
 
   const realAcc = db.brokerAccounts.find(acc => acc.id === bot.brokerAccountId);
-  if (!realAcc) return;
+  if (!realAcc) return report;
 
   const adapter = getBrokerAdapter(bot.broker);
-  if (!adapter) return;
+  if (!adapter) return report;
 
   let apiKey = "", apiSecret = "", passphrase = "";
   try {
@@ -1645,7 +1843,7 @@ async function cancelAllPendingOrdersForBot(botId: string) {
     apiSecret = decryptSecret(realAcc.encryptedSecret);
     if (realAcc.encryptedPassphrase) passphrase = decryptSecret(realAcc.encryptedPassphrase);
   } catch (err) {
-    return;
+    return report;
   }
 
   const activeOrders = (db.orders || []).filter(
@@ -1653,31 +1851,61 @@ async function cancelAllPendingOrdersForBot(botId: string) {
   );
 
   for (const ord of activeOrders) {
+    report.attempted++;
     try {
-      const brokerOrderIdToCancel = ord.brokerOrderId || ord.clientOrderId;
-      console.log(`[ORDER CANCEL] Canceling order ${brokerOrderIdToCancel} for bot ${botId}`);
-      await adapter.cancelOrder(brokerOrderIdToCancel, ord.symbol, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      if (!ord.brokerOrderId) {
+        console.log(`[ORDER CANCEL] Order ${ord.clientOrderId} has no brokerOrderId, marking CANCEL_REQUESTED`);
+        dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_REQUESTED", undefined, "Cancellation requested; awaiting broker confirmation.");
+        report.skipped.push({ clientOrderId: ord.clientOrderId, reason: "No broker order ID" });
+        continue;
+      }
+
+      console.log(`[ORDER CANCEL] Canceling order ${ord.brokerOrderId} for bot ${botId}`);
+      await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, apiKey, apiSecret, passphrase, realAcc.isSandbox);
       dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", ord.brokerOrderId, "Canceled due to bot stop/kill switch");
+      report.canceled++;
     } catch (err: any) {
       console.error(`[ORDER CANCEL FAILED] Failed to cancel order ${ord.clientOrderId} for bot ${botId}: ${err.message}`);
+      dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_FAILED", ord.brokerOrderId, err.message);
+      report.failed.push({ clientOrderId: ord.clientOrderId, brokerOrderId: ord.brokerOrderId, reason: err.message });
     }
   }
+  
+  return report;
 }
 
 app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: any, res) => {
   const { id } = req.params;
   const botIndex = bots.findIndex((b) => b.id === id);
   if (botIndex !== -1) {
-    bots[botIndex].status = "stopped";
+    bots[botIndex].status = "stopping_cancel_requested";
+    dbInstance.save();
+
+    // N3: Cancel pending orders when bot is stopped
+    const cancelReport = await cancelAllPendingOrdersForBot(id);
+    
+    if (cancelReport.failed.length > 0) {
+      bots[botIndex].status = "stopped_with_open_orders";
+    } else {
+      bots[botIndex].status = "stopped";
+    }
+
     bots[botIndex].isEnabled = false;
     bots[botIndex].lastUpdated = new Date().toISOString();
-    appendSecurityLog(req.user.username, req.user.role, "BOT_STOP", id, `Deactivated bot: ${bots[botIndex].name}`, req.ip);
-    dbInstance.save();
     
-    // N3: Cancel pending orders when bot is stopped
-    await cancelAllPendingOrdersForBot(id);
+    if (cancelReport.failed.length > 0) {
+      appendSecurityLog(req.user.username, req.user.role, "BOT_STOP_FAILED", id, `Deactivated bot ${bots[botIndex].name} but order cancel failed`, req.ip);
+    } else {
+      appendSecurityLog(req.user.username, req.user.role, "BOT_STOP", id, `Deactivated bot: ${bots[botIndex].name}`, req.ip);
+    }
+    dbInstance.save();
 
-    res.json({ success: true, bot: bots[botIndex] });
+    res.json({ 
+      success: cancelReport.failed.length === 0, 
+      bot: bots[botIndex],
+      cancelReport,
+      warning: cancelReport.failed.length > 0 ? "Some broker orders could not be canceled." : undefined
+    });
   } else {
     res.status(404).json({ error: "Bot not found" });
   }
@@ -1839,11 +2067,26 @@ app.post("/api/risk", requireAuth(['admin']), async (req: any, res) => {
 
   if (db.riskSettings.globalKillSwitch) {
     // N3: Kill switch cancels active orders for all bots
-    await Promise.all(bots.map(async (bot) => {
-      bot.status = "stopped_by_risk";
+    const cancelReports = await Promise.all(bots.map(async (bot) => {
+      bot.status = "stopping_cancel_requested";
+      const report = await cancelAllPendingOrdersForBot(bot.id);
+      if (report.failed.length > 0) {
+        bot.status = "stopped_with_open_orders";
+      } else {
+        bot.status = "stopped_by_risk";
+      }
       bot.isEnabled = false;
-      await cancelAllPendingOrdersForBot(bot.id);
+      return report;
     }));
+
+    const hasFailures = cancelReports.some(r => r.failed.length > 0);
+    if (hasFailures) {
+      appendSecurityLog(req.user.username, req.user.role, "KILL_SWITCH_CANCEL_INCOMPLETE", "Global Risk Settings", `Global Kill Switch activated but some orders failed to cancel.`);
+    }
+    
+    appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);
+    dbInstance.save();
+    return res.json({ success: true, settings: db.riskSettings, cancelReports, warning: hasFailures ? "Global Kill Switch activated, but some broker orders could not be canceled." : undefined });
   }
 
   appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);

@@ -42,7 +42,7 @@ export interface BotConfig {
   leverage: number; // 1-20x for futures_grid
   stopLoss?: number;
   takeProfit?: number;
-  status: 'running' | 'paused' | 'stopped' | 'stopped_by_risk';
+  status: 'running' | 'paused' | 'stopped' | 'stopped_by_risk' | 'stopping_cancel_requested' | 'stopped_with_open_orders';
   profitUsd: number;
   profitPercent: number;
   unrealizedProfitUsd: number;
@@ -159,7 +159,7 @@ export interface Order {
   type: "LMT" | "MKT";
   price: number;
   quantity: number;
-  status: "ORDER_INTENT_CREATED" | "PENDING" | "WORKING" | "NEW" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED";
+  status: "ORDER_INTENT_CREATED" | "PENDING" | "WORKING" | "NEW" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED" | "CANCEL_REQUESTED" | "CANCEL_FAILED";
   createdAt: string;
   updatedAt: string;
   lastError?: string;

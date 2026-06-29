@@ -49,6 +49,7 @@ export interface OrderStatus {
   filledPrice?: number;
   filledQuantity?: number;
   error?: string;
+  fills?: Array<{ id: string; price: number; qty: number; fee: number; feeCurrency: string; timestamp: string }>;
 }
 
 export interface BrokerAdapter {
