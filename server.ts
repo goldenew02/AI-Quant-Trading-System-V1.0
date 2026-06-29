@@ -1429,6 +1429,25 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
     return res.status(404).json({ error: "Bot not found" });
   }
 
+  // P1-3: Configuration time live account validation
+  if (config.executionMode === "live") {
+    if (!config.brokerAccountId) {
+      return res.status(400).json({ error: "Live mode requires brokerAccountId." });
+    }
+
+    const account = dbInstance.get().brokerAccounts.find(
+      acc => acc.id === config.brokerAccountId && acc.broker === config.broker
+    );
+
+    if (!account) {
+      return res.status(400).json({ error: "Broker account does not match selected broker." });
+    }
+
+    if (account.isSandbox) {
+      return res.status(400).json({ error: "Live mode cannot bind sandbox/testnet account." });
+    }
+  }
+
   const newInvestment = Number(config.investment);
   const otherBotsInvestment = bots.filter(b => b.id !== id).reduce((sum, b) => sum + b.investment, 0);
   const totalInvProposed = otherBotsInvestment + newInvestment;

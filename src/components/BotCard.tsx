@@ -3,6 +3,16 @@ import { Play, Square, Settings, RefreshCw, Layers, ShieldAlert, Coins, HelpCirc
 import { BotConfig, BrokerType, BotType, FuturesDirection } from "../types";
 import { apiFetch } from "../lib/api";
 
+type BrokerAccountSummary = {
+  id: string;
+  broker: BrokerType;
+  accountAlias: string;
+  permissions: string;
+  isSandbox: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
 interface BotCardProps {
   key?: string;
   bot: BotConfig;
@@ -50,25 +60,33 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
     brokerAccountId: bot.brokerAccountId || "",
   });
 
-  const [brokerAccounts, setBrokerAccounts] = useState<any[]>([]);
+  const [brokerAccounts, setBrokerAccounts] = useState<BrokerAccountSummary[]>([]);
 
   useEffect(() => {
     if (isConfiguring) {
       apiFetch("/api/broker-accounts")
         .then(res => res.json())
         .then(data => {
-          if (data.accounts) {
-            setBrokerAccounts(data.accounts);
-          }
+          const accounts = Array.isArray(data) ? data : (data.accounts || []);
+          setBrokerAccounts(accounts);
         })
         .catch(console.error);
     }
   }, [isConfiguring]);
 
   const handleSave = () => {
-    if (editingConfig.executionMode === "live" && !editingConfig.brokerAccountId) {
-      alert("Please select a valid broker account for Live Execution Mode.");
-      return;
+    if (editingConfig.executionMode === "live") {
+      const selected = brokerAccounts.find(
+        acc =>
+          acc.id === editingConfig.brokerAccountId &&
+          acc.broker === editingConfig.broker &&
+          !acc.isSandbox
+      );
+    
+      if (!selected) {
+        alert("Please select a non-sandbox broker account matching this bot broker.");
+        return;
+      }
     }
     
     onConfigure(bot.id, {
@@ -127,10 +145,19 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
   };
 
   const handleValueChange = (field: string, value: any) => {
-    setEditingConfig((prev) => ({
-      ...prev,
-      [field]: value,
-    }));
+    setEditingConfig((prev) => {
+      const next = { ...prev, [field]: value };
+
+      if (field === "broker") {
+        next.brokerAccountId = "";
+      }
+
+      if (field === "executionMode" && value !== "live") {
+        next.brokerAccountId = "";
+      }
+
+      return next;
+    });
   };
 
   const getStatusColorClass = (status: string) => {
