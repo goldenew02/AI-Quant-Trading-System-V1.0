@@ -390,10 +390,21 @@ function runIsolatedBotStep(bot: BotConfig) {
 
       if (isLive) {
         // --- REAL BROKER PATHWAY (No Early Bookkeeping or Simulated Fills - P0-1) ---
-        // Look for configured real broker credentials matching current bot's broker
-        const realAcc = dbInstance.get().brokerAccounts.find(acc => acc.broker === bot.broker);
-        if (!realAcc) {
-          console.warn(`[REAL BROKER] Bot ${bot.id} is set to Live mode but no API key configured/decrypted for ${bot.broker}. Skipping trigger.`);
+        // Look for configured real broker credentials matching current bot's broker and brokerAccountId
+        const realAcc = dbInstance.get().brokerAccounts.find(
+          acc => acc.id === bot.brokerAccountId && acc.broker === bot.broker
+        );
+        if (!bot.brokerAccountId || !realAcc || realAcc.isSandbox) {
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          appendSecurityLog(
+            "system",
+            "admin",
+            "LIVE_BROKER_ACCOUNT_BINDING_REJECTED",
+            bot.id,
+            "Live order blocked because broker account binding is missing, mismatched, or sandbox."
+          );
+          dbInstance.upsertBot(bot);
           return;
         }
 

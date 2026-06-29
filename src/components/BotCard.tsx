@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Play, Square, Settings, RefreshCw, Layers, ShieldAlert, Coins, HelpCircle } from "lucide-react";
 import { BotConfig, BrokerType, BotType, FuturesDirection } from "../types";
 import { apiFetch } from "../lib/api";
@@ -47,9 +47,30 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
     gridTradeValueUSDT: bot.gridTradeValueUSDT || 100,
     gridIntervalRatio: bot.gridIntervalRatio || 0.01,
     maxSymbolNotionalUSDT: bot.maxSymbolNotionalUSDT || 1000,
+    brokerAccountId: bot.brokerAccountId || "",
   });
 
+  const [brokerAccounts, setBrokerAccounts] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (isConfiguring) {
+      apiFetch("/api/broker-accounts")
+        .then(res => res.json())
+        .then(data => {
+          if (data.accounts) {
+            setBrokerAccounts(data.accounts);
+          }
+        })
+        .catch(console.error);
+    }
+  }, [isConfiguring]);
+
   const handleSave = () => {
+    if (editingConfig.executionMode === "live" && !editingConfig.brokerAccountId) {
+      alert("Please select a valid broker account for Live Execution Mode.");
+      return;
+    }
+    
     onConfigure(bot.id, {
       ...editingConfig,
       rangeMin: Number(editingConfig.rangeMin),
@@ -654,6 +675,26 @@ export default function BotCard({ bot, onStart, onStop, onConfigure }: BotCardPr
                 <option value="live">Live (实盘交易)</option>
               </select>
             </div>
+
+            {editingConfig.executionMode === "live" && (
+              <div>
+                <label className="block text-[10px] text-zinc-500 uppercase font-mono mb-1">Broker Account Binding</label>
+                <select
+                  value={editingConfig.brokerAccountId || ""}
+                  onChange={(e) => handleValueChange("brokerAccountId", e.target.value)}
+                  className="w-full bg-[#141416] border border-[#2A2A2C] rounded-none p-1.5 px-2.5 text-white text-xs font-sans focus:border-[#00FF66] focus:outline-none"
+                >
+                  <option value="">Select broker account...</option>
+                  {brokerAccounts
+                    .filter(acc => acc.broker === editingConfig.broker && !acc.isSandbox)
+                    .map(acc => (
+                      <option key={acc.id} value={acc.id}>
+                        {acc.accountAlias || acc.id} ({acc.broker})
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="flex gap-2 justify-end mt-3">

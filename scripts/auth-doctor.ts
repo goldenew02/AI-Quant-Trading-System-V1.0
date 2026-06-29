@@ -130,7 +130,7 @@ async function main() {
   console.log(`- COOKIE_SECURE: ${process.env.COOKIE_SECURE || "not set"} [Source: ${getVarSource("COOKIE_SECURE")}]`);
   console.log(`- BOOTSTRAP_ADMIN_USER: ${process.env.BOOTSTRAP_ADMIN_USER || "not set"} [Source: ${getVarSource("BOOTSTRAP_ADMIN_USER")}]`);
   console.log(`- BOOTSTRAP_ADMIN_PASSWORD Set: ${process.env.BOOTSTRAP_ADMIN_PASSWORD ? "YES" : "NO"} [Source: ${getVarSource("BOOTSTRAP_ADMIN_PASSWORD")}]`);
-  console.log(`- ADMIN_PASSWORD_SYNC_ON_BOOT: ${process.env.ADMIN_PASSWORD_SYNC_ON_BOOT || "not set (default: true)"} [Source: ${getVarSource("ADMIN_PASSWORD_SYNC_ON_BOOT")}]`);
+  console.log(`- ADMIN_PASSWORD_SYNC_ON_BOOT: ${process.env.ADMIN_PASSWORD_SYNC_ON_BOOT || "not set (default: false)"} [Source: ${getVarSource("ADMIN_PASSWORD_SYNC_ON_BOOT")}]`);
   console.log(`- ADMIN_TOTP_SYNC_ON_BOOT: ${process.env.ADMIN_TOTP_SYNC_ON_BOOT || "not set (default: false)"} [Source: ${getVarSource("ADMIN_TOTP_SYNC_ON_BOOT")}]`);
 
   const sqliteSupported = await checkSqliteSupport();

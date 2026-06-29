@@ -3,17 +3,6 @@ import { AlertOctagon, HelpCircle, Save, ToggleLeft, ToggleRight, Loader, CheckC
 import { RiskSettings } from "../types";
 import { apiFetch } from "../lib/api";
 
-function stableStringify(obj: any): string {
-  return JSON.stringify(obj, Object.keys(obj).sort());
-}
-
-async function computeSha256(text: string): Promise<string> {
-  const msgBuffer = new TextEncoder().encode(text);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
 export default function RiskControl() {
   const [settings, setSettings] = useState<RiskSettings>({
     maxDailyDrawdown: 5,
@@ -118,8 +107,6 @@ export default function RiskControl() {
         autoMeltSharpeThreshold: Number(updatedSettings.autoMeltSharpeThreshold)
       };
 
-      const payloadStr = stableStringify(payload);
-      const payloadHash = await computeSha256(payloadStr);
       const actionName = mfaActionType === 'SAVE' ? "SAVE_RISK_LIMITS" : "TOGGLE_GLOBAL_KILL_SWITCH";
 
       // Step 1: Verify TOTP and obtain the transient high-impact action token
@@ -131,7 +118,7 @@ export default function RiskControl() {
         body: JSON.stringify({ 
           code: mfaCode, 
           action: actionName,
-          bodyHash: payloadHash
+          payload
         }),
       });
       const data = await res.json();

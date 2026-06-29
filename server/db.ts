@@ -34,7 +34,7 @@ if (!fs.existsSync(envPath) && !isProd) {
   const envContent = `# AegisQuant Secure Local Environment Configuration
 BOOTSTRAP_ADMIN_USER=${adminUser}
 BOOTSTRAP_ADMIN_PASSWORD=${adminPass}
-ADMIN_PASSWORD_SYNC_ON_BOOT=true
+ADMIN_PASSWORD_SYNC_ON_BOOT=false
 ADMIN_TOTP_SYNC_ON_BOOT=false
 ENCRYPTION_KEY=${encKey}
 SESSION_SECRET=${sessSec}
@@ -438,6 +438,7 @@ export class AegisDB {
       } else {
         if (syncPasswordOnBoot && !verifyPassword(seedPass, adminUser.passwordHash)) {
           adminUser.passwordHash = hashPassword(seedPass);
+          adminUser.passwordVersion = (adminUser.passwordVersion || 1) + 1;
           needsSave = true;
           this.appendSecurityLog(
             "system",
