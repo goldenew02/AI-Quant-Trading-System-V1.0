@@ -758,13 +758,14 @@ setInterval(async () => {
           const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
           const total = filledPrice * finalChunkQty;
           
+          const feeUsd = Math.round(total * 0.001 * 100) / 100;
           dbInstance.insertFill({
             id: fillId,
             orderId: ord.id,
             brokerFillId: `br_fill_${ord.brokerOrderId || ord.clientOrderId}`,
             price: filledPrice,
             quantity: finalChunkQty,
-            fee: Math.round(total * 0.001 * 100) / 100,
+            fee: feeUsd,
             feeCurrency: "USD",
             timestamp: new Date().toISOString()
           });
@@ -775,7 +776,13 @@ setInterval(async () => {
             realizedPnl = Math.round((filledPrice - bot.entryPrice) * finalChunkQty * 100) / 100;
             if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
             if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * finalChunkQty) * 0.012 * 100) / 100;
+            
+            // N2: Fee enters PnL
+            realizedPnl -= feeUsd;
             bot.profitUsd += realizedPnl;
+          } else {
+            // N2: Fee enters PnL for BUY side as well
+            bot.profitUsd -= feeUsd;
           }
 
           bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
@@ -826,6 +833,7 @@ setInterval(async () => {
           if (newFillQty > 0.0001) {
             const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
             const total = filledPrice * newFillQty;
+            const feeUsd = Math.round(total * 0.001 * 100) / 100;
             const uniqueFillId = `br_fill_partial_${ord.brokerOrderId || ord.clientOrderId}_${cumulativeFilledQty}`;
             
             dbInstance.insertFill({
@@ -834,10 +842,24 @@ setInterval(async () => {
               brokerFillId: uniqueFillId,
               price: filledPrice,
               quantity: newFillQty,
-              fee: Math.round(total * 0.001 * 100) / 100,
+              fee: feeUsd,
               feeCurrency: "USD",
               timestamp: new Date().toISOString()
             });
+
+            // N2: Fee enters PnL for partial fills
+            let realizedPnl = 0;
+            if (ord.side === "SELL") {
+              realizedPnl = Math.round((filledPrice - bot.entryPrice) * newFillQty * 100) / 100;
+              if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
+              if (realizedPnl === 0) realizedPnl = Math.round((filledPrice * newFillQty) * 0.012 * 100) / 100;
+              
+              realizedPnl -= feeUsd;
+              bot.profitUsd += realizedPnl;
+            } else {
+              bot.profitUsd -= feeUsd;
+            }
+            bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
 
             appendTradeLog({
               id: `tx_${Math.random().toString(36).substr(2, 9)}`,
@@ -1606,7 +1628,43 @@ app.post("/api/bots/start/:id", requireAuth(['admin', 'operator']), async (req: 
   }
 });
 
-app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), (req: any, res) => {
+async function cancelAllPendingOrdersForBot(botId: string) {
+  const db = dbInstance.get();
+  const bot = db.bots.find(b => b.id === botId);
+  if (!bot || bot.executionMode !== "live") return;
+
+  const realAcc = db.brokerAccounts.find(acc => acc.id === bot.brokerAccountId);
+  if (!realAcc) return;
+
+  const adapter = getBrokerAdapter(bot.broker);
+  if (!adapter) return;
+
+  let apiKey = "", apiSecret = "", passphrase = "";
+  try {
+    apiKey = decryptSecret(realAcc.encryptedApiKey);
+    apiSecret = decryptSecret(realAcc.encryptedSecret);
+    if (realAcc.encryptedPassphrase) passphrase = decryptSecret(realAcc.encryptedPassphrase);
+  } catch (err) {
+    return;
+  }
+
+  const activeOrders = (db.orders || []).filter(
+    o => o.botId === botId && ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED"].includes(o.status)
+  );
+
+  for (const ord of activeOrders) {
+    try {
+      const brokerOrderIdToCancel = ord.brokerOrderId || ord.clientOrderId;
+      console.log(`[ORDER CANCEL] Canceling order ${brokerOrderIdToCancel} for bot ${botId}`);
+      await adapter.cancelOrder(brokerOrderIdToCancel, ord.symbol, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      dbInstance.updateOrderStatus(ord.clientOrderId, "CANCELED", ord.brokerOrderId, "Canceled due to bot stop/kill switch");
+    } catch (err: any) {
+      console.error(`[ORDER CANCEL FAILED] Failed to cancel order ${ord.clientOrderId} for bot ${botId}: ${err.message}`);
+    }
+  }
+}
+
+app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: any, res) => {
   const { id } = req.params;
   const botIndex = bots.findIndex((b) => b.id === id);
   if (botIndex !== -1) {
@@ -1615,6 +1673,10 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), (req: any, re
     bots[botIndex].lastUpdated = new Date().toISOString();
     appendSecurityLog(req.user.username, req.user.role, "BOT_STOP", id, `Deactivated bot: ${bots[botIndex].name}`, req.ip);
     dbInstance.save();
+    
+    // N3: Cancel pending orders when bot is stopped
+    await cancelAllPendingOrdersForBot(id);
+
     res.json({ success: true, bot: bots[botIndex] });
   } else {
     res.status(404).json({ error: "Bot not found" });
@@ -1776,10 +1838,12 @@ app.post("/api/risk", requireAuth(['admin']), async (req: any, res) => {
   });
 
   if (db.riskSettings.globalKillSwitch) {
-    bots.forEach((bot) => {
+    // N3: Kill switch cancels active orders for all bots
+    await Promise.all(bots.map(async (bot) => {
       bot.status = "stopped_by_risk";
       bot.isEnabled = false;
-    });
+      await cancelAllPendingOrdersForBot(bot.id);
+    }));
   }
 
   appendSecurityLog(req.user.username, req.user.role, "RISK_CONTROL_UPDATE", "Global Risk Settings", `Updated risk thresholds: max leverage ${db.riskSettings.maxLeverageLimit}x, drawdown limit ${db.riskSettings.maxAccountDrawdown}%, kill switch status: ${db.riskSettings.globalKillSwitch}`, req.ip);

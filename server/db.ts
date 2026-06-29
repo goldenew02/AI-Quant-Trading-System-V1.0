@@ -406,13 +406,18 @@ export class AegisDB {
     if (!this.data.ibConnectionMode) this.data.ibConnectionMode = "web_api_proxy";
 
     // Synchronize admin password and TOTP secret with .env to prevent out-of-sync credential lockouts
-    const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
-    const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-    const seedTotp = process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
+    const envPath = path.join(process.cwd(), ".env");
+    let localEnvConfig: any = {};
+    if (fs.existsSync(envPath)) {
+      localEnvConfig = dotenv.parse(fs.readFileSync(envPath, "utf-8"));
+    }
+    const seedUser = localEnvConfig.BOOTSTRAP_ADMIN_USER || process.env.BOOTSTRAP_ADMIN_USER;
+    const seedPass = localEnvConfig.BOOTSTRAP_ADMIN_PASSWORD || process.env.BOOTSTRAP_ADMIN_PASSWORD;
+    const seedTotp = localEnvConfig.BOOTSTRAP_ADMIN_TOTP_SECRET || process.env.BOOTSTRAP_ADMIN_TOTP_SECRET;
 
     // Safety switches for synchronizing credentials on boot
-    const syncPasswordOnBoot = process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
-    const syncTotpOnBoot = process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true"; // defaults to false for protection against unintentional overwrite
+    const syncPasswordOnBoot = localEnvConfig.ADMIN_PASSWORD_SYNC_ON_BOOT === "true" || process.env.ADMIN_PASSWORD_SYNC_ON_BOOT === "true"; 
+    const syncTotpOnBoot = localEnvConfig.ADMIN_TOTP_SYNC_ON_BOOT === "true" || process.env.ADMIN_TOTP_SYNC_ON_BOOT === "true";
 
     if (seedUser && seedPass) {
       let adminUser = this.data.users.find(u => u.username === seedUser);
