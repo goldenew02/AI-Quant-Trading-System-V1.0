@@ -387,6 +387,15 @@ export class AegisDB {
     if (!this.data.brokerAccounts) this.data.brokerAccounts = [];
     if (!this.data.orders) this.data.orders = [];
     if (!this.data.fills) this.data.fills = [];
+    
+    // Migration: add marketType to existing orders
+    for (const order of this.data.orders) {
+      if (!order.marketType) {
+        const bot = this.data.bots?.find((b: any) => b.id === order.botId);
+        order.marketType = (bot?.gridType === "perpetual" || bot?.type === "futures_grid") ? "perpetual" : "spot";
+      }
+    }
+
     if (!this.data.mfaActionTokens) this.data.mfaActionTokens = [];
     if (!this.data.preauthSessions) this.data.preauthSessions = [];
     if (!this.data.riskSettings) {
@@ -681,6 +690,10 @@ export class AegisDB {
               clientOrderId TEXT NOT NULL UNIQUE,
               brokerOrderId TEXT,
               symbol TEXT NOT NULL,
+              marketType TEXT NOT NULL DEFAULT 'spot',
+              marginMode TEXT,
+              positionSide TEXT,
+              exchangeSymbol TEXT,
               side TEXT NOT NULL,
               type TEXT NOT NULL,
               price REAL NOT NULL,
@@ -692,6 +705,13 @@ export class AegisDB {
             )
           `, (err) => {
             if (err) console.error("Failed to create orders table:", err);
+            else {
+              // Add columns if they don't exist (Migration)
+              sqliteDb.run(`ALTER TABLE orders ADD COLUMN marketType TEXT NOT NULL DEFAULT 'spot'`, () => {});
+              sqliteDb.run(`ALTER TABLE orders ADD COLUMN marginMode TEXT`, () => {});
+              sqliteDb.run(`ALTER TABLE orders ADD COLUMN positionSide TEXT`, () => {});
+              sqliteDb.run(`ALTER TABLE orders ADD COLUMN exchangeSymbol TEXT`, () => {});
+            }
           });
 
           // Fetch state
@@ -1064,8 +1084,8 @@ export class AegisDB {
   public insertOrder(ord: Order) {
     if (this.sqliteDbConn) {
       this.sqliteDbConn.run(
-        "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
+        "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, marketType, marginMode, positionSide, exchangeSymbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.marketType || 'spot', ord.marginMode || null, ord.positionSide || null, ord.exchangeSymbol || null, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
         (err) => {
           if (err) {
             if (err.message.includes("UNIQUE constraint failed")) {

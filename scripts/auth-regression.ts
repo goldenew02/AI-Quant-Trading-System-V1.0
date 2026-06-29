@@ -1,84 +1,129 @@
-import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { AegisDB, hashPassword, verifyPassword, encryptSecret, decryptSecret } from "../server/db";
 
-// Mock environment and DB state for testing
-const mockEnv = {
-  ADMIN_PASSWORD_SYNC_ON_BOOT: "false",
-  BOOTSTRAP_ADMIN_PASSWORD: "secretPassword"
-};
-
-function verifyPassword(password: string, stored: string): boolean {
-  try {
-    const [salt, hash] = stored.split(":");
-    if (!salt || !hash) return false;
-    const testHash = crypto.pbkdf2Sync(password, salt, 310000, 64, "sha512").toString("hex");
-    return crypto.timingSafeEqual(Buffer.from(testHash, "hex"), Buffer.from(hash, "hex"));
-  } catch {
-    return false;
-  }
-}
-
-function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.pbkdf2Sync(password, salt, 310000, 64, "sha512").toString("hex");
-  return `${salt}:${hash}`;
-}
-
-function runTests() {
-  console.log("Running Auth Regression Tests...");
+async function runTests() {
+  console.log("Running Auth Regression Tests (with real DB instance)...");
   let passed = 0;
   let failed = 0;
 
-  // Test 1: Verify valid password
-  const testPassword = "mySecurePassword123";
-  const hashed = hashPassword(testPassword);
-  if (verifyPassword(testPassword, hashed)) {
-    console.log("✅ Test 1 Passed: verifyPassword correctly matches valid password");
-    passed++;
-  } else {
-    console.error("❌ Test 1 Failed: verifyPassword failed to match valid password");
-    failed++;
-  }
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aegis-auth-reg-"));
+  process.env.DB_DIR = tempDir;
 
-  // Test 2: Verify invalid password
-  if (!verifyPassword("wrongPassword", hashed)) {
-    console.log("✅ Test 2 Passed: verifyPassword correctly rejects invalid password");
-    passed++;
-  } else {
-    console.error("❌ Test 2 Failed: verifyPassword matched an invalid password");
-    failed++;
-  }
-
-  // Test 3: DB user password check logic (Simulation from auth-doctor)
-  function testDoctorLogic(syncOnBoot: boolean, envPass: string, dbPassMatches: boolean) {
-    let passwordMatchesBootstrap = "";
+  try {
+    // Stage 1: Initialize existing DB state manually to simulate an older deployment
+    const dbFile = path.join(tempDir, "aegis.db");
     
-    if (envPass) {
-      if (dbPassMatches) {
-        passwordMatchesBootstrap = syncOnBoot ? "YES (Matches env password AND sync is enabled)" : "YES (Env password matches DB password)";
-      } else {
-        if (syncOnBoot) {
-          passwordMatchesBootstrap = "NO (MISMATCH, but will be OVERWRITTEN on next boot!)";
-        } else {
-          passwordMatchesBootstrap = "NO (Boot sync disabled and existing credential preserved)";
-        }
-      }
-    } else {
-      passwordMatchesBootstrap = "NO (BOOTSTRAP_ADMIN_PASSWORD env variable is empty/missing)";
-    }
-    return passwordMatchesBootstrap;
-  }
+    // Original credentials that the user set via UI and wants to KEEP
+    const originalPasswordHash = hashPassword("UserCustomPassword123!");
+    const originalTotpSecretEncrypted = encryptSecret("ORIGINAL_TOTP_SECRET_123");
+    
+    const mockInitialData = {
+      users: [{
+        username: "admin",
+        passwordHash: originalPasswordHash,
+        role: "admin",
+        totpSecret: originalTotpSecretEncrypted,
+        isActive: true,
+        mustEnrollTotp: false
+      }]
+    };
+    
+    // We create a dummy DB instance just to write this initial state to disk
+    const initialDb = new AegisDB();
+    await initialDb.ready;
+    initialDb.get().users = [{
+      username: "admin",
+      passwordHash: originalPasswordHash,
+      role: "admin",
+      totpSecret: originalTotpSecretEncrypted,
+      isActive: true,
+      mustEnrollTotp: false
+    }];
+    initialDb.save();
 
-  // Test 3a: Sync disabled, password matches
-  if (testDoctorLogic(false, "pass", true) === "YES (Env password matches DB password)") passed++; else failed++;
-  
-  // Test 3b: Sync disabled, password mismatch (Credential preserved)
-  if (testDoctorLogic(false, "pass", false) === "NO (Boot sync disabled and existing credential preserved)") passed++; else failed++;
-  
-  // Test 3c: Sync enabled, password matches
-  if (testDoctorLogic(true, "pass", true) === "YES (Matches env password AND sync is enabled)") passed++; else failed++;
-  
-  // Test 3d: Sync enabled, password mismatch (Will overwrite)
-  if (testDoctorLogic(true, "pass", false) === "NO (MISMATCH, but will be OVERWRITTEN on next boot!)") passed++; else failed++;
+    console.log("Stage 1: Seeded existing database with custom user credentials.");
+
+    // Stage 2: Boot system with different env credentials, but SYNC_ON_BOOT = false
+    process.env.BOOTSTRAP_ADMIN_USER = "admin";
+    process.env.BOOTSTRAP_ADMIN_PASSWORD = "EnvPasswordThatShouldBeIgnored";
+    process.env.BOOTSTRAP_ADMIN_TOTP_SECRET = "ENV_TOTP_THAT_SHOULD_BE_IGNORED";
+    process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "false";
+    process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
+
+    const testDb1 = new AegisDB();
+    await testDb1.ready;
+    
+    let adminUser = testDb1.get().users.find(u => u.username === "admin");
+    
+    // Check if original credentials were preserved
+    if (adminUser?.passwordHash === originalPasswordHash) {
+      console.log("✅ Test 1 Passed: passwordHash preserved when SYNC_ON_BOOT=false");
+      passed++;
+    } else {
+      console.error("❌ Test 1 Failed: passwordHash was overwritten!");
+      failed++;
+    }
+
+    if (adminUser?.totpSecret === originalTotpSecretEncrypted) {
+      console.log("✅ Test 2 Passed: totpSecret preserved when SYNC_ON_BOOT=false");
+      passed++;
+    } else {
+      console.error("❌ Test 2 Failed: totpSecret was overwritten!");
+      failed++;
+    }
+
+    if (adminUser?.mustEnrollTotp === false) {
+      console.log("✅ Test 3 Passed: mustEnrollTotp preserved as false");
+      passed++;
+    } else {
+      console.error("❌ Test 3 Failed: mustEnrollTotp was reset!");
+      failed++;
+    }
+
+    // Stage 3: Boot system with SYNC_ON_BOOT = true
+    process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "true";
+    process.env.ADMIN_TOTP_SYNC_ON_BOOT = "true";
+
+    const testDb2 = new AegisDB();
+    await testDb2.ready;
+
+    adminUser = testDb2.get().users.find(u => u.username === "admin");
+
+    if (adminUser?.passwordHash !== originalPasswordHash && verifyPassword("EnvPasswordThatShouldBeIgnored", adminUser?.passwordHash || "")) {
+      console.log("✅ Test 4 Passed: passwordHash overwritten when SYNC_ON_BOOT=true");
+      passed++;
+    } else {
+      console.error("❌ Test 4 Failed: passwordHash not updated correctly!");
+      failed++;
+    }
+
+    if (adminUser?.totpSecret !== originalTotpSecretEncrypted && decryptSecret(adminUser?.totpSecret || "") === "ENV_TOTP_THAT_SHOULD_BE_IGNORED") {
+      console.log("✅ Test 5 Passed: totpSecret overwritten when SYNC_ON_BOOT=true");
+      passed++;
+    } else {
+      console.error("❌ Test 5 Failed: totpSecret not updated correctly!");
+      failed++;
+    }
+
+    if (adminUser?.mustEnrollTotp === false) {
+      console.log("✅ Test 6 Passed: mustEnrollTotp is false after sync with provided TOTP");
+      passed++;
+    } else {
+      console.error("❌ Test 6 Failed: mustEnrollTotp state is incorrect!");
+      failed++;
+    }
+    
+  } catch (err) {
+    console.error("Exception during tests:", err);
+    failed++;
+  } finally {
+    // Cleanup
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch (e) {}
+  }
 
   console.log(`\nTests Completed: ${passed} passed, ${failed} failed.`);
   if (failed > 0) {
