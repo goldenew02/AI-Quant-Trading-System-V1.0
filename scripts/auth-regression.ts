@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { AegisDB, hashPassword, verifyPassword, encryptSecret, decryptSecret } from "../server/db";
+import { hashPassword, verifyPassword, encryptSecret, decryptSecret } from "../server/db-core";
 
 async function runTests() {
   console.log("Running Auth Regression Tests (with real DB instance)...");
@@ -31,7 +31,8 @@ async function runTests() {
     };
     
     // We create a dummy DB instance just to write this initial state to disk
-    const initialDb = new AegisDB();
+    const { AegisDB } = await import("../server/db-core");
+    const initialDb = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: false });
     await initialDb.ready;
     initialDb.get().users = [{
       username: "admin",
@@ -52,7 +53,7 @@ async function runTests() {
     process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "false";
     process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
 
-    const testDb1 = new AegisDB();
+    const testDb1 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true });
     await testDb1.ready;
     
     let adminUser = testDb1.get().users.find(u => u.username === "admin");
@@ -86,7 +87,7 @@ async function runTests() {
     process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "true";
     process.env.ADMIN_TOTP_SYNC_ON_BOOT = "true";
 
-    const testDb2 = new AegisDB();
+    const testDb2 = new AegisDB({ dbDir: tempDir, autoBootstrapEnv: true });
     await testDb2.ready;
 
     adminUser = testDb2.get().users.find(u => u.username === "admin");

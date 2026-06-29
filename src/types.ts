@@ -158,6 +158,10 @@ export interface Order {
   marginMode?: "cash" | "cross" | "isolated";
   positionSide?: "long" | "short" | "net";
   exchangeSymbol?: string;
+  cancelRequestedAt?: string;
+  cancelRetryCount?: number;
+  lastBrokerStatus?: string;
+  manualReviewRequired?: boolean;
   symbol: string;
   side: "BUY" | "SELL";
   type: "LMT" | "MKT";

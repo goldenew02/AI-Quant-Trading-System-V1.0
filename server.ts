@@ -704,61 +704,76 @@ setInterval(() => {
   });
 }, 5000);
 
+
+
+import { OrderStatus, OrderAccepted } from "./server/brokers/adapter";
+
 // --- HELPER FOR FILL & PNL PROCESSING ---
-async function recordBrokerExecutionUpdate(ord: any, updatedOrder: any, bot: any) {
+async function recordBrokerExecutionUpdate(ord: Order, updatedOrder: OrderStatus | OrderAccepted, bot: BotConfig) {
   const db = dbInstance.get();
   
+  if ((updatedOrder.status === "FILLED" || updatedOrder.status === "PARTIALLY_FILLED") && 
+      (!("fills" in updatedOrder) || !updatedOrder.fills || updatedOrder.fills.length === 0) && 
+      !updatedOrder.filledQuantity) {
+    console.error(`[ORDER FILL ERROR] Broker reported ${updatedOrder.status} but missing both fills and filledQuantity for order ${ord.clientOrderId}`);
+    // Do not proceed with state updates that rely on fill data
+    return;
+  }
+  
+  const fillsToProcess: Array<{
+    fill: Fill;
+    log?: Omit<TradeLog, "previousHash" | "currentHash">;
+    pnlIncrement: number;
+    feeIncrement: number;
+  }> = [];
+
   const processFills = (fills: any[]) => {
     for (const fill of fills) {
-      const isAlreadyRecorded = (db.fills || []).some((f: any) => f.brokerFillId === fill.id);
+      const isAlreadyRecorded = (db.fills || []).some((f: any) => f.brokerFillId === fill.id && f.orderId === ord.id);
       if (!isAlreadyRecorded) {
         const fillId = "fill_" + crypto.randomBytes(8).toString("hex");
-        dbInstance.insertFill({
-          id: fillId,
-          orderId: ord.id,
-          brokerFillId: fill.id,
-          price: fill.price,
-          quantity: fill.qty,
-          fee: fill.fee,
-          feeCurrency: fill.feeCurrency,
-          timestamp: fill.timestamp || new Date().toISOString()
-        });
-
         const total = fill.price * fill.qty;
         let realizedPnl = 0;
+        
         if (ord.side === "SELL") {
           realizedPnl = Math.round((fill.price - bot.entryPrice) * fill.qty * 100) / 100;
           if (realizedPnl < 0 && bot.direction === "long") realizedPnl = Math.abs(realizedPnl) * 0.2;
           if (realizedPnl === 0) realizedPnl = Math.round((total) * 0.012 * 100) / 100;
-          realizedPnl -= fill.fee;
-          bot.profitUsd += realizedPnl;
-        } else {
-          bot.profitUsd -= fill.fee;
         }
 
-        bot.profitUsd = Math.round(bot.profitUsd * 100) / 100;
-        bot.profitPercent = Math.round((bot.profitUsd / bot.investment) * 10000) / 100;
-        bot.tradesCount++;
-
-        appendTradeLog({
-          id: `tx_${Math.random().toString(36).substr(2, 9)}`,
-          botId: bot.id,
-          botName: bot.name,
-          broker: bot.broker,
-          symbol: bot.symbol,
-          timestamp: new Date().toISOString(),
-          type: ord.side.toLowerCase() as 'buy' | 'sell',
-          price: fill.price,
-          amount: fill.qty,
-          total,
-          pnl: realizedPnl > 0 ? realizedPnl : undefined
+        fillsToProcess.push({
+          fill: {
+            id: fillId,
+            orderId: ord.id,
+            brokerFillId: fill.id,
+            price: fill.price,
+            quantity: fill.qty,
+            fee: fill.fee,
+            feeCurrency: fill.feeCurrency,
+            timestamp: fill.timestamp || new Date().toISOString()
+          },
+          log: {
+            id: `tx_${Math.random().toString(36).substr(2, 9)}`,
+            botId: bot.id,
+            botName: bot.name,
+            broker: bot.broker,
+            symbol: bot.symbol,
+            timestamp: new Date().toISOString(),
+            type: ord.side.toLowerCase() as 'buy' | 'sell',
+            price: fill.price,
+            amount: fill.qty,
+            total,
+            pnl: realizedPnl > 0 ? realizedPnl - fill.fee : undefined
+          },
+          pnlIncrement: realizedPnl,
+          feeIncrement: fill.fee
         });
       }
     }
   };
 
   const filledPrice = updatedOrder.filledPrice ?? ord.price;
-  if (updatedOrder.fills && updatedOrder.fills.length > 0) {
+  if ("fills" in updatedOrder && updatedOrder.fills && updatedOrder.fills.length > 0) {
     processFills(updatedOrder.fills);
   } else {
     // Fallback synthesis
@@ -780,19 +795,23 @@ async function recordBrokerExecutionUpdate(ord: any, updatedOrder: any, bot: any
     }
   }
 
-  // Update order status AFTER recording fills to ensure atomic-like visibility
-  dbInstance.updateOrderStatus(ord.clientOrderId, updatedOrder.status, ord.brokerOrderId || updatedOrder.brokerOrderId);
-
-  // Flip grid state if order fully filled
+  let botGridUpdates = undefined;
   if (updatedOrder.status === "FILLED") {
-    const gridIndex = bot.grids.findIndex((g: any) => Math.abs(g.price - ord.price) < 0.0001 && g.type === ord.side.toLowerCase());
-    if (gridIndex !== -1) {
-      bot.grids[gridIndex].filled = false;
-      bot.grids[gridIndex].type = ord.side.toLowerCase() === "buy" ? "sell" : "buy";
-    }
+    botGridUpdates = {
+      targetPrice: ord.price,
+      side: ord.side.toLowerCase()
+    };
   }
 
-  dbInstance.upsertBot(bot);
+  await dbInstance.recordExecutionTransaction({
+    orderId: ord.id,
+    clientOrderId: ord.clientOrderId,
+    nextStatus: updatedOrder.status,
+    brokerOrderId: ord.brokerOrderId || updatedOrder.brokerOrderId,
+    botId: bot.id,
+    fillsToProcess,
+    botGridUpdates
+  });
 }
 
 // Poll and update WORKING or PENDING orders from real brokers every 10 seconds (P0-6)
@@ -848,18 +867,27 @@ setInterval(async () => {
         } else if (updatedOrder.status === "FILLED" || updatedOrder.status === "PARTIALLY_FILLED") {
           await recordBrokerExecutionUpdate(ord, updatedOrder, bot);
         } else if (updatedOrder.status === "NEW" || updatedOrder.status === "WORKING") {
-          const anyOrd = ord as any;
-          anyOrd.cancelRetryCount = (anyOrd.cancelRetryCount || 0) + 1;
-          if (anyOrd.cancelRetryCount > 3) {
+          const newRetryCount = (ord.cancelRetryCount || 0) + 1;
+          
+          if (!ord.brokerOrderId) {
+            console.warn(`[ORDER CANCEL FAILED] No brokerOrderId for ${ord.clientOrderId}, requires manual review`);
+            dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", manualReviewRequired: true, lastError: "Missing brokerOrderId" });
+            continue;
+          }
+
+          if (newRetryCount > 3) {
              console.warn(`[ORDER CANCEL FAILED] Exceeded retry count for ${ord.clientOrderId}`);
-             dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_FAILED", updatedOrder.brokerOrderId || ord.brokerOrderId, "Exceeded retry count");
+             dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: "Exceeded retry count" });
           } else {
              try {
-               await adapter.cancelOrder(ord.brokerOrderId || "", ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+               await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+               dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
              } catch (cancelErr: any) {
                console.error(`[ORDER CANCEL RETRY] Failed to retry cancel for ${ord.clientOrderId}: ${cancelErr.message}`);
-               if (anyOrd.cancelRetryCount > 1) {
-                  dbInstance.updateOrderStatus(ord.clientOrderId, "CANCEL_FAILED", updatedOrder.brokerOrderId || ord.brokerOrderId, cancelErr.message);
+               if (newRetryCount > 1) {
+                  dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: cancelErr.message });
+               } else {
+                  dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
                }
              }
           }
