@@ -1429,14 +1429,20 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
     return res.status(404).json({ error: "Bot not found" });
   }
 
-  // P1-3: Configuration time live account validation
-  if (config.executionMode === "live") {
-    if (!config.brokerAccountId) {
+  const currentBot = bots[botIndex];
+  const effectiveConfig = {
+    ...currentBot,
+    ...config
+  };
+
+  // P1-3: Configuration time live account validation (effective state)
+  if (effectiveConfig.executionMode === "live") {
+    if (!effectiveConfig.brokerAccountId) {
       return res.status(400).json({ error: "Live mode requires brokerAccountId." });
     }
 
     const account = dbInstance.get().brokerAccounts.find(
-      acc => acc.id === config.brokerAccountId && acc.broker === config.broker
+      acc => acc.id === effectiveConfig.brokerAccountId && acc.broker === effectiveConfig.broker
     );
 
     if (!account) {
@@ -1448,7 +1454,7 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
     }
   }
 
-  const newInvestment = Number(config.investment);
+  const newInvestment = Number(effectiveConfig.investment);
   const otherBotsInvestment = bots.filter(b => b.id !== id).reduce((sum, b) => sum + b.investment, 0);
   const totalInvProposed = otherBotsInvestment + newInvestment;
 
@@ -1456,12 +1462,12 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
   const singleAssetPercent = totalInvProposed > 0 ? (newInvestment / totalInvProposed) * 100 : 0;
   if (singleAssetPercent > riskSettings.singleAssetMaxAllocationPercent) {
     return res.status(400).json({
-      error: `组合风控预警 (PORTFOLIO_ASSET_ALLOC_BREACH): 单一资产 [${config.symbol}] 拟分配资金占比达 ${singleAssetPercent.toFixed(1)}%，已超过组合持仓风控上限 [${riskSettings.singleAssetMaxAllocationPercent}%]。请调低出资额或增加其他策略持仓。`
+      error: `组合风控预警 (PORTFOLIO_ASSET_ALLOC_BREACH): 单一资产 [${effectiveConfig.symbol}] 拟分配资金占比达 ${singleAssetPercent.toFixed(1)}%，已超过组合持仓风控上限 [${riskSettings.singleAssetMaxAllocationPercent}%]。请调低出资额或增加其他策略持仓。`
     });
   }
 
   // 2. Portfolio Allocation Wind Control - Industry Crypto Exposure Cap
-  const isProposedCrypto = (config.symbol || "").includes("/");
+  const isProposedCrypto = (effectiveConfig.symbol || "").includes("/");
   const cryptoInvProposed = bots.filter(b => b.id !== id).reduce((sum, b) => {
     const isCrypto = b.symbol.includes("/");
     return sum + (isCrypto ? b.investment : 0);
@@ -1475,21 +1481,21 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
   }
 
   // 3. Leverage Cap Control
-  if (Number(config.leverage || 1) > riskSettings.maxLeverageLimit) {
+  if (Number(effectiveConfig.leverage || 1) > riskSettings.maxLeverageLimit) {
     return res.status(400).json({
-      error: `杠杆超限预警 (LEVERAGE_BREACH): 当前配置杠杆倍数 [${config.leverage}x] 已超过全局最大杠杆限制上限 [${riskSettings.maxLeverageLimit}x]。请降低杠杆以维持充足保证金安全垫。`
+      error: `杠杆超限预警 (LEVERAGE_BREACH): 当前配置杠杆倍数 [${effectiveConfig.leverage}x] 已超过全局最大杠杆限制上限 [${riskSettings.maxLeverageLimit}x]。请降低杠杆以维持充足保证金安全垫。`
     });
   }
 
   // 4. Restricted Asset Checklist
-  if (riskSettings.restrictedSymbols.some(s => s.toLowerCase() === (config.symbol || "").toLowerCase())) {
+  if (riskSettings.restrictedSymbols.some(s => s.toLowerCase() === (effectiveConfig.symbol || "").toLowerCase())) {
     return res.status(400).json({
-      error: `标的禁投预警 (SYMBOL_RESTRICTED): 交易标的 [${config.symbol}] 属于高波动禁投资产，已被全局风控限制。`
+      error: `标的禁投预警 (SYMBOL_RESTRICTED): 交易标的 [${effectiveConfig.symbol}] 属于高波动禁投资产，已被全局风控限制。`
     });
   }
 
   // 5. Spot Grid Safety Restrictions - Short & Neutral Prohibited (P1-3)
-  if (config.type === "spot_grid" && (config.direction === "short" || config.direction === "neutral")) {
+  if (effectiveConfig.type === "spot_grid" && (effectiveConfig.direction === "short" || effectiveConfig.direction === "neutral")) {
     return res.status(400).json({
       error: `现货风控限制 (SPOT_DIRECTION_RESTRICTED): 现货普通或专业现货网格 (Spot Grid) 不支持 '做空 (Short)' 或 '双向 (Neutral)' 交易模式。现货方向必须强制为 '做多 (Long)'。`
     });
@@ -1504,37 +1510,36 @@ app.post("/api/bots/configure/:id", requireAuth(['admin']), (req: any, res) => {
   bot.configHistory.push({
     version: nextVer,
     timestamp: new Date().toISOString(),
-    rangeMin: Number(config.rangeMin),
-    rangeMax: Number(config.rangeMax),
-    gridCount: Number(config.gridCount),
-    investment: Number(config.investment),
-    leverage: Number(config.leverage || 1),
+    rangeMin: Number(effectiveConfig.rangeMin),
+    rangeMax: Number(effectiveConfig.rangeMax),
+    gridCount: Number(effectiveConfig.gridCount),
+    investment: Number(effectiveConfig.investment),
+    leverage: Number(effectiveConfig.leverage || 1),
   });
 
   bots[botIndex] = {
-    ...bot,
-    ...config,
+    ...effectiveConfig,
     version: nextVer,
     grids: generateGrids(
-      Number(config.rangeMin),
-      Number(config.rangeMax),
-      Number(config.gridCount),
+      Number(effectiveConfig.rangeMin),
+      Number(effectiveConfig.rangeMax),
+      Number(effectiveConfig.gridCount),
       bot.currentPrice,
-      Number(config.investment) / Number(config.gridCount)
+      Number(effectiveConfig.investment) / Number(effectiveConfig.gridCount)
     ),
     lastUpdated: new Date().toISOString(),
   };
 
   // Calculate Futures or Perpetual liquidation metrics
-  if (config.gridType === "perpetual") {
-    const directionFactor = config.direction === "long" ? 1 : config.direction === "short" ? -1 : 0;
-    const lev = Number(config.perpetualLeverage || 5);
+  if (effectiveConfig.gridType === "perpetual") {
+    const directionFactor = effectiveConfig.direction === "long" ? 1 : effectiveConfig.direction === "short" ? -1 : 0;
+    const lev = Number(effectiveConfig.perpetualLeverage || 5);
     bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.9) / lev) * 100) / 100;
-    bots[botIndex].maintenanceMargin = Math.round((Number(config.investment) / lev) * 0.05 * 100) / 100;
-  } else if (config.type === "futures_grid") {
-    const directionFactor = config.direction === "long" ? 1 : config.direction === "short" ? -1 : 0;
-    bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.8) / Number(config.leverage || 1)) * 100) / 100;
-    bots[botIndex].maintenanceMargin = Math.round(Number(config.investment) * 0.05 * 100) / 100;
+    bots[botIndex].maintenanceMargin = Math.round((Number(effectiveConfig.investment) / lev) * 0.05 * 100) / 100;
+  } else if (effectiveConfig.type === "futures_grid") {
+    const directionFactor = effectiveConfig.direction === "long" ? 1 : effectiveConfig.direction === "short" ? -1 : 0;
+    bots[botIndex].liquidationPrice = Math.round(bot.currentPrice * (1 - (directionFactor * 0.8) / Number(effectiveConfig.leverage || 1)) * 100) / 100;
+    bots[botIndex].maintenanceMargin = Math.round(Number(effectiveConfig.investment) * 0.05 * 100) / 100;
   } else {
     delete bots[botIndex].liquidationPrice;
     delete bots[botIndex].maintenanceMargin;
