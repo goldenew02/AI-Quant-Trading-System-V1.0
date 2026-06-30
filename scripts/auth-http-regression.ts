@@ -4,6 +4,7 @@ import os from "os";
 import crypto from "crypto";
 
 process.env.NODE_ENV = "test";
+process.env.AEGIS_DISABLE_ENV_BOOTSTRAP = "true";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "aegis-http-reg-"));
 process.env.DB_DIR = tempDir;
@@ -22,10 +23,34 @@ function generateRandomBase32Secret() {
   }
   return secret;
 }
+function generateTOTP(secret: string, timestamp = Date.now()): string {
+  // Base32 decode
+  const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (let i = 0; i < secret.length; i++) {
+    const val = base32chars.indexOf(secret.charAt(i).toUpperCase());
+    bits += val.toString(2).padStart(5, '0');
+  }
+  const hex = (bits.match(/.{1,8}/g) || []).map(b => parseInt(b, 2).toString(16).padStart(2, '0')).join('');
+  const keyBuffer = Buffer.from(hex, 'hex');
+
+  const time = Math.floor(timestamp / 30000);
+  const timeBuffer = Buffer.alloc(8);
+  timeBuffer.writeUInt32BE(time, 4);
+
+  const hmac = crypto.createHmac('sha1', keyBuffer);
+  hmac.update(timeBuffer);
+  const hmacResult = hmac.digest();
+
+  const offset = hmacResult[hmacResult.length - 1] & 0xf;
+  const code = (hmacResult.readUInt32BE(offset) & 0x7fffffff) % 1000000;
+  return code.toString().padStart(6, '0');
+}
 const randTotp = generateRandomBase32Secret();
 
 process.env.BOOTSTRAP_ADMIN_USER = "admin";
-process.env.BOOTSTRAP_ADMIN_PASSWORD = randPass;
+process.env.BOOTSTRAP_ADMIN_PASSWORD = "DIFFERENT_BOOTSTRAP_PASSWORD_123!";
+process.env.BOOTSTRAP_ADMIN_TOTP_SECRET = "DIFFERENT_TOTP_SECRET_1234567890123";
 process.env.SESSION_SECRET = crypto.randomBytes(64).toString("base64");
 process.env.APP_URL = "http://127.0.0.1";
 process.env.COOKIE_SAMESITE = "lax";
@@ -78,15 +103,14 @@ async function run() {
   const rootEnvPath = path.join(process.cwd(), ".env");
   const rootDataPath = path.join(process.cwd(), "data");
   
-  if (fs.existsSync(path.join(rootDataPath, "aegis_secure.json"))) {
-    fs.copyFileSync(path.join(rootDataPath, "aegis_secure.json"), path.join(rootDataPath, "aegis_secure.json.bak"));
-  }
-
   const rootEnvBefore = hashFile(rootEnvPath);
   const rootDataBefore = fingerprintTree(rootDataPath);
 
   const { AegisDB, setEncryptionKey, encryptSecret, hashPassword } = await import("../server/db-core");
   setEncryptionKey(testEncryptionKey);
+
+  const origPassHash = hashPassword(randPass);
+  const origTotpEnc = encryptSecret(randTotp);
 
   const initialDb = new AegisDB({ 
     dbDir: tempDir, 
@@ -94,11 +118,12 @@ async function run() {
     encryptionKey: testEncryptionKey,
     seedUsers: [{
       username: "admin",
-      passwordHash: hashPassword(randPass),
+      passwordHash: origPassHash,
       role: "admin",
-      totpSecret: encryptSecret(randTotp),
+      totpSecret: origTotpEnc,
       isActive: true,
-      mustEnrollTotp: false
+      mustEnrollTotp: false,
+      passwordVersion: 1
     }]
   });
   await initialDb.ready;
@@ -170,14 +195,7 @@ async function run() {
     }
 
     const { verifyTOTP } = await import("../server/db-core");
-    let token = "";
-    for (let i = 0; i < 1000000; i++) {
-      const candidate = i.toString().padStart(6, "0");
-      if (verifyTOTP(randTotp, candidate)) {
-        token = candidate;
-        break;
-      }
-    }
+    let token = generateTOTP(randTotp);
     
     if (token) {
       response = await fetch(`${baseUrl}/api/auth/login/totp`, {
@@ -221,6 +239,18 @@ async function run() {
           console.error("[FAIL] Test 3 Failed: /api/auth/me failed", meBody);
           failed++;
         }
+
+        // Test explicit state check
+        const dbAdmin = dbInstance.get().users.find((u: any) => u.username === "admin");
+        if (dbAdmin) {
+          if (dbAdmin.passwordHash === origPassHash && dbAdmin.totpSecret === origTotpEnc && dbAdmin.passwordVersion === 1) {
+            console.log("[PASS] Test 3b Passed: Admin user state is unmodified in DB (sync flags respected)");
+            passed++;
+          } else {
+            console.error("[FAIL] Test 3b Failed: Admin user state was unexpectedly modified!");
+            failed++;
+          }
+        }
       } else {
         console.error("[FAIL] Test 2 Failed: TOTP verification failed", totpBody);
         failed++;
@@ -240,22 +270,14 @@ async function run() {
       failed++;
     }
 
-    let rootDataPass = true;
-    try {
-      const bak = fs.readFileSync(path.join(rootDataPath, "aegis_secure.json.bak"), "utf8");
-      const cur = fs.readFileSync(path.join(rootDataPath, "aegis_secure.json"), "utf8");
-      const bObj = JSON.parse(bak);
-      const cObj = JSON.parse(cur);
-      if (JSON.stringify(bObj.users) !== JSON.stringify(cObj.users)) {
-        console.error("[FAIL] Test 5 Failed: Root data/users was modified!");
-        rootDataPass = false;
-      }
-    } catch (e) {}
-
-    if (rootDataPass) {
-      console.log("[PASS] Test 5 Passed: Root data/users unchanged");
+    const rootDataAfter = fingerprintTree(rootDataPath);
+    if (rootDataBefore.hash === rootDataAfter.hash) {
+      console.log("[PASS] Test 5 Passed: Root data/ unchanged");
       passed++;
     } else {
+      console.error("[FAIL] Test 5 Failed: Root data/ was modified!");
+      console.error("Before:", rootDataBefore.entries);
+      console.error("After:", rootDataAfter.entries);
       failed++;
     }
 

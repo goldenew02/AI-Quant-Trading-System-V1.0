@@ -6,8 +6,9 @@ import dotenv from "dotenv";
 export function bootstrapAndValidateEnv() {
   const envPath = path.join(process.cwd(), ".env");
   const isProd = process.env.NODE_ENV === "production";
+  const disableEnvBootstrap = process.env.NODE_ENV === "test" || process.env.AEGIS_DISABLE_ENV_BOOTSTRAP === "true";
 
-  if (!fs.existsSync(envPath) && !isProd) {
+  if (!disableEnvBootstrap && !fs.existsSync(envPath) && !isProd) {
     // Development only: dynamically bootstrap a highly secure .env with strong random secrets
     const adminUser = "admin";
     const adminPass = "Aegis_" + crypto.randomBytes(6).toString("hex") + "!";

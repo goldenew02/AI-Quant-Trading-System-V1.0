@@ -167,7 +167,7 @@ export interface Order {
   type: "LMT" | "MKT";
   price: number;
   quantity: number;
-  status: "ORDER_INTENT_CREATED" | "PENDING" | "WORKING" | "NEW" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED" | "CANCEL_REQUESTED" | "CANCEL_FAILED";
+  status: "ORDER_INTENT_CREATED" | "PENDING" | "PENDING_UNKNOWN" | "WORKING" | "NEW" | "FILLED" | "PARTIALLY_FILLED" | "CANCELED" | "REJECTED" | "CANCEL_REQUESTED" | "CANCEL_FAILED";
   createdAt: string;
   updatedAt: string;
   lastError?: string;

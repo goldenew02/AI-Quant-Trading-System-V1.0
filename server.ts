@@ -516,7 +516,7 @@ async function runIsolatedBotStep(bot: BotConfig) {
         console.log(`[REAL BROKER ORDER] Placing order ${clientOrderId} to ${bot.broker} for ${grid.amount} ${bot.symbol} at ${tradePrice}`);
         
         try {
-          const accepted = await adapter.placeOrder(
+          const accepted = await withTimeout(adapter.placeOrder(
             {
               botId: bot.id,
               brokerAccountId: realAcc.id,
@@ -533,7 +533,7 @@ async function runIsolatedBotStep(bot: BotConfig) {
             apiSecret,
             passphrase,
             realAcc.isSandbox
-          );
+          ), 8000, "placeOrder timeout");
           if (accepted.status === "NEW") {
             // Live broker accepted the order. It is now active on the broker book (WORKING status per P0-6)
             await dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
@@ -555,7 +555,12 @@ async function runIsolatedBotStep(bot: BotConfig) {
           }
         } catch (apiErr: any) {
           console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
-          await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
+          if (apiErr.message === "placeOrder timeout") {
+            await dbInstance.updateOrderStatus(clientOrderId, "PENDING_UNKNOWN", undefined, "placeOrder timeout, manual review required");
+            appendSecurityLog("system", "admin", "BROKER_TIMEOUT", bot.id, `Order ${clientOrderId} timed out. Manual review required.`);
+          } else {
+            await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
+          }
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           appendSecurityLog("system", "admin", "BROKER_OFFLINE", bot.id, `Network execution exception on ${bot.broker}: ${apiErr.message}`);
@@ -699,12 +704,19 @@ async function runIsolatedBotStep(bot: BotConfig) {
 }
 
 let botSupervisorTickRunning = false;
+let supervisorSkipCount = 0;
+let lastSupervisorSkipLogTime = 0;
 
 // 7*24h simulation logic running every 5 seconds on Node backend background
 setInterval(async () => {
   if (riskSettings.globalKillSwitch) return;
   if (botSupervisorTickRunning) {
-    appendSecurityLog("system", "admin", "SUPERVISOR_TICK_SKIPPED", "bot-supervisor", "Previous bot tick still running.");
+    supervisorSkipCount++;
+    if (Date.now() - lastSupervisorSkipLogTime > 60000) {
+      appendSecurityLog("system", "admin", "SUPERVISOR_TICK_SKIPPED", "bot-supervisor", `Previous bot tick still running. Skipped ${supervisorSkipCount} ticks in last minute.`);
+      supervisorSkipCount = 0;
+      lastSupervisorSkipLogTime = Date.now();
+    }
     return;
   }
   botSupervisorTickRunning = true;
@@ -851,11 +863,18 @@ async function recordBrokerExecutionUpdate(ord: Order, updatedOrder: OrderStatus
 }
 
 let orderPollingRunning = false;
+let orderPollingSkipCount = 0;
+let lastOrderPollingSkipLogTime = 0;
 
 // Poll and update WORKING or PENDING orders from real brokers every 10 seconds (P0-6)
 setInterval(async () => {
   if (orderPollingRunning) {
-    appendSecurityLog("system", "admin", "ORDER_POLLING_SKIPPED", "order-polling", "Previous polling tick still running.");
+    orderPollingSkipCount++;
+    if (Date.now() - lastOrderPollingSkipLogTime > 60000) {
+      appendSecurityLog("system", "admin", "ORDER_POLLING_SKIPPED", "order-polling", `Previous polling tick still running. Skipped ${orderPollingSkipCount} ticks in last minute.`);
+      orderPollingSkipCount = 0;
+      lastOrderPollingSkipLogTime = Date.now();
+    }
     return;
   }
   orderPollingRunning = true;
@@ -929,7 +948,7 @@ setInterval(async () => {
              await dbInstance.updateOrderState(ord.clientOrderId, { status: "CANCEL_FAILED", brokerOrderId: updatedOrder.brokerOrderId || ord.brokerOrderId, cancelRetryCount: newRetryCount, lastError: "Exceeded retry count" });
           } else {
              try {
-               await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+               await withTimeout(adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox), 8000, "cancelOrder timeout");
                await dbInstance.updateOrderState(ord.clientOrderId, { cancelRetryCount: newRetryCount });
              } catch (cancelErr: any) {
                console.error(`[ORDER CANCEL RETRY] Failed to retry cancel for ${ord.clientOrderId}: ${cancelErr.message}`);
@@ -997,11 +1016,18 @@ setInterval(() => {
 }, 60000);
 
 let reconciliationRunning = false;
+let reconciliationSkipCount = 0;
+let lastReconciliationSkipLogTime = 0;
 
 // N4: Reconciliation loop to verify real broker state against local state (P1-4)
 setInterval(async () => {
   if (reconciliationRunning) {
-    appendSecurityLog("system", "admin", "RECONCILIATION_SKIPPED", "reconciliation", "Previous reconciliation tick still running.");
+    reconciliationSkipCount++;
+    if (Date.now() - lastReconciliationSkipLogTime > 60000) {
+      appendSecurityLog("system", "admin", "RECONCILIATION_SKIPPED", "reconciliation", `Previous reconciliation tick still running. Skipped ${reconciliationSkipCount} ticks in last minute.`);
+      reconciliationSkipCount = 0;
+      lastReconciliationSkipLogTime = Date.now();
+    }
     return;
   }
   reconciliationRunning = true;
@@ -1879,7 +1905,7 @@ async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport
       }
 
       console.log(`[ORDER CANCEL] Canceling order ${ord.brokerOrderId} for bot ${botId}`);
-      await adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      await withTimeout(adapter.cancelOrder(ord.brokerOrderId, ord.symbol, ord.marketType, apiKey, apiSecret, passphrase, realAcc.isSandbox), 8000, "cancelOrder timeout");
       await dbInstance.updateOrderState(ord.clientOrderId, { 
         status: "CANCELED", 
         brokerOrderId: ord.brokerOrderId, 

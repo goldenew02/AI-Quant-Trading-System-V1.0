@@ -927,9 +927,44 @@ export class AegisDB {
     }
   }
 
-  public async saveAsync(): Promise<void> {
-    this.save();
-    return Promise.resolve();
+  public saveAsync(): Promise<void> {
+    const dataToSave = { ...this.data };
+    if (isSqliteSupported) {
+      delete (dataToSave as any).preauthSessions;
+      delete (dataToSave as any).mfaActionTokens;
+    }
+
+    const payload = JSON.stringify(dataToSave, null, 2);
+
+    if (!isSqliteSupported) {
+      return new Promise((resolve, reject) => {
+        const JSON_FILE = path.join(this.dbDir, "aegis_secure.json");
+        const TEMP_FILE = JSON_FILE + ".tmp";
+        fs.promises.writeFile(TEMP_FILE, payload, "utf-8")
+          .then(() => fs.promises.rename(TEMP_FILE, JSON_FILE))
+          .then(resolve)
+          .catch((err) => {
+             console.error("[Aegis DB] Error writing JSON file", err);
+             reject(err);
+          });
+      });
+    }
+
+    return new Promise((resolve, reject) => {
+      if (!this.sqliteDbConn) return resolve();
+      this.sqliteDbConn.run(
+        "INSERT INTO aegis_kv (id, snapshot_json, updated_at) VALUES ('primary', ?, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at",
+        [payload, new Date().toISOString()],
+        function (err: any) {
+          if (err) {
+            console.error("[Aegis DB] Async SQLite KV Snapshot Error:", err);
+            reject(err);
+          } else {
+            resolve();
+          }
+        }
+      );
+    });
   }
 
   public save() {
@@ -1105,8 +1140,7 @@ export class AegisDB {
               }
             }
             this.data.orders.unshift(ord);
-            this.save();
-            resolve(true);
+            this.saveAsync().then(() => resolve(true)).catch(reject);
           }
         );
         return;
@@ -1115,8 +1149,7 @@ export class AegisDB {
       const exists = this.data.orders.some((o: Order) => o.clientOrderId === ord.clientOrderId);
       if (!exists) {
         this.data.orders.unshift(ord);
-        this.save();
-        resolve(true);
+        this.saveAsync().then(() => resolve(true)).catch(reject);
       } else {
         resolve(false);
       }
@@ -1125,7 +1158,8 @@ export class AegisDB {
 
   private readonly ORDER_TRANSITIONS: Record<string, string[]> = {
     "ORDER_INTENT_CREATED": ["PENDING", "REJECTED", "CANCEL_REQUESTED"],
-    "PENDING": ["WORKING", "NEW", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCEL_REQUESTED", "CANCELED"],
+    "PENDING": ["WORKING", "NEW", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCEL_REQUESTED", "CANCELED", "PENDING_UNKNOWN"],
+    "PENDING_UNKNOWN": ["WORKING", "NEW", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCEL_REQUESTED", "CANCELED"],
     "NEW": ["WORKING", "PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "REJECTED"],
     "WORKING": ["PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED"],
     "PARTIALLY_FILLED": ["FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED"],
@@ -1178,13 +1212,11 @@ export class AegisDB {
                 );
                 return reject(new Error(`SQLite order row missing: ${clientOrderId}`));
               }
-              db.save();
-              resolve();
+              db.saveAsync().then(() => resolve()).catch(reject);
             }
           );
         } else {
-          this.save();
-          resolve();
+          this.saveAsync().then(() => resolve()).catch(reject);
         }
       } else {
         if (!updates.allowMissing) {
@@ -1234,15 +1266,13 @@ export class AegisDB {
             }
             // Only push to memory and save state after successful DB insert
             this.data.fills.unshift(fill);
-            this.save();
-            resolve(true);
+            this.saveAsync().then(() => resolve(true)).catch(reject);
           }
         );
       } else {
         // Memory fallback if sqlite is not connected (e.g. testing/bootstrap)
         this.data.fills.unshift(fill);
-        this.save();
-        resolve(true);
+        this.saveAsync().then(() => resolve(true)).catch(reject);
       }
     });
   }
