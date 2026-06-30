@@ -12,15 +12,81 @@ process.env.ENCRYPTION_KEY = testEncryptionKey.toString("base64");
 process.env.ADMIN_PASSWORD_SYNC_ON_BOOT = "false";
 process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
 
+const randPass = `T_${crypto.randomBytes(18).toString("base64url")}!`;
+
+function generateRandomBase32Secret() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let secret = '';
+  for (let i = 0; i < 16; i++) {
+    secret += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return secret;
+}
+const randTotp = generateRandomBase32Secret();
+
+process.env.BOOTSTRAP_ADMIN_USER = "admin";
+process.env.BOOTSTRAP_ADMIN_PASSWORD = randPass;
+process.env.SESSION_SECRET = crypto.randomBytes(64).toString("base64");
+process.env.APP_URL = "http://127.0.0.1";
+process.env.COOKIE_SAMESITE = "lax";
+process.env.COOKIE_SECURE = "false";
+
+// Helper to hash tree
+function walk(dirPath: string): string[] {
+  let results: string[] = [];
+  try {
+    const list = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const file of list) {
+      const fullPath = path.join(dirPath, file.name);
+      if (file.isDirectory()) {
+        results = results.concat(walk(fullPath));
+      } else {
+        results.push(fullPath);
+      }
+    }
+  } catch (e) {}
+  return results;
+}
+
+function hashFile(filePath: string): string {
+  try {
+    const data = fs.readFileSync(filePath);
+    return crypto.createHash("sha256").update(data).digest("hex");
+  } catch {
+    return "missing_file";
+  }
+}
+
+function fingerprintTree(dirPath: string): { hash: string, entries: string } {
+  try {
+    const entries = walk(dirPath).map(file => {
+      const rel = path.relative(dirPath, file).replace(/\\/g, "/");
+      const stat = fs.statSync(file);
+      const hash = hashFile(file);
+      return `${rel}|${stat.size}|${hash}`;
+    }).sort().join("\n");
+    return { hash: crypto.createHash("sha256").update(entries).digest("hex"), entries };
+  } catch {
+    return { hash: "missing_dir", entries: "" };
+  }
+}
+
 let passed = 0;
 let failed = 0;
 
 async function run() {
+  const rootEnvPath = path.join(process.cwd(), ".env");
+  const rootDataPath = path.join(process.cwd(), "data");
+  
+  if (fs.existsSync(path.join(rootDataPath, "aegis_secure.json"))) {
+    fs.copyFileSync(path.join(rootDataPath, "aegis_secure.json"), path.join(rootDataPath, "aegis_secure.json.bak"));
+  }
+
+  const rootEnvBefore = hashFile(rootEnvPath);
+  const rootDataBefore = fingerprintTree(rootDataPath);
+
   const { AegisDB, setEncryptionKey, encryptSecret, hashPassword } = await import("../server/db-core");
   setEncryptionKey(testEncryptionKey);
-
-  const randPass = "SecretPass123!";
-  const randTotp = "JBSWY3DPEHPK3PXP"; // valid base32 string
 
   const initialDb = new AegisDB({ 
     dbDir: tempDir, 
@@ -42,7 +108,6 @@ async function run() {
   const server = await bootstrap(0);
   
   const { dbInstance } = await import("../server/db.ts");
-  console.log("Users in dbInstance:", dbInstance.get().users);
   
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -163,8 +228,42 @@ async function run() {
     } else {
       console.log("[SKIP] Skipping TOTP verification test (could not generate token locally)");
     }
+    
+    // Stage 4: Assert root files unchanged
+    const rootEnvAfter = hashFile(rootEnvPath);
+    
+    if (rootEnvBefore === rootEnvAfter) {
+      console.log("[PASS] Test 4 Passed: Root .env unchanged");
+      passed++;
+    } else {
+      console.error("[FAIL] Test 4 Failed: Root .env was modified!");
+      failed++;
+    }
+
+    let rootDataPass = true;
+    try {
+      const bak = fs.readFileSync(path.join(rootDataPath, "aegis_secure.json.bak"), "utf8");
+      const cur = fs.readFileSync(path.join(rootDataPath, "aegis_secure.json"), "utf8");
+      const bObj = JSON.parse(bak);
+      const cObj = JSON.parse(cur);
+      if (JSON.stringify(bObj.users) !== JSON.stringify(cObj.users)) {
+        console.error("[FAIL] Test 5 Failed: Root data/users was modified!");
+        rootDataPass = false;
+      }
+    } catch (e) {}
+
+    if (rootDataPass) {
+      console.log("[PASS] Test 5 Passed: Root data/users unchanged");
+      passed++;
+    } else {
+      failed++;
+    }
+
   } finally {
     server.close();
+    initialDb.close();
+    dbInstance.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 
   console.log(`\nHTTP Tests Completed: ${passed} passed, ${failed} failed.`);

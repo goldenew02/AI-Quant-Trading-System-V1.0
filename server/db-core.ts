@@ -917,6 +917,21 @@ export class AegisDB {
     return this.data;
   }
 
+  public close() {
+    if (this.sqliteDbConn) {
+      try {
+        this.sqliteDbConn.close();
+      } catch (e) {
+        console.error("Failed to close SQLite connection:", e);
+      }
+    }
+  }
+
+  public async saveAsync(): Promise<void> {
+    this.save();
+    return Promise.resolve();
+  }
+
   public save() {
     const dataToSave = { ...this.data };
     if (isSqliteSupported) {

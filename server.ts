@@ -18,6 +18,21 @@ import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, h
 
 dotenv.config({ override: false });
 
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(message));
+    }, ms);
+    promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }).catch((err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
 // Unified Cookie Options Helpers for environmentalized secure cookies (P0-2, P1-1)
 function resolveSameSite(): "lax" | "strict" | "none" {
   const configured = (process.env.COOKIE_SAMESITE || "lax").toLowerCase();
@@ -839,7 +854,10 @@ let orderPollingRunning = false;
 
 // Poll and update WORKING or PENDING orders from real brokers every 10 seconds (P0-6)
 setInterval(async () => {
-  if (orderPollingRunning) return;
+  if (orderPollingRunning) {
+    appendSecurityLog("system", "admin", "ORDER_POLLING_SKIPPED", "order-polling", "Previous polling tick still running.");
+    return;
+  }
   orderPollingRunning = true;
   try {
     const db = dbInstance.get();
@@ -886,7 +904,7 @@ setInterval(async () => {
       const brokerOrderIdToQuery = ord.brokerOrderId || ord.clientOrderId;
       console.log(`[ORDER POLLING] Querying status of order ${ord.clientOrderId} (${brokerOrderIdToQuery}) from ${bot.broker}`);
       
-      const updatedOrder = await adapter.getOrder(
+      const updatedOrder = await withTimeout(adapter.getOrder(
         brokerOrderIdToQuery,
         ord.symbol,
         ord.marketType,
@@ -894,7 +912,7 @@ setInterval(async () => {
         apiSecret,
         passphrase,
         realAcc.isSandbox
-      );
+      ), 8000, "getOrder timeout");
 
       console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);
 
@@ -982,7 +1000,10 @@ let reconciliationRunning = false;
 
 // N4: Reconciliation loop to verify real broker state against local state (P1-4)
 setInterval(async () => {
-  if (reconciliationRunning) return;
+  if (reconciliationRunning) {
+    appendSecurityLog("system", "admin", "RECONCILIATION_SKIPPED", "reconciliation", "Previous reconciliation tick still running.");
+    return;
+  }
   reconciliationRunning = true;
   try {
     const db = dbInstance.get();
@@ -1016,8 +1037,8 @@ setInterval(async () => {
     }
 
     try {
-      const positions = await adapter.getPositions(apiKey, apiSecret, passphrase, realAcc.isSandbox);
-      const balances = await adapter.getBalances(apiKey, apiSecret, passphrase, realAcc.isSandbox);
+      const positions = await withTimeout(adapter.getPositions(apiKey, apiSecret, passphrase, realAcc.isSandbox), 8000, "getPositions timeout");
+      const balances = await withTimeout(adapter.getBalances(apiKey, apiSecret, passphrase, realAcc.isSandbox), 8000, "getBalances timeout");
 
       for (const bot of accBots) {
         let riskTriggered = false;
