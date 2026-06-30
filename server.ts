@@ -13,6 +13,17 @@ import https from "https";
 import { BotConfig, TradeLog, RiskSettings, GridLine, Order, Fill, BrokerAccount } from "./src/types";
 import { getBrokerAdapter } from "./server/brokers";
 
+const ACTIVE_ORDER_STATUSES = [
+  "ORDER_INTENT_CREATED",
+  "PENDING",
+  "PENDING_UNKNOWN",
+  "WORKING",
+  "NEW",
+  "PARTIALLY_FILLED",
+  "CANCEL_REQUESTED",
+  "CANCEL_FAILED"
+] as const;
+
 // Shared State via AegisDB Instance - Import DB first so .env is bootstrapped/loaded before anything else
 import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
 
@@ -430,7 +441,7 @@ async function runIsolatedBotStep(bot: BotConfig) {
           o.botId === bot.id && 
           Math.abs(o.price - grid.price) < 0.0001 && 
           o.side.toLowerCase() === grid.type && 
-          ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status)
+          ACTIVE_ORDER_STATUSES.includes(o.status as any)
         );
 
         if (hasExistingOrder) {
@@ -556,7 +567,12 @@ async function runIsolatedBotStep(bot: BotConfig) {
         } catch (apiErr: any) {
           console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
           if (apiErr.message === "placeOrder timeout") {
-            await dbInstance.updateOrderStatus(clientOrderId, "PENDING_UNKNOWN", undefined, "placeOrder timeout, manual review required");
+            await dbInstance.updateOrderState(clientOrderId, {
+              status: "PENDING_UNKNOWN",
+              lastError: "placeOrder timeout; broker acceptance unknown",
+              manualReviewRequired: true,
+              lastBrokerStatus: "PLACE_ORDER_TIMEOUT"
+            });
             appendSecurityLog("system", "admin", "BROKER_TIMEOUT", bot.id, `Order ${clientOrderId} timed out. Manual review required.`);
           } else {
             await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
@@ -720,6 +736,10 @@ setInterval(async () => {
     return;
   }
   botSupervisorTickRunning = true;
+  if (supervisorSkipCount > 0) {
+    appendSecurityLog("system", "admin", "SUPERVISOR_RECOVERED", "bot-supervisor", `Recovered after ${supervisorSkipCount} skipped ticks.`);
+    supervisorSkipCount = 0;
+  }
   try {
     // Let's drift active symbols slightly in isolated context (P0-7)
   for (const bot of bots) {
@@ -878,10 +898,14 @@ setInterval(async () => {
     return;
   }
   orderPollingRunning = true;
+  if (orderPollingSkipCount > 0) {
+    appendSecurityLog("system", "admin", "ORDER_POLLING_RECOVERED", "order-polling", `Recovered after ${orderPollingSkipCount} skipped ticks.`);
+    orderPollingSkipCount = 0;
+  }
   try {
     const db = dbInstance.get();
     const orders = db.orders || [];
-    const workingOrders = orders.filter(o => ["WORKING", "PENDING", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status));
+    const workingOrders = orders.filter(o => ACTIVE_ORDER_STATUSES.includes(o.status as any));
     if (workingOrders.length === 0) return;
 
     for (const ord of workingOrders) {
@@ -1031,6 +1055,10 @@ setInterval(async () => {
     return;
   }
   reconciliationRunning = true;
+  if (reconciliationSkipCount > 0) {
+    appendSecurityLog("system", "admin", "RECONCILIATION_RECOVERED", "reconciliation", `Recovered after ${reconciliationSkipCount} skipped ticks.`);
+    reconciliationSkipCount = 0;
+  }
   try {
     const db = dbInstance.get();
     if (db.riskSettings.globalKillSwitch) return;
@@ -1886,7 +1914,7 @@ async function cancelAllPendingOrdersForBot(botId: string): Promise<CancelReport
   }
 
   const activeOrders = (db.orders || []).filter(
-    o => o.botId === botId && ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status)
+    o => o.botId === botId && ACTIVE_ORDER_STATUSES.includes(o.status as any)
   );
 
   for (const ord of activeOrders) {
@@ -2126,7 +2154,7 @@ app.post("/api/risk", requireAuth(['admin']), async (req: any, res) => {
   if (db.riskSettings.globalKillSwitch) {
     // N3: Kill switch cancels active orders for all bots
     const cancelReports = await Promise.all(bots.map(async (bot) => {
-      const activeOrdersCount = (db.orders || []).filter(o => o.botId === bot.id && ["ORDER_INTENT_CREATED", "PENDING", "WORKING", "NEW", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status)).length;
+      const activeOrdersCount = (db.orders || []).filter(o => o.botId === bot.id && ACTIVE_ORDER_STATUSES.includes(o.status as any)).length;
       if (bot.executionMode !== "live" || (bot.status !== "running" && activeOrdersCount === 0)) {
         bot.status = "stopped_by_risk";
         bot.isEnabled = false;

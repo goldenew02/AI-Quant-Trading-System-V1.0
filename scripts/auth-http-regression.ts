@@ -15,13 +15,10 @@ process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
 
 const randPass = `T_${crypto.randomBytes(18).toString("base64url")}!`;
 
-function generateRandomBase32Secret() {
+function generateRandomBase32Secret(length = 32) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let secret = '';
-  for (let i = 0; i < 16; i++) {
-    secret += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return secret;
+  const bytes = crypto.randomBytes(length);
+  return Array.from(bytes, b => chars[b % chars.length]).join('');
 }
 function generateTOTP(secret: string, timestamp = Date.now()): string {
   // Base32 decode
@@ -243,7 +240,7 @@ async function run() {
         // Test explicit state check
         const dbAdmin = dbInstance.get().users.find((u: any) => u.username === "admin");
         if (dbAdmin) {
-          if (dbAdmin.passwordHash === origPassHash && dbAdmin.totpSecret === origTotpEnc && dbAdmin.passwordVersion === 1) {
+          if (dbAdmin.passwordHash === origPassHash && dbAdmin.totpSecret === origTotpEnc && dbAdmin.passwordVersion === 1 && dbAdmin.mustEnrollTotp === false) {
             console.log("[PASS] Test 3b Passed: Admin user state is unmodified in DB (sync flags respected)");
             passed++;
           } else {

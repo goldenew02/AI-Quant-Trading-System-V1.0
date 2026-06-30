@@ -953,8 +953,8 @@ export class AegisDB {
     return new Promise((resolve, reject) => {
       if (!this.sqliteDbConn) return resolve();
       this.sqliteDbConn.run(
-        "INSERT INTO aegis_kv (id, snapshot_json, updated_at) VALUES ('primary', ?, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at",
-        [payload, new Date().toISOString()],
+        "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [payload],
         function (err: any) {
           if (err) {
             console.error("[Aegis DB] Async SQLite KV Snapshot Error:", err);
