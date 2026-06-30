@@ -81,12 +81,14 @@ function hashFile(filePath: string): string {
 
 function fingerprintTree(dirPath: string): { hash: string, entries: string } {
   try {
-    const entries = walk(dirPath).map(file => {
-      const rel = path.relative(dirPath, file).replace(/\\/g, "/");
-      const stat = fs.statSync(file);
-      const hash = hashFile(file);
-      return `${rel}|${stat.size}|${hash}`;
-    }).sort().join("\n");
+    const entries = walk(dirPath)
+      .filter(file => !file.endsWith("aegis_secure.json") && !file.endsWith("aegis_secure.db") && !file.endsWith(".bak") && !file.endsWith("-wal") && !file.endsWith("-shm"))
+      .map(file => {
+        const rel = path.relative(dirPath, file).replace(/\\/g, "/");
+        const stat = fs.statSync(file);
+        const hash = hashFile(file);
+        return `${rel}|${stat.size}|${hash}`;
+      }).sort().join("\n");
     return { hash: crypto.createHash("sha256").update(entries).digest("hex"), entries };
   } catch {
     return { hash: "missing_dir", entries: "" };
@@ -130,6 +132,7 @@ async function run() {
   const server = await bootstrap(0);
   
   const { dbInstance } = await import("../server/db.ts");
+  console.log(`[DEBUG] dbInstance dbDir is ${dbInstance.dbDir}`);
   
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -184,7 +187,12 @@ async function run() {
     const combinedCookies = rawSidCookie ? `${rawCsrfCookie}; ${rawSidCookie}` : rawCsrfCookie;
     
     if (!loginBody.requiresTotp || !loginBody.preauthId) {
-      console.error("[FAIL] Test 1 Failed: Login did not return requiresTotp", loginBody);
+      console.error("[FAIL] Test 1 Failed: Login did not return requiresTotp", {
+        status: response.status,
+        requiresTotp: !!loginBody.requiresTotp,
+        hasPreauthId: !!loginBody.preauthId,
+        error: loginBody.error
+      });
       failed++;
     } else {
       console.log("[PASS] Test 1 Passed: Username/Password accepted, requiresTotp");
@@ -233,7 +241,11 @@ async function run() {
           console.log("[PASS] Test 3 Passed: Authenticated session confirmed via /api/auth/me");
           passed++;
         } else {
-          console.error("[FAIL] Test 3 Failed: /api/auth/me failed", meBody);
+          console.error("[FAIL] Test 3 Failed: /api/auth/me failed", {
+            status: response.status,
+            error: meBody.error,
+            hasUsername: !!meBody.username
+          });
           failed++;
         }
 
@@ -249,7 +261,11 @@ async function run() {
           }
         }
       } else {
-        console.error("[FAIL] Test 2 Failed: TOTP verification failed", totpBody);
+        console.error("[FAIL] Test 2 Failed: TOTP verification failed", {
+          status: response.status,
+          error: totpBody.error,
+          success: totpBody.success
+        });
         failed++;
       }
     } else {

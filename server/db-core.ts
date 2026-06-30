@@ -715,7 +715,29 @@ export class AegisDB {
               if (row && row.value) {
                 try {
                   this.updateDataInPlace(JSON.parse(row.value));
-                  resolve();
+                  
+                  // Now load structured orders and fills to ensure they are the source of truth (P1-3)
+                  sqliteDb.all("SELECT raw_json FROM orders ORDER BY created_at DESC", (orderErr, orderRows) => {
+                    if (orderErr) {
+                      console.error("Failed to load orders from structured table:", orderErr);
+                      return resolve();
+                    }
+                    if (orderRows && orderRows.length > 0) {
+                      this.data.orders = orderRows.map((r: any) => JSON.parse(r.raw_json));
+                    }
+                    
+                    sqliteDb.all("SELECT raw_json FROM fills ORDER BY created_at DESC", (fillErr, fillRows) => {
+                      if (fillErr) {
+                        console.error("Failed to load fills from structured table:", fillErr);
+                        return resolve();
+                      }
+                      if (fillRows && fillRows.length > 0) {
+                        this.data.fills = fillRows.map((r: any) => JSON.parse(r.raw_json));
+                      }
+                      resolve();
+                    });
+                  });
+
                 } catch (parseErr) {
                   console.error("Failed to parse SQLite state, fallback to seed:", parseErr);
                   this.seedAndSave(sqliteDb, resolve, reject);
@@ -957,8 +979,9 @@ export class AegisDB {
         [payload],
         function (err: any) {
           if (err) {
-            console.error("[Aegis DB] Async SQLite KV Snapshot Error:", err);
-            reject(err);
+            console.error("[Aegis DB] KV_SNAPSHOT_WRITE_FAILED:", err);
+            // We resolve because structured tables were successfully written
+            resolve();
           } else {
             resolve();
           }

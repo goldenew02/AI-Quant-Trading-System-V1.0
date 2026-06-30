@@ -10,19 +10,12 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
 import https from "https";
-import { BotConfig, TradeLog, RiskSettings, GridLine, Order, Fill, BrokerAccount } from "./src/types";
-import { getBrokerAdapter } from "./server/brokers";
 
-const ACTIVE_ORDER_STATUSES = [
-  "ORDER_INTENT_CREATED",
-  "PENDING",
-  "PENDING_UNKNOWN",
-  "WORKING",
-  "NEW",
-  "PARTIALLY_FILLED",
-  "CANCEL_REQUESTED",
-  "CANCEL_FAILED"
-] as const;
+// Set global timeout for all axios requests to 8000ms (P1-2)
+axios.defaults.timeout = 8000;
+
+import { BotConfig, TradeLog, RiskSettings, GridLine, Order, Fill, BrokerAccount, ACTIVE_ORDER_STATUSES } from "./src/types";
+import { getBrokerAdapter } from "./server/brokers";
 
 // Shared State via AegisDB Instance - Import DB first so .env is bootstrapped/loaded before anything else
 import { dbInstance, verifyPassword, verifyTOTP, decryptSecret, encryptSecret, hashPassword } from "./server/db";
@@ -944,18 +937,49 @@ setInterval(async () => {
         continue;
       }
 
-      const brokerOrderIdToQuery = ord.brokerOrderId || ord.clientOrderId;
-      console.log(`[ORDER POLLING] Querying status of order ${ord.clientOrderId} (${brokerOrderIdToQuery}) from ${bot.broker}`);
+      if (ord.status === "PENDING_UNKNOWN" && !ord.brokerOrderId) {
+        if (!adapter.supportsClientOrderIdLookup || !adapter.getOrderByClientOrderId) {
+          await dbInstance.updateOrderState(ord.clientOrderId, {
+            manualReviewRequired: true,
+            lastError: "Broker order id unknown and adapter cannot query by clientOrderId",
+            lastBrokerStatus: "CLIENT_ORDER_LOOKUP_UNSUPPORTED"
+          });
+          continue;
+        }
+      }
+
+      let updatedOrder;
       
-      const updatedOrder = await withTimeout(adapter.getOrder(
-        brokerOrderIdToQuery,
-        ord.symbol,
-        ord.marketType,
-        apiKey,
-        apiSecret,
-        passphrase,
-        realAcc.isSandbox
-      ), 8000, "getOrder timeout");
+      try {
+        if (ord.status === "PENDING_UNKNOWN" && !ord.brokerOrderId && adapter.getOrderByClientOrderId) {
+          console.log(`[ORDER POLLING] Querying status of order by client ID ${ord.clientOrderId} from ${bot.broker}`);
+          updatedOrder = await withTimeout(adapter.getOrderByClientOrderId(
+            ord.clientOrderId,
+            ord.symbol,
+            ord.marketType,
+            apiKey,
+            apiSecret,
+            passphrase,
+            realAcc.isSandbox
+          ), 8000, "getOrderByClientOrderId timeout");
+        } else {
+          const brokerOrderIdToQuery = ord.brokerOrderId || ord.clientOrderId; // Fallback if somehow missing
+          console.log(`[ORDER POLLING] Querying status of order ${ord.clientOrderId} (${brokerOrderIdToQuery}) from ${bot.broker}`);
+          
+          updatedOrder = await withTimeout(adapter.getOrder(
+            brokerOrderIdToQuery,
+            ord.symbol,
+            ord.marketType,
+            apiKey,
+            apiSecret,
+            passphrase,
+            realAcc.isSandbox
+          ), 8000, "getOrder timeout");
+        }
+      } catch (err: any) {
+        console.error(`[ORDER POLLING ERROR] getOrder for ${ord.clientOrderId}: ${err.message}`);
+        continue;
+      }
 
       console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);
 
@@ -1994,6 +2018,81 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: a
     });
   } else {
     res.status(404).json({ error: "Bot not found" });
+  }
+});
+
+// P2-3: Manual review API for PENDING_UNKNOWN or unresolved orders
+app.post("/api/orders/:clientOrderId/manual-resolve", requireAuth(['admin', 'operator']), async (req: any, res) => {
+  const { clientOrderId } = req.params;
+  const { action, brokerOrderId, actionToken } = req.body;
+
+  // Protect via MFA token (assuming consumeMfaTokenAsync takes string matching endpoint body structure)
+  // Reconstruct minimal payload structure matching what front-end hashes for manual resolve
+  const bodyHash = crypto.createHash('sha256').update(JSON.stringify({ action, brokerOrderId })).digest('hex');
+  const isMfaValid = await consumeMfaTokenAsync(
+    actionToken,
+    req.user.username,
+    req.cookies.sid || "",
+    "RESOLVE_ORDER",
+    bodyHash
+  );
+
+  if (!isMfaValid) {
+    appendSecurityLog(req.user.username, req.user.role, "MFA_REJECTED", "manual-resolve", `Failed MFA for manual resolve ${clientOrderId}`);
+    return res.status(403).json({ error: "Invalid or expired MFA token" });
+  }
+
+  const db = dbInstance.get();
+  const orderIndex = db.orders?.findIndex((o: any) => o.clientOrderId === clientOrderId);
+  
+  if (orderIndex === undefined || orderIndex === -1) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+  
+  const ord = db.orders![orderIndex];
+  
+  try {
+    switch (action) {
+      case "attachBrokerOrderId":
+        if (!brokerOrderId) return res.status(400).json({ error: "brokerOrderId required" });
+        await dbInstance.updateOrderState(clientOrderId, { 
+          brokerOrderId, 
+          manualReviewRequired: false,
+          status: "WORKING" // Reset to working once attached
+        });
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Attached brokerOrderId ${brokerOrderId}`);
+        break;
+      case "markCanceled":
+        await dbInstance.updateOrderState(clientOrderId, { 
+          status: "CANCELED", 
+          manualReviewRequired: false,
+          bypassTransition: true 
+        });
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as CANCELED`);
+        break;
+      case "markRejected":
+        await dbInstance.updateOrderState(clientOrderId, { 
+          status: "REJECTED", 
+          manualReviewRequired: false,
+          bypassTransition: true 
+        });
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as REJECTED`);
+        break;
+      case "requestCancel":
+        await dbInstance.updateOrderState(clientOrderId, { 
+          status: "CANCEL_REQUESTED", 
+          manualReviewRequired: false 
+        });
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually re-requested cancel`);
+        break;
+      default:
+        return res.status(400).json({ error: "Invalid action" });
+    }
+    
+    res.json({ success: true, updatedOrder: dbInstance.get().orders!.find(o => o.clientOrderId === clientOrderId) });
+  } catch (err: any) {
+    console.error(`[MANUAL RESOLVE ERROR]`, err);
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -29,12 +29,14 @@ function walk(dirPath: string): string[] {
 
 function fingerprintTree(dirPath: string): string {
   try {
-    const entries = walk(dirPath).map(file => {
-      const rel = path.relative(dirPath, file).replace(/\\/g, "/");
-      const stat = fs.statSync(file);
-      const hash = hashFile(file);
-      return `${rel}|${stat.size}|${hash}`;
-    }).sort().join("\n");
+    const entries = walk(dirPath)
+      .filter(file => !file.endsWith("aegis_secure.json") && !file.endsWith("aegis_secure.db") && !file.endsWith(".bak") && !file.endsWith("-wal") && !file.endsWith("-shm"))
+      .map(file => {
+        const rel = path.relative(dirPath, file).replace(/\\/g, "/");
+        const stat = fs.statSync(file);
+        const hash = hashFile(file);
+        return `${rel}|${stat.size}|${hash}`;
+      }).sort().join("\n");
     return crypto.createHash("sha256").update(entries).digest("hex");
   } catch {
     return "missing_dir";

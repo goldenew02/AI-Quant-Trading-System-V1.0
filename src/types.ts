@@ -147,6 +147,19 @@ export interface BrokerAccount {
   updatedAt: string;
 }
 
+export const ACTIVE_ORDER_STATUSES = [
+  "ORDER_INTENT_CREATED",
+  "PENDING",
+  "PENDING_UNKNOWN",
+  "WORKING",
+  "NEW",
+  "PARTIALLY_FILLED",
+  "CANCEL_REQUESTED",
+  "CANCEL_FAILED"
+] as const;
+
+export type ActiveOrderStatus = typeof ACTIVE_ORDER_STATUSES[number];
+
 export interface Order {
   id: string;
   botId: string;
