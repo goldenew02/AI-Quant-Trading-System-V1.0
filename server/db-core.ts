@@ -1073,28 +1073,39 @@ export class AegisDB {
     this.save();
   }
 
-  public insertOrder(ord: Order) {
-    if (this.sqliteDbConn) {
-      this.sqliteDbConn.run(
-        "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, marketType, marginMode, positionSide, exchangeSymbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.marketType || 'spot', ord.marginMode || null, ord.positionSide || null, ord.exchangeSymbol || null, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
-        (err) => {
-          if (err) {
-            if (err.message.includes("UNIQUE constraint failed")) {
-              console.log(`[DB-SQLite] Unique constraint hit. Duplicate order skipped: ${ord.clientOrderId}`);
-            } else {
-              console.error("[DB-SQLite] Failed to insert order:", err);
+  public insertOrder(ord: Order): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      if (this.sqliteDbConn) {
+        this.sqliteDbConn.run(
+          "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, marketType, marginMode, positionSide, exchangeSymbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.marketType || 'spot', ord.marginMode || null, ord.positionSide || null, ord.exchangeSymbol || null, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
+          (err) => {
+            if (err) {
+              if (err.message.includes("UNIQUE constraint failed")) {
+                console.log(`[DB-SQLite] Unique constraint hit. Duplicate order skipped: ${ord.clientOrderId}`);
+                return resolve(false);
+              } else {
+                console.error("[DB-SQLite] Failed to insert order:", err);
+                return reject(err);
+              }
             }
-            return;
+            this.data.orders.unshift(ord);
+            this.save();
+            resolve(true);
           }
-          this.data.orders.unshift(ord);
-          this.save();
-        }
-      );
-    } else {
-      this.data.orders.unshift(ord);
-      this.save();
-    }
+        );
+        return;
+      }
+      
+      const exists = this.data.orders.some((o: Order) => o.clientOrderId === ord.clientOrderId);
+      if (!exists) {
+        this.data.orders.unshift(ord);
+        this.save();
+        resolve(true);
+      } else {
+        resolve(false);
+      }
+    });
   }
 
   private readonly ORDER_TRANSITIONS: Record<string, string[]> = {
@@ -1136,17 +1147,24 @@ export class AegisDB {
         delete (ord as any).allowMissing;
         ord.updatedAt = new Date().toISOString();
         if (this.sqliteDbConn) {
+          const db = this;
           this.sqliteDbConn.run(
             "UPDATE orders SET status = ?, brokerOrderId = ?, lastError = ?, updatedAt = ?, cancelRetryCount = ?, cancelRequestedAt = ?, lastBrokerStatus = ?, manualReviewRequired = ? WHERE clientOrderId = ?",
             [ord.status, ord.brokerOrderId || null, ord.lastError || null, ord.updatedAt, ord.cancelRetryCount || 0, ord.cancelRequestedAt || null, ord.lastBrokerStatus || null, ord.manualReviewRequired ? 1 : 0, clientOrderId],
-            (err: any) => {
-              if (err) {
-                console.error("[DB-SQLite] Failed to update order state:", err);
-                reject(err);
-              } else {
-                this.save();
-                resolve();
+            function (this: any, err: any) {
+              if (err) return reject(err);
+              if (this.changes !== 1) {
+                db.appendSecurityLog(
+                  "system",
+                  "admin",
+                  "ORDER_SQLITE_UPDATE_MISSING_ROW",
+                  clientOrderId,
+                  "SQLite order update affected 0 rows while memory order existed."
+                );
+                return reject(new Error(`SQLite order row missing: ${clientOrderId}`));
               }
+              db.save();
+              resolve();
             }
           );
         } else {

@@ -9,4 +9,6 @@ if (rawKey) {
   setEncryptionKey(Buffer.from(rawKey, "base64"));
 }
 
-export const dbInstance = new AegisDB();
+export const dbInstance = new AegisDB({
+  dbDir: process.env.DB_DIR
+});

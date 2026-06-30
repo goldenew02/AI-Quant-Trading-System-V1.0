@@ -445,7 +445,13 @@ async function runIsolatedBotStep(bot: BotConfig) {
           updatedAt: new Date().toISOString()
         };
 
-        dbInstance.insertOrder(orderEntity);
+        const inserted = await dbInstance.insertOrder(orderEntity);
+        if (!inserted) {
+          appendSecurityLog("system", "admin", "ORDER_DUPLICATE_CLIENT_ID", clientOrderId, `Attempted to insert duplicate order.`);
+          bot.status = "stopped_by_risk";
+          bot.isEnabled = false;
+          return;
+        }
 
         // Perform automated strict risk checks before API execution (P1-1)
         if (riskSettings.restrictedSymbols.includes(bot.symbol)) {
@@ -581,10 +587,14 @@ async function runIsolatedBotStep(bot: BotConfig) {
             updatedAt: new Date().toISOString()
           };
 
-          dbInstance.insertOrder(orderEntity);
+          const insertedOrder = await dbInstance.insertOrder(orderEntity);
+          if (!insertedOrder) {
+            console.warn(`[SIMULATOR] Duplicate order skipped for ${clientOrderId}`);
+            continue;
+          }
 
           const fillId = "fill_sim_" + crypto.randomBytes(8).toString("hex");
-          dbInstance.insertFill({
+          await dbInstance.insertFill({
             id: fillId,
             orderId,
             brokerFillId: `sim_fill_${clientOrderId}`,
@@ -673,11 +683,18 @@ async function runIsolatedBotStep(bot: BotConfig) {
   }
 }
 
+let botSupervisorTickRunning = false;
+
 // 7*24h simulation logic running every 5 seconds on Node backend background
 setInterval(async () => {
   if (riskSettings.globalKillSwitch) return;
-
-  // Let's drift active symbols slightly in isolated context (P0-7)
+  if (botSupervisorTickRunning) {
+    appendSecurityLog("system", "admin", "SUPERVISOR_TICK_SKIPPED", "bot-supervisor", "Previous bot tick still running.");
+    return;
+  }
+  botSupervisorTickRunning = true;
+  try {
+    // Let's drift active symbols slightly in isolated context (P0-7)
   for (const bot of bots) {
     if (bot.status !== "running") continue;
 
@@ -702,6 +719,9 @@ setInterval(async () => {
     if (bot.status === "running") {
       dbInstance.upsertBot(bot);
     }
+  }
+  } finally {
+    botSupervisorTickRunning = false;
   }
 }, 5000);
 
@@ -815,17 +835,22 @@ async function recordBrokerExecutionUpdate(ord: Order, updatedOrder: OrderStatus
   });
 }
 
+let orderPollingRunning = false;
+
 // Poll and update WORKING or PENDING orders from real brokers every 10 seconds (P0-6)
 setInterval(async () => {
-  const db = dbInstance.get();
-  const orders = db.orders || [];
-  const workingOrders = orders.filter(o => ["WORKING", "PENDING", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status));
-  if (workingOrders.length === 0) return;
+  if (orderPollingRunning) return;
+  orderPollingRunning = true;
+  try {
+    const db = dbInstance.get();
+    const orders = db.orders || [];
+    const workingOrders = orders.filter(o => ["WORKING", "PENDING", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "CANCEL_FAILED"].includes(o.status));
+    if (workingOrders.length === 0) return;
 
-  for (const ord of workingOrders) {
-    try {
-      const bot = bots.find(b => b.id === ord.botId);
-      if (!bot) continue;
+    for (const ord of workingOrders) {
+      try {
+        const bot = bots.find(b => b.id === ord.botId);
+        if (!bot) continue;
 
       const realAcc = db.brokerAccounts.find(acc => acc.id === ord.brokerAccountId);
       if (!realAcc) continue;
@@ -918,6 +943,9 @@ setInterval(async () => {
       console.error(`[ORDER POLLING EXCEPTION] Error updating order status for ${ord.clientOrderId}:`, err.message);
     }
   }
+  } finally {
+    orderPollingRunning = false;
+  }
 }, 10000);
 
 // Lazily initialising Gemini AI SDK to prevent startup crashes if GEMINI_API_KEY is not defined
@@ -950,13 +978,18 @@ setInterval(() => {
   circuitBreakerActive = false;
 }, 60000);
 
+let reconciliationRunning = false;
+
 // N4: Reconciliation loop to verify real broker state against local state (P1-4)
 setInterval(async () => {
-  const db = dbInstance.get();
-  if (db.riskSettings.globalKillSwitch) return;
+  if (reconciliationRunning) return;
+  reconciliationRunning = true;
+  try {
+    const db = dbInstance.get();
+    if (db.riskSettings.globalKillSwitch) return;
 
-  const liveBots = bots.filter(b => b.status === "running" && b.executionMode === "live" && b.brokerAccountId);
-  if (liveBots.length === 0) return;
+    const liveBots = bots.filter(b => b.status === "running" && b.executionMode === "live" && b.brokerAccountId);
+    if (liveBots.length === 0) return;
 
   const accountBotMap = new Map<string, typeof liveBots>();
   for (const bot of liveBots) {
@@ -1041,6 +1074,9 @@ setInterval(async () => {
     } catch (err: any) {
       console.error(`[RECONCILIATION] Failed to fetch data for account ${accountId}: ${err.message}`);
     }
+  }
+  } finally {
+    reconciliationRunning = false;
   }
 }, 30000);
 
@@ -2498,17 +2534,17 @@ app.post("/api/gemini/analyze", requireAuth(['admin', 'operator']), async (req, 
 
 // --- VITE AND STATIC SERVING MAIN ENTRY ---
 
-async function bootstrap() {
+export async function bootstrap(port = PORT) {
   await dbInstance.ready;
   console.log("[Aegis Quant] SQLite Database initialized and loaded asynchronously.");
 
-  if (process.env.NODE_ENV !== "production") {
+  if (process.env.NODE_ENV !== "production" && process.env.NODE_ENV !== "test") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === "production") {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
@@ -2516,9 +2552,16 @@ async function bootstrap() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Aegis Quant] Full-stack engine launched on http://0.0.0.0:${PORT}`);
+  return new Promise<any>((resolve) => {
+    const server = app.listen(port, "0.0.0.0", () => {
+      console.log(`[Aegis Quant] Full-stack engine launched on http://0.0.0.0:${port}`);
+      resolve(server);
+    });
   });
 }
 
-bootstrap();
+if (process.env.NODE_ENV !== "test") {
+  bootstrap();
+}
+
+export { app };
