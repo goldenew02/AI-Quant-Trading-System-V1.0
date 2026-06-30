@@ -11,20 +11,31 @@ function hashFile(filepath: string): string {
   }
 }
 
-function fingerprintTree(dirPath: string): string {
+function walk(dirPath: string): string[] {
+  let results: string[] = [];
   try {
-    const files = fs.readdirSync(dirPath, { withFileTypes: true });
-    let content = "";
-    for (const f of files.sort((a, b) => a.name.localeCompare(b.name))) {
-      const fullPath = path.join(dirPath, f.name);
-      if (f.isDirectory()) {
-        content += fingerprintTree(fullPath);
+    const list = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const file of list) {
+      const fullPath = path.join(dirPath, file.name);
+      if (file.isDirectory()) {
+        results = results.concat(walk(fullPath));
       } else {
-        const stat = fs.statSync(fullPath);
-        content += `${f.name}|${stat.size}|${hashFile(fullPath)}\n`;
+        results.push(fullPath);
       }
     }
-    return crypto.createHash("sha256").update(content).digest("hex");
+  } catch (e) {}
+  return results;
+}
+
+function fingerprintTree(dirPath: string): string {
+  try {
+    const entries = walk(dirPath).map(file => {
+      const rel = path.relative(dirPath, file).replace(/\\/g, "/");
+      const stat = fs.statSync(file);
+      const hash = hashFile(file);
+      return `${rel}|${stat.size}|${hash}`;
+    }).sort().join("\n");
+    return crypto.createHash("sha256").update(entries).digest("hex");
   } catch {
     return "missing_dir";
   }
@@ -91,26 +102,26 @@ async function runTests() {
     
     // Check if original credentials were preserved
     if (adminUser?.passwordHash === originalPasswordHash) {
-      console.log("✅ Test 1 Passed: passwordHash preserved when SYNC_ON_BOOT=false");
+      console.log("[PASS] Test 1 Passed: passwordHash preserved when SYNC_ON_BOOT=false");
       passed++;
     } else {
-      console.error("❌ Test 1 Failed: passwordHash was overwritten!");
+      console.error("[FAIL] Test 1 Failed: passwordHash was overwritten!");
       failed++;
     }
 
     if (adminUser?.totpSecret === originalTotpSecretEncrypted) {
-      console.log("✅ Test 2 Passed: totpSecret preserved when SYNC_ON_BOOT=false");
+      console.log("[PASS] Test 2 Passed: totpSecret preserved when SYNC_ON_BOOT=false");
       passed++;
     } else {
-      console.error("❌ Test 2 Failed: totpSecret was overwritten!");
+      console.error("[FAIL] Test 2 Failed: totpSecret was overwritten!");
       failed++;
     }
 
     if (adminUser?.mustEnrollTotp === false) {
-      console.log("✅ Test 3 Passed: mustEnrollTotp preserved as false");
+      console.log("[PASS] Test 3 Passed: mustEnrollTotp preserved as false");
       passed++;
     } else {
-      console.error("❌ Test 3 Failed: mustEnrollTotp was reset!");
+      console.error("[FAIL] Test 3 Failed: mustEnrollTotp was reset!");
       failed++;
     }
 
@@ -124,46 +135,78 @@ async function runTests() {
     adminUser = testDb2.get().users.find(u => u.username === "admin");
 
     if (adminUser?.passwordHash !== originalPasswordHash && verifyPassword(newRandPass, adminUser?.passwordHash || "")) {
-      console.log("✅ Test 4 Passed: passwordHash overwritten when SYNC_ON_BOOT=true");
+      console.log("[PASS] Test 4 Passed: passwordHash overwritten when SYNC_ON_BOOT=true");
       passed++;
     } else {
-      console.error("❌ Test 4 Failed: passwordHash not updated correctly!");
+      console.error("[FAIL] Test 4 Failed: passwordHash not updated correctly!");
       failed++;
     }
 
     if (adminUser?.totpSecret !== originalTotpSecretEncrypted && decryptSecret(adminUser?.totpSecret || "") === newRandTotp) {
-      console.log("✅ Test 5 Passed: totpSecret overwritten when SYNC_ON_BOOT=true");
+      console.log("[PASS] Test 5 Passed: totpSecret overwritten when SYNC_ON_BOOT=true");
       passed++;
     } else {
-      console.error("❌ Test 5 Failed: totpSecret not updated correctly!");
+      console.error("[FAIL] Test 5 Failed: totpSecret not updated correctly!");
       failed++;
     }
 
     if (adminUser?.mustEnrollTotp === false) {
-      console.log("✅ Test 6 Passed: mustEnrollTotp is false after sync with provided TOTP");
+      console.log("[PASS] Test 6 Passed: mustEnrollTotp is false after sync with provided TOTP");
       passed++;
     } else {
-      console.error("❌ Test 6 Failed: mustEnrollTotp state is incorrect!");
+      console.error("[FAIL] Test 6 Failed: mustEnrollTotp state is incorrect!");
       failed++;
     }
     
-    // Stage 4: Assert root files unchanged
+    // Stage 4: Preauth Session Lifecycle
+    const preauthIdHash = crypto.createHash("sha256").update("test-preauth").digest("hex");
+    await testDb2.insertPreauthSession(preauthIdHash, "admin", "admin", Date.now() + 60000, "127.0.0.1", "test-agent");
+    
+    const preauthSession = await testDb2.validatePreauthSessionAsync(preauthIdHash, "127.0.0.1", "test-agent");
+    if (preauthSession && preauthSession.username === "admin") {
+      console.log("[PASS] Test 7 Passed: Preauth session validated");
+      passed++;
+    } else {
+      console.error("[FAIL] Test 7 Failed: Preauth session validation failed");
+      failed++;
+    }
+
+    await testDb2.consumePreauthSessionAsync(preauthIdHash);
+    console.log("[PASS] Test 8 Passed: Preauth session consumed for the first time");
+    passed++;
+
+    let secondConsumeFailed = false;
+    try {
+      await testDb2.consumePreauthSessionAsync(preauthIdHash);
+    } catch (e) {
+      secondConsumeFailed = true;
+    }
+    
+    if (secondConsumeFailed) {
+      console.log("[PASS] Test 9 Passed: Preauth session double-consume rejected");
+      passed++;
+    } else {
+      console.error("[FAIL] Test 9 Failed: Preauth session double-consume succeeded!");
+      failed++;
+    }
+
+    // Stage 5: Assert root files unchanged
     const rootEnvAfter = hashFile(rootEnvPath);
     const rootDataAfter = fingerprintTree(rootDataPath);
     
     if (rootEnvBefore === rootEnvAfter) {
-      console.log("✅ Test 7 Passed: Root .env unchanged");
+      console.log("[PASS] Test 10 Passed: Root .env unchanged");
       passed++;
     } else {
-      console.error("❌ Test 7 Failed: Root .env was modified!");
+      console.error("[FAIL] Test 10 Failed: Root .env was modified!");
       failed++;
     }
 
     if (rootDataBefore === rootDataAfter) {
-      console.log("✅ Test 8 Passed: Root data/ unchanged");
+      console.log("[PASS] Test 11 Passed: Root data/ unchanged");
       passed++;
     } else {
-      console.error("❌ Test 8 Failed: Root data/ was modified!");
+      console.error("[FAIL] Test 11 Failed: Root data/ was modified!");
       console.error("Before:", rootDataBefore);
       console.error("After :", rootDataAfter);
       failed++;

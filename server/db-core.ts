@@ -179,10 +179,10 @@ export function setEncryptionKey(key: Buffer) {
 }
 
 function getDecodedEncryptionKey(): Buffer {
-  if (_encryptionKey) return _encryptionKey;
-  const raw = process.env.ENCRYPTION_KEY;
-  if (!raw) throw new Error("ENCRYPTION_KEY environment variable is not defined");
-  return Buffer.from(raw, "base64");
+  if (!_encryptionKey) {
+    throw new Error("CRITICAL: Encryption key not set. Call setEncryptionKey() first.");
+  }
+  return _encryptionKey;
 }
 
 // AES-256-GCM Secure Encryption complying with P0-3
@@ -1121,7 +1121,7 @@ export class AegisDB {
     return true;
   }
 
-  public updateOrderState(clientOrderId: string, updates: Partial<Order> & { bypassTransition?: boolean }): Promise<void> {
+  public updateOrderState(clientOrderId: string, updates: Partial<Order> & { bypassTransition?: boolean, allowMissing?: boolean }): Promise<void> {
     return new Promise((resolve, reject) => {
       const ord = this.data.orders.find((o: Order) => o.clientOrderId === clientOrderId);
       if (ord) {
@@ -1133,6 +1133,7 @@ export class AegisDB {
         
         Object.assign(ord, updates);
         delete (ord as any).bypassTransition;
+        delete (ord as any).allowMissing;
         ord.updatedAt = new Date().toISOString();
         if (this.sqliteDbConn) {
           this.sqliteDbConn.run(
@@ -1153,6 +1154,16 @@ export class AegisDB {
           resolve();
         }
       } else {
+        if (!updates.allowMissing) {
+          this.appendSecurityLog(
+            "system",
+            "admin",
+            "ORDER_STATE_UPDATE_MISSING_ORDER",
+            clientOrderId,
+            `Attempted to update missing order with status ${updates.status || "UNCHANGED"}`
+          );
+          return reject(new Error(`Order not found: ${clientOrderId}`));
+        }
         resolve();
       }
     });
@@ -1531,9 +1542,10 @@ export class AegisDB {
 
   public consumePreauthSessionAsync(preauthIdHash: string): Promise<void> {
     const now = Date.now();
+    const db = this;
     return new Promise((resolve, reject) => {
-      if (isSqliteSupported && this.sqliteDbConn) {
-        this.sqliteDbConn.run(
+      if (isSqliteSupported && db.sqliteDbConn) {
+        db.sqliteDbConn.run(
           "UPDATE preauth_sessions SET used_at = ? WHERE preauth_id_hash = ? AND used_at IS NULL AND expires_at >= ?",
           [now, preauthIdHash, now],
           function (this: any, err: any) {
@@ -1543,17 +1555,23 @@ export class AegisDB {
             if (this.changes !== 1) {
               return reject(new Error("Pre-authorization double-use protection block triggered."));
             }
-            if (this.data.preauthSessions) {
-              this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
-              this.save();
+            if (db.data.preauthSessions) {
+              db.data.preauthSessions = db.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+              db.save();
             }
             resolve();
           }
         );
       } else {
         if (this.data.preauthSessions) {
+          const originalLength = this.data.preauthSessions.length;
           this.data.preauthSessions = this.data.preauthSessions.filter(p => p.preauthIdHash !== preauthIdHash);
+          if (this.data.preauthSessions.length === originalLength) {
+            return reject(new Error("Pre-authorization double-use protection block triggered."));
+          }
           this.save();
+        } else {
+          return reject(new Error("Pre-authorization double-use protection block triggered."));
         }
         resolve();
       }

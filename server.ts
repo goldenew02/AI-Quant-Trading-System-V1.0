@@ -494,24 +494,25 @@ async function runIsolatedBotStep(bot: BotConfig) {
 
         console.log(`[REAL BROKER ORDER] Placing order ${clientOrderId} to ${bot.broker} for ${grid.amount} ${bot.symbol} at ${tradePrice}`);
         
-        adapter.placeOrder(
-          {
-            botId: bot.id,
-            brokerAccountId: realAcc.id,
-            clientOrderId,
-            symbol: bot.symbol,
-            marketType: marketType,
-            side: grid.type === "buy" ? "BUY" : "SELL",
-            type: "LMT",
-            price: tradePrice,
-            quantity: grid.amount,
-            leverage: bot.gridType === "perpetual" ? (bot.perpetualLeverage || 5) : bot.leverage
-          },
-          apiKey,
-          apiSecret,
-          passphrase,
-          realAcc.isSandbox
-        ).then(async (accepted) => {
+        try {
+          const accepted = await adapter.placeOrder(
+            {
+              botId: bot.id,
+              brokerAccountId: realAcc.id,
+              clientOrderId,
+              symbol: bot.symbol,
+              marketType: marketType,
+              side: grid.type === "buy" ? "BUY" : "SELL",
+              type: "LMT",
+              price: tradePrice,
+              quantity: grid.amount,
+              leverage: bot.gridType === "perpetual" ? (bot.perpetualLeverage || 5) : bot.leverage
+            },
+            apiKey,
+            apiSecret,
+            passphrase,
+            realAcc.isSandbox
+          );
           if (accepted.status === "NEW") {
             // Live broker accepted the order. It is now active on the broker book (WORKING status per P0-6)
             await dbInstance.updateOrderStatus(clientOrderId, "WORKING", accepted.brokerOrderId);
@@ -531,13 +532,13 @@ async function runIsolatedBotStep(bot: BotConfig) {
             bot.isEnabled = false;
             appendSecurityLog("system", "admin", "BROKER_REJECTION", bot.id, `Order rejected by ${bot.broker}: ${accepted.error}`);
           }
-        }).catch(async (apiErr) => {
+        } catch (apiErr: any) {
           console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
           await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, apiErr.message);
           bot.status = "stopped_by_risk";
           bot.isEnabled = false;
           appendSecurityLog("system", "admin", "BROKER_OFFLINE", bot.id, `Network execution exception on ${bot.broker}: ${apiErr.message}`);
-        });
+        }
 
       } else {
         // --- HIGH FIDELITY PAPER TRADING PATHWAY ---
@@ -673,15 +674,15 @@ async function runIsolatedBotStep(bot: BotConfig) {
 }
 
 // 7*24h simulation logic running every 5 seconds on Node backend background
-setInterval(() => {
+setInterval(async () => {
   if (riskSettings.globalKillSwitch) return;
 
   // Let's drift active symbols slightly in isolated context (P0-7)
-  bots.forEach((bot) => {
-    if (bot.status !== "running") return;
+  for (const bot of bots) {
+    if (bot.status !== "running") continue;
 
     try {
-      runIsolatedBotStep(bot);
+      await runIsolatedBotStep(bot);
     } catch (botError: any) {
       console.error(`CRITICAL: Isolated error in bot [${bot.name}] (${bot.id}):`, botError.message);
       appendSecurityLog(
@@ -695,13 +696,13 @@ setInterval(() => {
       bot.status = "stopped_by_risk";
       bot.isEnabled = false;
     }
-  });
+  }
 
-  bots.forEach((bot) => {
+  for (const bot of bots) {
     if (bot.status === "running") {
       dbInstance.upsertBot(bot);
     }
-  });
+  }
 }, 5000);
 
 
