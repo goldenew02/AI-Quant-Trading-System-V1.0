@@ -1,8 +1,10 @@
 import crypto from "crypto";
-import axios from "axios";
+import { brokerHttp as axios } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class BinanceAdapter implements BrokerAdapter {
+  supportsClientOrderIdLookup = true;
+
   private getBaseUrl(isSandbox?: boolean, isFutures?: boolean): string {
     if (isFutures) {
       return isSandbox 
@@ -180,6 +182,36 @@ export class BinanceAdapter implements BrokerAdapter {
     return {
       brokerOrderId: String(data.orderId),
       clientOrderId: data.clientOrderId,
+      status: finalStatus,
+      filledPrice: parseFloat(data.price || "0"),
+      filledQuantity: parseFloat(data.executedQty || "0")
+    };
+  }
+
+  async getOrderByClientOrderId(clientOrderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+    if (!apiKey || !apiSecret) throw new Error("Binance credentials missing.");
+    const formattedSymbol = symbol.replace("/", "").toUpperCase();
+    
+    const isFutures = marketType === "perpetual" || marketType === "futures";
+    const baseUrl = this.getBaseUrl(isSandbox, isFutures);
+    const orderParams = { symbol: formattedSymbol, origClientOrderId: clientOrderId };
+    const query = this.buildSignedQuery(orderParams, apiSecret);
+    const endpoint = isFutures ? "/fapi/v1/order" : "/api/v3/order";
+    
+    const res = await axios.get(`${baseUrl}${endpoint}?${query}`, {
+      headers: { "X-MBX-APIKEY": apiKey }
+    });
+    
+    let finalStatus: OrderStatus["status"] = "NEW";
+    const data = res.data;
+    if (data.status === "FILLED") finalStatus = "FILLED";
+    else if (data.status === "PARTIALLY_FILLED") finalStatus = "PARTIALLY_FILLED";
+    else if (data.status === "CANCELED") finalStatus = "CANCELED";
+    else if (data.status === "REJECTED") finalStatus = "REJECTED";
+
+    return {
+      brokerOrderId: String(data.orderId),
+      clientOrderId: data.clientOrderId || clientOrderId,
       status: finalStatus,
       filledPrice: parseFloat(data.price || "0"),
       filledQuantity: parseFloat(data.executedQty || "0")

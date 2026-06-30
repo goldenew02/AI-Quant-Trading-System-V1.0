@@ -260,6 +260,84 @@ async function run() {
             failed++;
           }
         }
+
+        // Add a dummy order
+        dbInstance.get().orders = [{
+          id: "test-order-1",
+          botId: "test-bot",
+          broker: "binance",
+          brokerAccountId: "test-acc",
+          clientOrderId: "TEST_ORD_1",
+          brokerOrderId: "",
+          symbol: "BTC/USDT",
+          marketType: "spot",
+          side: "BUY",
+          type: "LMT",
+          price: 50000,
+          quantity: 1,
+          status: "PENDING_UNKNOWN",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          manualReviewRequired: true
+        }];
+
+        // Test 3c: MFA for manual resolve
+        token = generateTOTP(randTotp);
+        const resolvePayload = { clientOrderId: "TEST_ORD_1", resolutionAction: "attachBrokerOrderId", brokerOrderId: "BROKER_123" };
+        response = await fetch(`${baseUrl}/api/auth/verify-totp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-csrf-token": unsignedCsrfVal,
+            "Cookie": finalCookies
+          },
+          body: JSON.stringify({ code: token, action: "RESOLVE_ORDER", payload: resolvePayload })
+        });
+        const mfaRes = await response.json();
+        if (mfaRes.success && mfaRes.actionToken) {
+          console.log("[PASS] Test 3c Passed: MFA verify for RESOLVE_ORDER succeeded");
+          passed++;
+
+          response = await fetch(`${baseUrl}/api/orders/TEST_ORD_1/manual-resolve`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-csrf-token": unsignedCsrfVal,
+              "Cookie": finalCookies
+            },
+            body: JSON.stringify({ actionToken: mfaRes.actionToken, resolutionAction: "attachBrokerOrderId", brokerOrderId: "BROKER_123" })
+          });
+          const manualRes = await response.json();
+          if (manualRes.success && manualRes.updatedOrder && manualRes.updatedOrder.brokerOrderId === "BROKER_123") {
+            console.log("[PASS] Test 3d Passed: Manual resolve with MFA token succeeded");
+            passed++;
+          } else {
+            console.error("[FAIL] Test 3d Failed: Manual resolve failed", manualRes);
+            failed++;
+          }
+
+          // Test 3e: Same token cannot be reused
+          response = await fetch(`${baseUrl}/api/orders/TEST_ORD_1/manual-resolve`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-csrf-token": unsignedCsrfVal,
+              "Cookie": finalCookies
+            },
+            body: JSON.stringify({ actionToken: mfaRes.actionToken, resolutionAction: "attachBrokerOrderId", brokerOrderId: "BROKER_123" })
+          });
+          if (response.status === 403) {
+            console.log("[PASS] Test 3e Passed: Reused MFA token rejected");
+            passed++;
+          } else {
+            console.error("[FAIL] Test 3e Failed: Reused MFA token should have been rejected", response.status);
+            failed++;
+          }
+
+        } else {
+          console.error("[FAIL] Test 3c Failed: MFA verify for RESOLVE_ORDER failed", mfaRes);
+          failed++;
+        }
       } else {
         console.error("[FAIL] Test 2 Failed: TOTP verification failed", {
           status: response.status,

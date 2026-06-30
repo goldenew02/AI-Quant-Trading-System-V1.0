@@ -1,8 +1,10 @@
-import axios from "axios";
+import { brokerHttp as axios } from "./http";
 import https from "https";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class InteractiveBrokersAdapter implements BrokerAdapter {
+  supportsClientOrderIdLookup = false;
+
   constructor() {}
 
   private getBaseUrl(gatewayUrl?: string): string {

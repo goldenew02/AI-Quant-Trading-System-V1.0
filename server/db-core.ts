@@ -717,22 +717,55 @@ export class AegisDB {
                   this.updateDataInPlace(JSON.parse(row.value));
                   
                   // Now load structured orders and fills to ensure they are the source of truth (P1-3)
-                  sqliteDb.all("SELECT raw_json FROM orders ORDER BY created_at DESC", (orderErr, orderRows) => {
+                  sqliteDb.all("SELECT * FROM orders ORDER BY createdAt DESC", (orderErr, orderRows) => {
                     if (orderErr) {
-                      console.error("Failed to load orders from structured table:", orderErr);
+                      console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for orders:", orderErr);
                       return resolve();
                     }
                     if (orderRows && orderRows.length > 0) {
-                      this.data.orders = orderRows.map((r: any) => JSON.parse(r.raw_json));
+                      this.data.orders = orderRows.map((r: any) => ({
+                        id: r.id,
+                        botId: r.botId,
+                        broker: r.broker,
+                        brokerAccountId: r.brokerAccountId,
+                        clientOrderId: r.clientOrderId,
+                        brokerOrderId: r.brokerOrderId || undefined,
+                        symbol: r.symbol,
+                        marketType: r.marketType,
+                        marginMode: r.marginMode || undefined,
+                        positionSide: r.positionSide || undefined,
+                        exchangeSymbol: r.exchangeSymbol || undefined,
+                        side: r.side,
+                        type: r.type,
+                        price: Number(r.price),
+                        quantity: Number(r.quantity),
+                        status: r.status,
+                        createdAt: r.createdAt,
+                        updatedAt: r.updatedAt,
+                        lastError: r.lastError || undefined,
+                        cancelRequestedAt: r.cancelRequestedAt || undefined,
+                        cancelRetryCount: r.cancelRetryCount ? Number(r.cancelRetryCount) : undefined,
+                        lastBrokerStatus: r.lastBrokerStatus || undefined,
+                        manualReviewRequired: r.manualReviewRequired === 1
+                      }));
                     }
                     
-                    sqliteDb.all("SELECT raw_json FROM fills ORDER BY created_at DESC", (fillErr, fillRows) => {
+                    sqliteDb.all("SELECT * FROM fills ORDER BY timestamp DESC", (fillErr, fillRows) => {
                       if (fillErr) {
-                        console.error("Failed to load fills from structured table:", fillErr);
+                        console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for fills:", fillErr);
                         return resolve();
                       }
                       if (fillRows && fillRows.length > 0) {
-                        this.data.fills = fillRows.map((r: any) => JSON.parse(r.raw_json));
+                        this.data.fills = fillRows.map((r: any) => ({
+                          id: r.id,
+                          orderId: r.orderId,
+                          brokerFillId: r.brokerFillId,
+                          price: Number(r.price),
+                          quantity: Number(r.quantity),
+                          fee: Number(r.fee),
+                          feeCurrency: r.feeCurrency,
+                          timestamp: r.timestamp
+                        }));
                       }
                       resolve();
                     });

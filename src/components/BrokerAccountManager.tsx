@@ -11,6 +11,13 @@ interface BrokerAccountManagerProps {
 export default function BrokerAccountManager({ role, username }: BrokerAccountManagerProps) {
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [resolveMfaModal, setResolveMfaModal] = useState<{
+    isOpen: boolean;
+    clientOrderId: string;
+    resolutionAction: string;
+    brokerOrderId?: string;
+    tokenInput: string;
+  }>({ isOpen: false, clientOrderId: "", resolutionAction: "", tokenInput: "" });
   const [fills, setFills] = useState<Fill[]>([]);
   
   const [broker, setBroker] = useState<string>("Binance");
@@ -431,6 +438,38 @@ export default function BrokerAccountManager({ role, username }: BrokerAccountMa
                               Err: {ord.lastError}
                             </span>
                           )}
+                          {ord.manualReviewRequired && (
+                            <div className="mt-2 flex flex-wrap gap-2 justify-center border-t border-[#1b1b22] pt-2">
+                              <div className="text-[#ff5555] font-bold text-[10px] w-full text-center">MANUAL REVIEW REQUIRED</div>
+                              {ord.lastBrokerStatus === "CLIENT_ORDER_LOOKUP_UNSUPPORTED" && (
+                                <div className="text-[#ffb74d] text-[9px] w-full text-center">Broker lookup unsupported.</div>
+                              )}
+                              <button 
+                                onClick={() => setResolveMfaModal({ isOpen: true, clientOrderId: ord.clientOrderId, resolutionAction: "attachBrokerOrderId", brokerOrderId: "", tokenInput: "" })}
+                                className="px-2 py-1 bg-[#141419] border border-[#232329] text-[9px] text-[#00FF66] hover:bg-[#1b2b1d] transition"
+                              >
+                                Attach Broker ID
+                              </button>
+                              <button 
+                                onClick={() => setResolveMfaModal({ isOpen: true, clientOrderId: ord.clientOrderId, resolutionAction: "markCanceled", tokenInput: "" })}
+                                className="px-2 py-1 bg-[#141419] border border-[#232329] text-[9px] text-white hover:bg-[#2b1f1d] transition"
+                              >
+                                Mark Canceled
+                              </button>
+                              <button 
+                                onClick={() => setResolveMfaModal({ isOpen: true, clientOrderId: ord.clientOrderId, resolutionAction: "markRejected", tokenInput: "" })}
+                                className="px-2 py-1 bg-[#141419] border border-[#232329] text-[9px] text-[#ff5555] hover:bg-[#2b1f1d] transition"
+                              >
+                                Mark Rejected
+                              </button>
+                              <button 
+                                onClick={() => setResolveMfaModal({ isOpen: true, clientOrderId: ord.clientOrderId, resolutionAction: "requestCancel", tokenInput: "" })}
+                                className="px-2 py-1 bg-[#141419] border border-[#232329] text-[9px] text-[#ffb74d] hover:bg-[#2b251d] transition"
+                              >
+                                Request Cancel
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -492,6 +531,109 @@ export default function BrokerAccountManager({ role, username }: BrokerAccountMa
               </table>
             </div>
           )}
+        </div>
+      )}
+
+      {resolveMfaModal.isOpen && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+          <div className="bg-[#0a0a0c] border border-[#232329] w-full max-w-sm overflow-hidden shadow-2xl">
+            <div className="bg-[#141419] px-4 py-3 border-b border-[#232329] flex justify-between items-center">
+              <h3 className="text-[#8c8c9a] font-mono text-xs uppercase tracking-widest font-bold flex items-center gap-2">
+                <Key className="w-4 h-4 text-[#00FF66]" />
+                Resolve Order MFA
+              </h3>
+            </div>
+            <div className="p-6 space-y-4 font-mono">
+              <p className="text-xs text-[#6e6e7a]">
+                Resolving order <span className="text-white break-all">{resolveMfaModal.clientOrderId}</span> with action <span className="text-[#00FF66]">{resolveMfaModal.resolutionAction}</span>.
+              </p>
+              
+              {resolveMfaModal.resolutionAction === "attachBrokerOrderId" && (
+                <div className="space-y-1">
+                  <label className="text-[10px] uppercase text-[#8c8c9a] font-bold">Broker Order ID</label>
+                  <input
+                    type="text"
+                    value={resolveMfaModal.brokerOrderId || ""}
+                    onChange={(e) => setResolveMfaModal({ ...resolveMfaModal, brokerOrderId: e.target.value })}
+                    className="w-full bg-[#141419] border border-[#232329] text-white text-xs p-2 outline-none focus:border-[#00FF66] transition-colors"
+                    placeholder="Enter explicit broker order id"
+                  />
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <label className="text-[10px] uppercase text-[#8c8c9a] font-bold">Authenticator Code</label>
+                <input
+                  type="text"
+                  maxLength={6}
+                  value={resolveMfaModal.tokenInput}
+                  onChange={(e) => setResolveMfaModal({ ...resolveMfaModal, tokenInput: e.target.value.replace(/\D/g, '') })}
+                  className="w-full bg-[#141419] border border-[#232329] text-white text-xs p-2 outline-none focus:border-[#00FF66] transition-colors text-center tracking-[0.5em] text-lg font-bold"
+                  placeholder="000000"
+                />
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button 
+                  onClick={() => setResolveMfaModal({ isOpen: false, clientOrderId: "", resolutionAction: "", tokenInput: "" })}
+                  className="flex-1 px-4 py-2 bg-[#141419] hover:bg-[#1a1a24] text-[#8c8c9a] text-xs font-bold transition-colors border border-[#232329]"
+                >
+                  CANCEL
+                </button>
+                <button 
+                  onClick={async () => {
+                    try {
+                      const payload = {
+                        clientOrderId: resolveMfaModal.clientOrderId,
+                        resolutionAction: resolveMfaModal.resolutionAction,
+                        brokerOrderId: resolveMfaModal.brokerOrderId || ""
+                      };
+                      
+                      const verifyRes = await apiFetch("/api/auth/verify-totp", {
+                        method: "POST",
+                        body: JSON.stringify({
+                          code: resolveMfaModal.tokenInput,
+                          action: "RESOLVE_ORDER",
+                          payload
+                        })
+                      });
+                      
+                      const verifyData = await verifyRes.json();
+                      if (!verifyData.success || !verifyData.actionToken) {
+                        alert("MFA Verification Failed: " + (verifyData.error || "Invalid token"));
+                        return;
+                      }
+                      
+                      const resolveRes = await apiFetch(`/api/orders/${resolveMfaModal.clientOrderId}/manual-resolve`, {
+                        method: "POST",
+                        body: JSON.stringify({
+                          actionToken: verifyData.actionToken,
+                          resolutionAction: resolveMfaModal.resolutionAction,
+                          brokerOrderId: resolveMfaModal.brokerOrderId
+                        })
+                      });
+                      
+                      if (resolveRes.ok) {
+                        setResolveMfaModal({ isOpen: false, clientOrderId: "", resolutionAction: "", tokenInput: "" });
+                        // Refresh orders
+                        const ordersRes = await apiFetch("/api/orders");
+                        if (ordersRes.ok) setOrders(await ordersRes.json());
+                      } else {
+                        const data = await resolveRes.json();
+                        alert("Failed to resolve order: " + data.error);
+                      }
+                    } catch (e: any) {
+                      alert("Error: " + e.message);
+                    }
+                  }}
+                  disabled={resolveMfaModal.tokenInput.length !== 6 || (resolveMfaModal.resolutionAction === "attachBrokerOrderId" && !resolveMfaModal.brokerOrderId)}
+                  className="flex-1 px-4 py-2 bg-[#00FF66]/10 hover:bg-[#00FF66]/20 text-[#00FF66] border border-[#00FF66]/30 text-xs font-bold transition-colors disabled:opacity-50"
+                >
+                  AUTHORIZE
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

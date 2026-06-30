@@ -898,7 +898,10 @@ setInterval(async () => {
   try {
     const db = dbInstance.get();
     const orders = db.orders || [];
-    const workingOrders = orders.filter(o => ACTIVE_ORDER_STATUSES.includes(o.status as any));
+    const workingOrders = orders.filter(o => 
+      ACTIVE_ORDER_STATUSES.includes(o.status as any) &&
+      !(o.status === "PENDING_UNKNOWN" && o.manualReviewRequired && o.lastBrokerStatus === "CLIENT_ORDER_LOOKUP_UNSUPPORTED")
+    );
     if (workingOrders.length === 0) return;
 
     for (const ord of workingOrders) {
@@ -1436,7 +1439,8 @@ app.get("/api/auth/me", requireAuth(['admin', 'operator', 'viewer']), (req: any,
 const MFA_ACTIONS: Record<string, Array<"admin" | "operator" | "viewer">> = {
   START_LIVE_BOT: ["admin", "operator"],
   SAVE_RISK_LIMITS: ["admin"],
-  TOGGLE_GLOBAL_KILL_SWITCH: ["admin"]
+  TOGGLE_GLOBAL_KILL_SWITCH: ["admin"],
+  RESOLVE_ORDER: ["admin", "operator"]
 };
 
 app.post("/api/auth/verify-totp", requireAuth(['admin', 'operator', 'viewer']), authRateLimiter, async (req: any, res) => {
@@ -2024,17 +2028,15 @@ app.post("/api/bots/stop/:id", requireAuth(['admin', 'operator']), async (req: a
 // P2-3: Manual review API for PENDING_UNKNOWN or unresolved orders
 app.post("/api/orders/:clientOrderId/manual-resolve", requireAuth(['admin', 'operator']), async (req: any, res) => {
   const { clientOrderId } = req.params;
-  const { action, brokerOrderId, actionToken } = req.body;
+  const { resolutionAction, brokerOrderId, actionToken } = req.body;
 
-  // Protect via MFA token (assuming consumeMfaTokenAsync takes string matching endpoint body structure)
-  // Reconstruct minimal payload structure matching what front-end hashes for manual resolve
-  const bodyHash = crypto.createHash('sha256').update(JSON.stringify({ action, brokerOrderId })).digest('hex');
+  const payload = { clientOrderId, resolutionAction, brokerOrderId: brokerOrderId || "" };
   const isMfaValid = await consumeMfaTokenAsync(
     actionToken,
     req.user.username,
-    req.cookies.sid || "",
+    req.signedCookies.sid || "",
     "RESOLVE_ORDER",
-    bodyHash
+    payload
   );
 
   if (!isMfaValid) {
@@ -2051,16 +2053,20 @@ app.post("/api/orders/:clientOrderId/manual-resolve", requireAuth(['admin', 'ope
   
   const ord = db.orders![orderIndex];
   
+  const resolvableStatuses = ["PENDING_UNKNOWN", "CANCEL_FAILED", "CANCEL_REQUESTED"];
+  if (!ord.manualReviewRequired || !resolvableStatuses.includes(ord.status)) {
+    return res.status(409).json({ error: "Order is not in a manual-reviewable state." });
+  }
+
   try {
-    switch (action) {
+    switch (resolutionAction) {
       case "attachBrokerOrderId":
         if (!brokerOrderId) return res.status(400).json({ error: "brokerOrderId required" });
         await dbInstance.updateOrderState(clientOrderId, { 
           brokerOrderId, 
-          manualReviewRequired: false,
-          status: "WORKING" // Reset to working once attached
+          manualReviewRequired: false
         });
-        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Attached brokerOrderId ${brokerOrderId}`);
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Attached brokerOrderId ${brokerOrderId}, original status: ${ord.status}, new status: ${ord.status}`);
         break;
       case "markCanceled":
         await dbInstance.updateOrderState(clientOrderId, { 
@@ -2068,7 +2074,7 @@ app.post("/api/orders/:clientOrderId/manual-resolve", requireAuth(['admin', 'ope
           manualReviewRequired: false,
           bypassTransition: true 
         });
-        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as CANCELED`);
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as CANCELED, original status: ${ord.status}, new status: CANCELED`);
         break;
       case "markRejected":
         await dbInstance.updateOrderState(clientOrderId, { 
@@ -2076,14 +2082,14 @@ app.post("/api/orders/:clientOrderId/manual-resolve", requireAuth(['admin', 'ope
           manualReviewRequired: false,
           bypassTransition: true 
         });
-        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as REJECTED`);
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually marked as REJECTED, original status: ${ord.status}, new status: REJECTED`);
         break;
       case "requestCancel":
         await dbInstance.updateOrderState(clientOrderId, { 
           status: "CANCEL_REQUESTED", 
           manualReviewRequired: false 
         });
-        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually re-requested cancel`);
+        appendSecurityLog(req.user.username, req.user.role, "ORDER_RESOLVED", clientOrderId, `Manually re-requested cancel, original status: ${ord.status}, new status: CANCEL_REQUESTED`);
         break;
       default:
         return res.status(400).json({ error: "Invalid action" });
@@ -2185,6 +2191,14 @@ function normalizeMfaPayload(action: string, payload: any) {
       industryCryptoMaxPercent: Number(payload.industryCryptoMaxPercent),
       autoMeltDrawdownThreshold: Number(payload.autoMeltDrawdownThreshold),
       autoMeltSharpeThreshold: Number(payload.autoMeltSharpeThreshold)
+    };
+  }
+
+  if (action === "RESOLVE_ORDER") {
+    return {
+      clientOrderId: String(payload.clientOrderId || ""),
+      resolutionAction: String(payload.resolutionAction || ""),
+      brokerOrderId: payload.brokerOrderId ? String(payload.brokerOrderId) : ""
     };
   }
 

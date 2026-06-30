@@ -1,8 +1,10 @@
 import crypto from "crypto";
-import axios from "axios";
+import { brokerHttp as axios } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class OKXAdapter implements BrokerAdapter {
+  supportsClientOrderIdLookup = true;
+
   private getHeaders(
     method: string,
     requestPath: string,
@@ -176,6 +178,38 @@ export class OKXAdapter implements BrokerAdapter {
     return {
       brokerOrderId: orderInfo.ordId,
       clientOrderId: orderInfo.clOrdId,
+      status: finalStatus,
+      filledPrice: parseFloat(orderInfo.avgPx || "0"),
+      filledQuantity: parseFloat(orderInfo.accFillSz || "0")
+    };
+  }
+
+  async getOrderByClientOrderId(clientOrderId: string, symbol: string, marketType: "spot" | "perpetual" | "futures", apiKey?: string, apiSecret?: string, passphrase?: string, isSandbox?: boolean): Promise<OrderStatus> {
+    if (!apiKey || !apiSecret) throw new Error("OKX credentials missing.");
+    const baseUrl = this.getBaseUrl();
+    let formattedInstId = symbol.replace("/", "-").toUpperCase();
+    if (marketType === "perpetual" || marketType === "futures") {
+      if (!formattedInstId.includes("SWAP")) {
+        formattedInstId = `${formattedInstId}-SWAP`;
+      }
+    }
+    const requestPath = `/api/v5/trade/order?clOrdId=${clientOrderId}&instId=${formattedInstId}`;
+    const headers = this.getHeaders("GET", requestPath, "", apiKey, apiSecret, passphrase, isSandbox);
+
+    const res = await axios.get(`${baseUrl}${requestPath}`, { headers });
+    if (res.data?.code !== "0" || !res.data.data?.[0]) {
+      throw new Error(`OKX Order status request failed by client order ID: ${res.data?.msg}`);
+    }
+
+    const orderInfo = res.data.data[0];
+    let finalStatus: OrderStatus["status"] = "NEW";
+    if (orderInfo.state === "filled") finalStatus = "FILLED";
+    else if (orderInfo.state === "partially_filled") finalStatus = "PARTIALLY_FILLED";
+    else if (orderInfo.state === "canceled") finalStatus = "CANCELED";
+
+    return {
+      brokerOrderId: orderInfo.ordId,
+      clientOrderId: orderInfo.clOrdId || clientOrderId,
       status: finalStatus,
       filledPrice: parseFloat(orderInfo.avgPx || "0"),
       filledQuantity: parseFloat(orderInfo.accFillSz || "0")

@@ -1,8 +1,10 @@
 import crypto from "crypto";
-import axios from "axios";
+import { brokerHttp as axios } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class LongbridgeAdapter implements BrokerAdapter {
+  supportsClientOrderIdLookup = false;
+
   private getHeaders(
     method: string,
     path: string,
