@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { brokerHttp as axios } from "./http";
+import { brokerHttp as axios, normalizeBrokerHttpError } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class BinanceAdapter implements BrokerAdapter {
@@ -147,13 +147,14 @@ export class BinanceAdapter implements BrokerAdapter {
         filledPrice: data.price ? parseFloat(data.price) : order.price,
         filledQuantity: data.executedQty ? parseFloat(data.executedQty) : 0
       };
-    } catch (err: any) {
-      const errMsg = err.response?.data?.msg || err.message;
+    } catch (err: unknown) {
+      const brokerErr = normalizeBrokerHttpError(err);
+      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,
-        status: "REJECTED",
-        error: `Binance transaction rejected: ${errMsg}`
+        status: isRejected ? "REJECTED" : "UNKNOWN",
+        error: `Binance transaction error (${brokerErr.type}): ${brokerErr.message}`
       };
     }
   }

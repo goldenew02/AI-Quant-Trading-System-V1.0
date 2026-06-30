@@ -706,7 +706,63 @@ export class AegisDB {
             }
 
             // Fetch state AFTER migrations
-            sqliteDb.get("SELECT value FROM aegis_kv WHERE key = 'database_state'", (selectErr, row: any) => {
+            const loadStructuredTradingTables = () => {
+              return new Promise<void>((res, rej) => {
+                sqliteDb.all("SELECT * FROM orders ORDER BY createdAt DESC", (orderErr, orderRows) => {
+                  if (orderErr) {
+                    console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for orders:", orderErr);
+                    if (process.env.NODE_ENV === "production") return rej(orderErr);
+                  } else if (orderRows && orderRows.length > 0) {
+                    this.data.orders = orderRows.map((r: any) => ({
+                      id: r.id,
+                      botId: r.botId,
+                      broker: r.broker,
+                      brokerAccountId: r.brokerAccountId,
+                      clientOrderId: r.clientOrderId,
+                      brokerOrderId: r.brokerOrderId || undefined,
+                      symbol: r.symbol,
+                      marketType: r.marketType,
+                      marginMode: r.marginMode || undefined,
+                      positionSide: r.positionSide || undefined,
+                      exchangeSymbol: r.exchangeSymbol || undefined,
+                      side: r.side,
+                      type: r.type,
+                      price: Number(r.price),
+                      quantity: Number(r.quantity),
+                      status: r.status,
+                      createdAt: r.createdAt,
+                      updatedAt: r.updatedAt,
+                      lastError: r.lastError || undefined,
+                      cancelRequestedAt: r.cancelRequestedAt || undefined,
+                      cancelRetryCount: r.cancelRetryCount ? Number(r.cancelRetryCount) : undefined,
+                      lastBrokerStatus: r.lastBrokerStatus || undefined,
+                      manualReviewRequired: r.manualReviewRequired === 1
+                    }));
+                  }
+                  
+                  sqliteDb.all("SELECT * FROM fills ORDER BY timestamp DESC", (fillErr, fillRows) => {
+                    if (fillErr) {
+                      console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for fills:", fillErr);
+                      if (process.env.NODE_ENV === "production") return rej(fillErr);
+                    } else if (fillRows && fillRows.length > 0) {
+                      this.data.fills = fillRows.map((r: any) => ({
+                        id: r.id,
+                        orderId: r.orderId,
+                        brokerFillId: r.brokerFillId,
+                        price: Number(r.price),
+                        quantity: Number(r.quantity),
+                        fee: Number(r.fee),
+                        feeCurrency: r.feeCurrency,
+                        timestamp: r.timestamp
+                      }));
+                    }
+                    res();
+                  });
+                });
+              });
+            };
+
+            sqliteDb.get("SELECT value FROM aegis_kv WHERE key = 'database_state'", async (selectErr, row: any) => {
               if (selectErr) {
                 console.error("Failed to fetch state from SQLite:", selectErr);
                 return reject(selectErr);
@@ -715,68 +771,18 @@ export class AegisDB {
               if (row && row.value) {
                 try {
                   this.updateDataInPlace(JSON.parse(row.value));
-                  
-                  // Now load structured orders and fills to ensure they are the source of truth (P1-3)
-                  sqliteDb.all("SELECT * FROM orders ORDER BY createdAt DESC", (orderErr, orderRows) => {
-                    if (orderErr) {
-                      console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for orders:", orderErr);
-                      return resolve();
-                    }
-                    if (orderRows && orderRows.length > 0) {
-                      this.data.orders = orderRows.map((r: any) => ({
-                        id: r.id,
-                        botId: r.botId,
-                        broker: r.broker,
-                        brokerAccountId: r.brokerAccountId,
-                        clientOrderId: r.clientOrderId,
-                        brokerOrderId: r.brokerOrderId || undefined,
-                        symbol: r.symbol,
-                        marketType: r.marketType,
-                        marginMode: r.marginMode || undefined,
-                        positionSide: r.positionSide || undefined,
-                        exchangeSymbol: r.exchangeSymbol || undefined,
-                        side: r.side,
-                        type: r.type,
-                        price: Number(r.price),
-                        quantity: Number(r.quantity),
-                        status: r.status,
-                        createdAt: r.createdAt,
-                        updatedAt: r.updatedAt,
-                        lastError: r.lastError || undefined,
-                        cancelRequestedAt: r.cancelRequestedAt || undefined,
-                        cancelRetryCount: r.cancelRetryCount ? Number(r.cancelRetryCount) : undefined,
-                        lastBrokerStatus: r.lastBrokerStatus || undefined,
-                        manualReviewRequired: r.manualReviewRequired === 1
-                      }));
-                    }
-                    
-                    sqliteDb.all("SELECT * FROM fills ORDER BY timestamp DESC", (fillErr, fillRows) => {
-                      if (fillErr) {
-                        console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for fills:", fillErr);
-                        return resolve();
-                      }
-                      if (fillRows && fillRows.length > 0) {
-                        this.data.fills = fillRows.map((r: any) => ({
-                          id: r.id,
-                          orderId: r.orderId,
-                          brokerFillId: r.brokerFillId,
-                          price: Number(r.price),
-                          quantity: Number(r.quantity),
-                          fee: Number(r.fee),
-                          feeCurrency: r.feeCurrency,
-                          timestamp: r.timestamp
-                        }));
-                      }
-                      resolve();
-                    });
-                  });
-
+                  await loadStructuredTradingTables();
+                  resolve();
                 } catch (parseErr) {
                   console.error("Failed to parse SQLite state, fallback to seed:", parseErr);
                   this.seedAndSave(sqliteDb, resolve, reject);
+                  // Even if fallback to seed, load structured
+                  await loadStructuredTradingTables().catch(e => console.error("Structured load failed after fallback", e));
                 }
               } else {
                 this.seedAndSave(sqliteDb, resolve, reject);
+                // Even if we seed, we must load structured orders/fills
+                await loadStructuredTradingTables().catch(e => console.error("Structured load failed after seed", e));
               }
             });
           });

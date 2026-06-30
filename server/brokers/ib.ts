@@ -1,4 +1,4 @@
-import { brokerHttp as axios } from "./http";
+import { brokerHttp as axios, normalizeBrokerHttpError } from "./http";
 import https from "https";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
@@ -154,13 +154,14 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
         clientOrderId: order.clientOrderId,
         status: "NEW"
       };
-    } catch (err: any) {
-      const errMsg = err.response?.data?.error || err.message;
+    } catch (err: unknown) {
+      const brokerErr = normalizeBrokerHttpError(err);
+      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,
-        status: "REJECTED",
-        error: `Interactive Brokers execution failure: ${errMsg}`
+        status: isRejected ? "REJECTED" : "UNKNOWN",
+        error: `Interactive Brokers execution error (${brokerErr.type}): ${brokerErr.message}`
       };
     }
   }

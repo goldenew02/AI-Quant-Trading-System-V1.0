@@ -550,6 +550,17 @@ async function runIsolatedBotStep(bot: BotConfig) {
                await dbInstance.updateOrderStatus(clientOrderId, accepted.status, accepted.brokerOrderId);
             }
             console.log(`[REAL BROKER ORDER ${accepted.status}] Order ${clientOrderId} immediately ${accepted.status}.`);
+          } else if (accepted.status === "UNKNOWN") {
+            console.error(`[REAL BROKER UNKNOWN] Order transmission status unknown: ${accepted.error}`);
+            await dbInstance.updateOrderState(clientOrderId, {
+              status: "PENDING_UNKNOWN",
+              lastError: accepted.error || "Order acceptance unknown due to network error",
+              manualReviewRequired: true,
+              lastBrokerStatus: "PLACE_ORDER_TRANSPORT_UNKNOWN"
+            });
+            bot.status = "stopped_by_risk";
+            bot.isEnabled = false;
+            appendSecurityLog("system", "admin", "BROKER_UNKNOWN", bot.id, `Order ${clientOrderId} transmission unknown. Manual review required.`);
           } else {
             console.error(`[REAL BROKER REJECTED] Order rejected by broker: ${accepted.error}`);
             await dbInstance.updateOrderStatus(clientOrderId, "REJECTED", undefined, accepted.error);
@@ -559,10 +570,10 @@ async function runIsolatedBotStep(bot: BotConfig) {
           }
         } catch (apiErr: any) {
           console.error(`[REAL BROKER EXCEPTION] Network trade execution failure:`, apiErr.message);
-          if (apiErr.message === "placeOrder timeout") {
+          if (apiErr.message === "placeOrder timeout" || String(apiErr.message).includes("network") || String(apiErr.message).includes("ECONN")) {
             await dbInstance.updateOrderState(clientOrderId, {
               status: "PENDING_UNKNOWN",
-              lastError: "placeOrder timeout; broker acceptance unknown",
+              lastError: apiErr.message + "; broker acceptance unknown",
               manualReviewRequired: true,
               lastBrokerStatus: "PLACE_ORDER_TIMEOUT"
             });
@@ -981,7 +992,24 @@ setInterval(async () => {
         }
       } catch (err: any) {
         console.error(`[ORDER POLLING ERROR] getOrder for ${ord.clientOrderId}: ${err.message}`);
+        const pollErrors = (ord as any).pollErrorCount || 0;
+        if (pollErrors >= 3) {
+          await dbInstance.updateOrderState(ord.clientOrderId, {
+            status: "PENDING_UNKNOWN",
+            manualReviewRequired: true,
+            lastBrokerStatus: "ATTACHED_BROKER_ORDER_LOOKUP_FAILED",
+            lastError: err.message
+          });
+        } else {
+          // Increment pollErrorCount (we update it in-place and save)
+          (ord as any).pollErrorCount = pollErrors + 1;
+        }
         continue;
+      }
+
+      // Reset poll error count on success
+      if ((ord as any).pollErrorCount) {
+        delete (ord as any).pollErrorCount;
       }
 
       console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);

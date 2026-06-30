@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { brokerHttp as axios } from "./http";
+import { brokerHttp as axios, normalizeBrokerHttpError } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class OKXAdapter implements BrokerAdapter {
@@ -141,13 +141,14 @@ export class OKXAdapter implements BrokerAdapter {
         clientOrderId: ordDetails.clOrdId,
         status: "NEW" // OKX placing order creates a working order
       };
-    } catch (err: any) {
-      const errMsg = err.response?.data?.msg || err.message;
+    } catch (err: unknown) {
+      const brokerErr = normalizeBrokerHttpError(err);
+      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,
-        status: "REJECTED",
-        error: `OKX connection failure: ${errMsg}`
+        status: isRejected ? "REJECTED" : "UNKNOWN",
+        error: `OKX transaction error (${brokerErr.type}): ${brokerErr.message}`
       };
     }
   }

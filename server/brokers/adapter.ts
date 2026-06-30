@@ -40,7 +40,7 @@ export interface OrderRequest {
 export interface OrderAccepted {
   brokerOrderId: string;
   clientOrderId: string;
-  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "REJECTED";
+  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "REJECTED" | "UNKNOWN";
   filledPrice?: number;
   filledQuantity?: number;
   error?: string;
@@ -49,7 +49,7 @@ export interface OrderAccepted {
 export interface OrderStatus {
   brokerOrderId: string;
   clientOrderId: string;
-  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "WORKING" | "CANCELED" | "REJECTED";
+  status: "FILLED" | "PARTIALLY_FILLED" | "NEW" | "WORKING" | "CANCELED" | "REJECTED" | "UNKNOWN";
   filledPrice?: number;
   filledQuantity?: number;
   error?: string;

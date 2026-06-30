@@ -132,7 +132,7 @@ async function run() {
   const server = await bootstrap(0);
   
   const { dbInstance } = await import("../server/db.ts");
-  console.log(`[DEBUG] dbInstance dbDir is ${dbInstance.dbDir}`);
+  console.log(`[DEBUG] dbInstance dbDir is ${(dbInstance as any).dbDir}`);
   
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -265,7 +265,7 @@ async function run() {
         dbInstance.get().orders = [{
           id: "test-order-1",
           botId: "test-bot",
-          broker: "binance",
+          broker: "Binance",
           brokerAccountId: "test-acc",
           clientOrderId: "TEST_ORD_1",
           brokerOrderId: "",

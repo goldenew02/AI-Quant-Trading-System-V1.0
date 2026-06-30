@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { brokerHttp as axios } from "./http";
+import { brokerHttp as axios, normalizeBrokerHttpError } from "./http";
 import { BrokerAdapter, BrokerStatus, Balance, Position, OrderRequest, OrderAccepted, OrderStatus } from "./adapter";
 
 export class LongbridgeAdapter implements BrokerAdapter {
@@ -114,12 +114,14 @@ export class LongbridgeAdapter implements BrokerAdapter {
         status: "REJECTED",
         error: res.data?.message || "Order rejected by Longbridge"
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const brokerErr = normalizeBrokerHttpError(err);
+      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,
-        status: "REJECTED",
-        error: `Longbridge request failure: ${err.message}`
+        status: isRejected ? "REJECTED" : "UNKNOWN",
+        error: `Longbridge transaction error (${brokerErr.type}): ${brokerErr.message}`
       };
     }
   }

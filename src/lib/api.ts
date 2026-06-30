@@ -24,6 +24,11 @@ export async function apiFetch(url: string, options: RequestInit = {}): Promise<
     headers["X-CSRF-Token"] = csrfToken;
   }
 
+  // Auto-attach JSON content type if body is present and not FormData
+  if (options.body && !(options.body instanceof FormData) && !headers["Content-Type"] && !headers["content-type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(url, {
     ...options,
     credentials: "include", // Ensure signed HttpOnly session cookie is transmitted

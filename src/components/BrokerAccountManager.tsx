@@ -444,6 +444,9 @@ export default function BrokerAccountManager({ role, username }: BrokerAccountMa
                               {ord.lastBrokerStatus === "CLIENT_ORDER_LOOKUP_UNSUPPORTED" && (
                                 <div className="text-[#ffb74d] text-[9px] w-full text-center">Broker lookup unsupported.</div>
                               )}
+                              {ord.lastBrokerStatus === "ATTACHED_BROKER_ORDER_LOOKUP_FAILED" && (
+                                <div className="text-[#ff5555] text-[9px] w-full text-center">绑定的 brokerOrderId 查询失败，请重新核对</div>
+                              )}
                               <button 
                                 onClick={() => setResolveMfaModal({ isOpen: true, clientOrderId: ord.clientOrderId, resolutionAction: "attachBrokerOrderId", brokerOrderId: "", tokenInput: "" })}
                                 className="px-2 py-1 bg-[#141419] border border-[#232329] text-[9px] text-[#00FF66] hover:bg-[#1b2b1d] transition"
