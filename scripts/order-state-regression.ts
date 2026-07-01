@@ -24,11 +24,11 @@ async function run() {
   const createOrder = async (status: string) => {
      const id = crypto.randomUUID();
      const ord = {
-        id, botId: "b1", broker: "binance", brokerAccountId: "ba1",
-        clientOrderId: id, symbol: "BTCUSDT", side: "BUY", type: "MARKET",
-        quantity: 1, price: 0, status, createdAt: Date.now(), updatedAt: Date.now()
+        id, botId: "b1", broker: "Binance" as const, brokerAccountId: "ba1",
+        clientOrderId: id, symbol: "BTCUSDT", marketType: "spot" as const, side: "BUY" as const, type: "MKT" as const,
+        quantity: 1, price: 0, status: status as any, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
      };
-     await db.insertOrder(ord as any);
+     await db.insertOrder(ord);
      return id;
   };
 

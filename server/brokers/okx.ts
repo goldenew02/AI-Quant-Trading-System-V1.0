@@ -127,11 +127,18 @@ export class OKXAdapter implements BrokerAdapter {
       const res = await axios.post(`${baseUrl}${requestPath}`, body, { headers });
       const data = res.data;
       if (data?.code !== "0" || !data.data?.[0]) {
+        let isRejected = false;
+        const codeStr = String(data?.code);
+        const okxRejectionCodes = ["51000", "51006", "51008", "51014", "51015", "51119", "51121", "58001"];
+        if (codeStr && codeStr !== "0" && okxRejectionCodes.includes(codeStr)) {
+          isRejected = true;
+        }
+
         return {
           brokerOrderId: "",
           clientOrderId: order.clientOrderId,
-          status: "REJECTED",
-          error: data?.msg || data?.data?.[0]?.sMsg || "Rejected by OKX"
+          status: isRejected ? "REJECTED" : "UNKNOWN",
+          error: `[${codeStr}] ${data?.msg || data?.data?.[0]?.sMsg || "OKX non-success response"}`
         };
       }
 

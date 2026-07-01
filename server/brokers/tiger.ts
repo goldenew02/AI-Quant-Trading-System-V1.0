@@ -115,11 +115,18 @@ export class TigerAdapter implements BrokerAdapter {
           status: "NEW"
         };
       }
+      
+      const msg = (res.data?.message || res.data?.msg || "").toLowerCase();
+      let isRejected = false;
+      if (msg.includes("reject") || msg.includes("invalid") || msg.includes("balance") || msg.includes("margin") || msg.includes("insufficient") || msg.includes("exceed") || msg.includes("limit") || msg.includes("parameter")) {
+        isRejected = true;
+      }
+      
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,
-        status: "REJECTED",
-        error: res.data?.message || "Tiger Brokers order execution rejected"
+        status: isRejected ? "REJECTED" : "UNKNOWN",
+        error: `[${res.data?.code || "No code"}] ${res.data?.message || "Tiger response did not include order_id"}`
       };
     } catch (err: unknown) {
       let isRejected = false;

@@ -587,12 +587,12 @@ export class AegisDB {
         
         const exec = (sql: string, params: any[] = []): Promise<void> => new Promise((res, rej) => sqliteDb.run(sql, params, e => e ? rej(e) : res()));
         const query = (sql: string, params: any[] = []): Promise<any[]> => new Promise((res, rej) => sqliteDb.all(sql, params, (e, rows) => e ? rej(e) : res(rows)));
+        let hasDbState = false;
 
         (async () => {
           try {
             const tables = await query("SELECT name FROM sqlite_master WHERE type='table'");
             const tableNames = tables.map((t: any) => t.name);
-            let hasDbState = false;
             try {
               const sqlitePath = path.join(this.dbDir, "aegis_secure.db");
               if (fs.existsSync(sqlitePath) && fs.statSync(sqlitePath).size > 0) {
@@ -607,31 +607,6 @@ export class AegisDB {
             if (hasDbState && process.env.NODE_ENV === "production") {
               if (!tableNames.includes("orders") || !tableNames.includes("fills")) {
                 throw new Error("STRUCTURED_SCHEMA_INVALID: orders or fills table missing in an existing database");
-              }
-              const orderColumns = await query("PRAGMA table_info(orders)");
-              const requiredOrderColumns = [
-                "id", "botId", "broker", "brokerAccountId", "clientOrderId",
-                "symbol", "marketType", "side", "type", "price", "quantity",
-                "status", "createdAt", "updatedAt",
-                "pollErrorCount", "manualReviewRequired", "lastBrokerStatus"
-              ];
-              const colNames = orderColumns.map((c: any) => c.name);
-              for (const rc of requiredOrderColumns) {
-                if (!colNames.includes(rc)) {
-                  throw new Error(`STRUCTURED_SCHEMA_INVALID: orders table missing required column ${rc}`);
-                }
-              }
-
-              const fillColumns = await query("PRAGMA table_info(fills)");
-              const requiredFillColumns = [
-                "id", "orderId", "brokerFillId", "price", "quantity",
-                "fee", "feeCurrency", "timestamp"
-              ];
-              const fillColNames = fillColumns.map((c: any) => c.name);
-              for (const rc of requiredFillColumns) {
-                if (!fillColNames.includes(rc)) {
-                  throw new Error(`STRUCTURED_SCHEMA_INVALID: fills table missing required column ${rc}`);
-                }
               }
             }
           } catch (e) {
@@ -764,7 +739,41 @@ export class AegisDB {
 
             // Fetch state AFTER migrations
             const loadStructuredTradingTables = () => {
-              return new Promise<void>((res, rej) => {
+              return new Promise<void>(async (res, rej) => {
+                // Post-migration schema validation
+                if (hasDbState && process.env.NODE_ENV === "production") {
+                  try {
+                    const query = (sql: string, params: any[] = []): Promise<any[]> => new Promise((resolveQuery, rejectQuery) => sqliteDb.all(sql, params, (e, rows) => e ? rejectQuery(e) : resolveQuery(rows)));
+                    const orderColumns = await query("PRAGMA table_info(orders)");
+                    const requiredOrderColumns = [
+                      "id", "botId", "broker", "brokerAccountId", "clientOrderId",
+                      "symbol", "marketType", "side", "type", "price", "quantity",
+                      "status", "createdAt", "updatedAt",
+                      "pollErrorCount", "manualReviewRequired", "lastBrokerStatus"
+                    ];
+                    const colNames = orderColumns.map((c: any) => c.name);
+                    for (const rc of requiredOrderColumns) {
+                      if (!colNames.includes(rc)) {
+                        return rej(new Error(`STRUCTURED_SCHEMA_INVALID: orders table missing required column ${rc}`));
+                      }
+                    }
+
+                    const fillColumns = await query("PRAGMA table_info(fills)");
+                    const requiredFillColumns = [
+                      "id", "orderId", "brokerFillId", "price", "quantity",
+                      "fee", "feeCurrency", "timestamp"
+                    ];
+                    const fillColNames = fillColumns.map((c: any) => c.name);
+                    for (const rc of requiredFillColumns) {
+                      if (!fillColNames.includes(rc)) {
+                        return rej(new Error(`STRUCTURED_SCHEMA_INVALID: fills table missing required column ${rc}`));
+                      }
+                    }
+                  } catch (validationErr) {
+                    return rej(validationErr);
+                  }
+                }
+
                 sqliteDb.all("SELECT * FROM orders ORDER BY createdAt DESC", (orderErr, orderRows) => {
                   if (orderErr) {
                     console.error("[DB-SQLite] STRUCTURED_RESTORE_FAILED for orders:", orderErr);
@@ -832,12 +841,19 @@ export class AegisDB {
                   await loadStructuredTradingTables();
                   resolve();
                 } catch (parseErr) {
-                  console.error("Failed to parse SQLite state, fallback to seed:", parseErr);
+                  console.error("Failed to parse SQLite state:", parseErr);
+                  if (hasDbState && process.env.NODE_ENV === "production" && process.env.ALLOW_KV_RESEED_ON_CORRUPTION !== "true") {
+                    return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
+                  }
+                  console.warn("Falling back to seed...");
                   await this.seedAndSave(sqliteDb);
                   await loadStructuredTradingTables();
                   resolve();
                 }
               } else {
+                if (hasDbState && process.env.NODE_ENV === "production" && process.env.ALLOW_KV_RESEED_ON_CORRUPTION !== "true") {
+                  return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
+                }
                 await this.seedAndSave(sqliteDb);
                 await loadStructuredTradingTables();
                 resolve();

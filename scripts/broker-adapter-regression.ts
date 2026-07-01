@@ -129,6 +129,30 @@ async function run() {
     failed++; console.error("[FAIL] IB Gateway timeout ->", res.status);
   }
 
+  // Test OKX 200 + code: 51008 -> REJECTED
+  brokerHttp.post = async () => { return { status: 200, data: { code: "51008", msg: "Order placing failed" } } as any; };
+  res = await okx.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
+  if (res.status === "REJECTED") passed++; else failed++; console.log(res.status === "REJECTED" ? "[PASS]" : "[FAIL]", "OKX 200 + 51008 -> REJECTED");
+
+  // Test OKX 200 + code: 50000 -> UNKNOWN
+  brokerHttp.post = async () => { return { status: 200, data: { code: "50000", msg: "System error" } } as any; };
+  res = await okx.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
+  if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "OKX 200 + 50000 -> UNKNOWN");
+
+  // Test Tiger 200 + NO order_id + System error msg -> UNKNOWN
+  const { TigerAdapter } = await import("../server/brokers/tiger");
+  const tiger = new TigerAdapter();
+  brokerHttp.post = async () => { return { status: 200, data: { message: "System busy" } } as any; };
+  res = await tiger.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
+  if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "Tiger 200 + NO order_id + System error msg -> UNKNOWN");
+
+  // Test Longbridge 200 + NO order_id + Gateway msg -> UNKNOWN
+  const { LongbridgeAdapter } = await import("../server/brokers/longbridge");
+  const longbridge = new LongbridgeAdapter();
+  brokerHttp.post = async () => { return { status: 200, data: { message: "Gateway timeout" } } as any; };
+  res = await longbridge.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
+  if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "Longbridge 200 + NO order_id + Gateway msg -> UNKNOWN");
+
   // Restore mocks
   brokerHttp.post = origPost;
   brokerHttp.get = origGet;
@@ -136,4 +160,10 @@ async function run() {
   console.log(`Broker Adapter Tests Completed: ${passed} passed, ${failed} failed.`);
   process.exit(failed > 0 ? 1 : 0);
 }
-run();
+
+try {
+  run();
+} catch (e) {
+  brokerHttp.post = origPost;
+  brokerHttp.get = origGet;
+}

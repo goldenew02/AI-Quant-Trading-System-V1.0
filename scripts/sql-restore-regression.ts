@@ -4,17 +4,27 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 
-function hashDirectory(dirPath: string): string {
+function hashDirectory(dirPath: string, rootDir?: string): string {
   if (!fs.existsSync(dirPath)) return "NONE";
+  const root = rootDir || dirPath;
   const files = fs.readdirSync(dirPath).sort();
-  const hashes = files.map(file => {
+  const entries: string[] = [];
+  
+  for (const file of files) {
     const fullPath = path.join(dirPath, file);
-    if (fs.statSync(fullPath).isDirectory()) {
-      return hashDirectory(fullPath);
+    const relPath = path.relative(root, fullPath);
+    const stat = fs.statSync(fullPath);
+    
+    if (stat.isDirectory()) {
+      entries.push(`${relPath}|dir`);
+      entries.push(hashDirectory(fullPath, root));
+    } else {
+      const contentHash = crypto.createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex");
+      entries.push(`${relPath}|file|${stat.size}|${contentHash}`);
     }
-    return crypto.createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex");
-  });
-  return crypto.createHash("sha256").update(hashes.join("|")).digest("hex");
+  }
+  
+  return crypto.createHash("sha256").update(entries.join("||")).digest("hex");
 }
 
 async function run() {
@@ -40,8 +50,12 @@ async function run() {
   });
   await db.ready;
   if (!(db as any).sqliteDbConn) {
-    console.log("Native sqlite3 package is not active; skipping SQL tests.");
-    process.exit(0);
+    if (process.env.ALLOW_SQL_RESTORE_TEST_SKIP === "true" && process.env.NODE_ENV !== "production") {
+      console.log("Native sqlite3 package is not active; skipping SQL tests.");
+      process.exit(0);
+    }
+    console.error("[FAIL] Native sqlite3 unavailable; SQL restore safety tests cannot run.");
+    process.exit(1);
   }
 
   // Test SQL-RESTORE-2: Seed and then write orders/fills. Then drop KV and see if they come back.
