@@ -3,6 +3,9 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { Order } from "../src/types";
+
+type TestOrderStatus = Order["status"];
 
 async function run() {
   console.log("Running Order State Regression Tests...");
@@ -21,21 +24,21 @@ async function run() {
   await db.ready;
   
   // Create a mock order to test state transitions
-  const createOrder = async (status: string) => {
+  const createOrder = async (status: TestOrderStatus) => {
      const id = crypto.randomUUID();
-     const ord = {
+     const ord: Order = {
         id, botId: "b1", broker: "Binance" as const, brokerAccountId: "ba1",
         clientOrderId: id, symbol: "BTCUSDT", marketType: "spot" as const, side: "BUY" as const, type: "MKT" as const,
-        quantity: 1, price: 0, status: status as any, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        quantity: 1, price: 0, status: status, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
      };
      await db.insertOrder(ord);
      return id;
   };
 
-  const testTransition = async (name: string, from: string, to: string, shouldSucceed: boolean) => {
+  const testTransition = async (name: string, from: TestOrderStatus, to: TestOrderStatus, shouldSucceed: boolean) => {
      const id = await createOrder(from);
      try {
-        await db.updateOrderState(id, { status: to as any });
+        await db.updateOrderState(id, { status: to });
         const updated = await db.get().orders.find(o => o.clientOrderId === id);
         if (shouldSucceed) {
            if (updated?.status === to) {

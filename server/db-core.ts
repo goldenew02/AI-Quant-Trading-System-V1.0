@@ -835,28 +835,45 @@ export class AegisDB {
                 return reject(selectErr);
               }
               
+              let parsedState: any;
+
               if (row && row.value) {
                 try {
-                  this.updateDataInPlace(JSON.parse(row.value));
-                  await loadStructuredTradingTables();
-                  resolve();
-                } catch (parseErr) {
-                  console.error("Failed to parse SQLite state:", parseErr);
-                  if (hasDbState && process.env.NODE_ENV === "production" && process.env.ALLOW_KV_RESEED_ON_CORRUPTION !== "true") {
-                    return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
+                  parsedState = JSON.parse(row.value);
+                } catch (jsonErr) {
+                  console.error("Failed to parse SQLite state JSON:", jsonErr);
+                  if (hasDbState && process.env.NODE_ENV === "production") {
+                    if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
+                      console.warn("KV reseed override used due to JSON parse error.");
+                      this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
+                    } else {
+                      return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
+                    }
                   }
-                  console.warn("Falling back to seed...");
                   await this.seedAndSave(sqliteDb);
-                  await loadStructuredTradingTables();
-                  resolve();
+                  parsedState = this.data;
                 }
               } else {
-                if (hasDbState && process.env.NODE_ENV === "production" && process.env.ALLOW_KV_RESEED_ON_CORRUPTION !== "true") {
-                  return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
+                if (hasDbState && process.env.NODE_ENV === "production") {
+                  if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
+                    console.warn("KV reseed override used due to missing database_state.");
+                    this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
+                  } else {
+                    return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
+                  }
                 }
                 await this.seedAndSave(sqliteDb);
+                parsedState = this.data;
+              }
+
+              this.updateDataInPlace(parsedState);
+
+              try {
                 await loadStructuredTradingTables();
                 resolve();
+              } catch (structuredErr) {
+                console.error("Failed to load structured tables:", structuredErr);
+                reject(structuredErr);
               }
             });
           });

@@ -11,11 +11,12 @@ async function run() {
   let passed = 0;
   let failed = 0;
 
-  const orderMock: Order = {
-    id: "o1", botId: "b1", broker: "Binance" as BrokerType, brokerAccountId: "ba1",
-    clientOrderId: "o1", symbol: "BTCUSDT", side: "BUY", type: "MKT", marketType: "spot",
-    quantity: 1, price: 0, status: "PENDING", createdAt: Date.now().toString(), updatedAt: Date.now().toString()
-  };
+  try {
+    const orderMock: Order = {
+      id: "o1", botId: "b1", broker: "Binance" as BrokerType, brokerAccountId: "ba1",
+      clientOrderId: "o1", symbol: "BTCUSDT", side: "BUY", type: "MKT", marketType: "spot",
+      quantity: 1, price: 0, status: "PENDING", createdAt: Date.now().toString(), updatedAt: Date.now().toString()
+    };
 
   const ba: any = {
     id: "ba1", name: "b", broker: "Binance", apiKey: "a", apiSecret: "s",
@@ -153,17 +154,19 @@ async function run() {
   res = await longbridge.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
   if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "Longbridge 200 + NO order_id + Gateway msg -> UNKNOWN");
 
-  // Restore mocks
-  brokerHttp.post = origPost;
-  brokerHttp.get = origGet;
+  } finally {
+    // Restore mocks
+    brokerHttp.post = origPost;
+    brokerHttp.get = origGet;
+  }
 
   console.log(`Broker Adapter Tests Completed: ${passed} passed, ${failed} failed.`);
   process.exit(failed > 0 ? 1 : 0);
 }
 
-try {
-  run();
-} catch (e) {
+run().catch((e) => {
   brokerHttp.post = origPost;
   brokerHttp.get = origGet;
-}
+  console.error("Test execution failed:", e);
+  process.exit(1);
+});

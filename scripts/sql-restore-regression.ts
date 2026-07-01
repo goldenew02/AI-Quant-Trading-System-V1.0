@@ -168,18 +168,46 @@ async function run() {
     failed++; console.error("[FAIL] Test SQL-RESTORE-1 Failed: KV data was favored over structured", restoredOrder2);
   }
 
-  // Test SCHEMA-VALIDATION-1: Corrupted orders schema should fail-fast in production
+  // Test SCHEMA-UPGRADE-1: Upgradeable old schema should pass
   await new Promise<void>((resolve, reject) => {
     (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, clientOrderId TEXT, status TEXT)", (err2: any) => {
+      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, symbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt TEXT, updatedAt TEXT)", (err2: any) => {
+        if (err2) return reject(err2);
+        (db as any).sqliteDbConn.run("DELETE FROM schema_migrations", (err3: any) => {
+            if (err3) reject(err3);
+            else resolve();
+        });
+      });
+    });
+  });
+
+  process.env.NODE_ENV = "production";
+  try {
+    const dbUpgrade = new AegisDB({
+      dbDir: tmpDir,
+      autoBootstrapEnv: false,
+      seedUsers: [],
+      encryptionKey: testEncryptionKey
+    });
+    await dbUpgrade.ready;
+    passed++; console.log("[PASS] Test SCHEMA-UPGRADE-1 Passed: Old schema successfully migrated and passed validation");
+  } catch (err: any) {
+    failed++; console.error("[FAIL] Test SCHEMA-UPGRADE-1 Failed: DB failed to migrate", err);
+  }
+
+  // Test SCHEMA-UPGRADE-2: Corrupted orders schema should fail-fast
+  // Create table but without `clientOrderId` (a core column that no migration adds)
+  await new Promise<void>((resolve, reject) => {
+    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+      if (err) return reject(err);
+      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)", (err2: any) => {
         if (err2) reject(err2);
         else resolve();
       });
     });
   });
 
-  process.env.NODE_ENV = "production";
   try {
     const dbFail = new AegisDB({
       dbDir: tmpDir,
@@ -188,12 +216,12 @@ async function run() {
       encryptionKey: testEncryptionKey
     });
     await dbFail.ready;
-    failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-1 Failed: DB init succeeded despite missing marketType column in orders table");
+    failed++; console.error("[FAIL] Test SCHEMA-UPGRADE-2 Failed: DB init succeeded despite missing clientOrderId column in orders table");
   } catch (err: any) {
     if (err.message && err.message.includes("STRUCTURED_SCHEMA_INVALID") && err.message.includes("orders")) {
-      passed++; console.log("[PASS] Test SCHEMA-VALIDATION-1 Passed: Missing structured table columns failed-fast in production");
+      passed++; console.log("[PASS] Test SCHEMA-UPGRADE-2 Passed: Missing structured table core columns failed-fast in production");
     } else {
-      failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-1 Failed: Incorrect error thrown", err);
+      failed++; console.error("[FAIL] Test SCHEMA-UPGRADE-2 Failed: Incorrect error thrown", err);
     }
   }
   
