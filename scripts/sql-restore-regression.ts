@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import sqlite3 from "sqlite3";
 
 function hashDirectory(dirPath: string, rootDir?: string): string {
   if (!fs.existsSync(dirPath)) return "NONE";
@@ -58,8 +59,8 @@ async function run() {
     process.exit(1);
   }
 
-  function getTestSqliteConn(database: AegisDB): any {
-    const conn = (database as unknown as { sqliteDbConn?: any }).sqliteDbConn;
+  function getTestSqliteConn(database: AegisDB): sqlite3.Database {
+    const conn = (database as unknown as { sqliteDbConn?: sqlite3.Database }).sqliteDbConn;
     if (!conn) throw new Error("sqliteDbConn unavailable");
     return conn;
   }

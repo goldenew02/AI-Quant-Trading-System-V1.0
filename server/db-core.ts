@@ -847,7 +847,7 @@ export class AegisDB {
                       console.warn("KV reseed override used due to JSON parse error.");
                       await this.seedAndSave(sqliteDb);
                       parsedState = this.data;
-                      this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
+                      await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
                     } else {
                       return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
                     }
@@ -862,7 +862,7 @@ export class AegisDB {
                     console.warn("KV reseed override used due to missing database_state.");
                     await this.seedAndSave(sqliteDb);
                     parsedState = this.data;
-                    this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
+                    await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
                   } else {
                     return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
                   }
@@ -1178,6 +1178,25 @@ export class AegisDB {
         );
       });
     }
+  }
+
+  public async appendSecurityLogAsync(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
+    const prev = this.data.securityAuditLogs.length > 0 ? this.data.securityAuditLogs[0].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
+    const entry: SecurityAuditEntry = {
+      id: "sec_" + Math.random().toString(36).substring(2, 11),
+      timestamp: new Date().toISOString(),
+      username,
+      role,
+      action,
+      target,
+      details,
+      ipAddress: ip,
+      previousHash: prev,
+      currentHash: ""
+    };
+    entry.currentHash = computeSecurityHash(entry, prev);
+    this.data.securityAuditLogs.unshift(entry);
+    await this.saveAsync();
   }
 
   public appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {

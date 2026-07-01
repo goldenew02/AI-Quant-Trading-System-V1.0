@@ -143,3 +143,19 @@ sudo ufw enable
   ```bash
   openssl enc -aes-256-cbc -d -in /backup/aegis_data_2026-06-29.tar.gz.enc -pass pass:YOUR_PASSWORD | tar -xzvf - -C /restore_location
   ```
+
+## 10. KV Disaster Recovery Process
+If the KV `database_state` is corrupted or missing, the system will fail-fast and refuse to boot in production. Only use this procedure if you cannot restore from a valid backup.
+
+1. **Stop the service:** `sudo systemctl stop aegis`
+2. **Backup SQLite:** Backup `data/aegis_secure.db` manually.
+3. **Confirm no alternative:** Ensure you cannot restore from a valid backup.
+4. **Temporary environment variables:** Add these strictly for ONE boot in your `.env`:
+   ```env
+   ALLOW_KV_RESEED_ON_CORRUPTION=true
+   CONFIRM_KV_RESEED_RESETS_AUTH_STATE=YES_I_UNDERSTAND
+   ```
+5. **Start service once:** `sudo systemctl start aegis` (Wait for it to successfully boot).
+6. **Immediately revert:** Remove or set `ALLOW_KV_RESEED_ON_CORRUPTION=false` and remove `CONFIRM_KV_RESEED_RESETS_AUTH_STATE` from `.env`. Restart the service.
+7. **Verify & Audit:** Run `npm run auth-doctor` and `npm run test:auth`.
+8. **Check logs:** Check `securityAuditLogs` to verify the `KV_RESEED_OVERRIDE_USED` audit log was properly persisted.

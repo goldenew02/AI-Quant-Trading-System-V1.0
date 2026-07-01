@@ -13,8 +13,10 @@ async function run() {
   const testEncryptionKey = crypto.randomBytes(32);
   
   // 1. 构造已有 admin 用户，包含 passwordHash、totpSecret、mustEnrollTotp=false、passwordVersion
+  const originalPassword = `test-${crypto.randomBytes(16).toString("hex")}`;
+  const replacementPassword = `test-${crypto.randomBytes(16).toString("hex")}`;
   process.env.BOOTSTRAP_ADMIN_USER = "admin";
-  process.env.BOOTSTRAP_ADMIN_PASSWORD = "Password123!";
+  process.env.BOOTSTRAP_ADMIN_PASSWORD = originalPassword;
   process.env.NODE_ENV = "development";
 
   const db = new AegisDB({
@@ -69,7 +71,7 @@ async function run() {
   process.env.ADMIN_TOTP_SYNC_ON_BOOT = "false";
   
   // 3. 修改环境变量中的 bootstrap password / totp
-  process.env.BOOTSTRAP_ADMIN_PASSWORD = "NewPassword456!";
+  process.env.BOOTSTRAP_ADMIN_PASSWORD = replacementPassword;
   
   // 4. 重启 DB
   const dbSyncFalse = new AegisDB({
@@ -219,11 +221,21 @@ async function run() {
     passed++; console.log("[PASS] Test AUTH-KV-3 Passed: Reseed allowed by both env flags");
 
     // Test AUTH-KV-OVERRIDE-AUDIT
-    const auditLogs = dbSuccess.get().securityAuditLogs;
+    // We must verify that the audit log was persisted to SQLite, not just in memory.
+    
+    // Create a new DB instance to read from SQLite
+    const dbVerify = new AegisDB({
+      dbDir: tmpDir,
+      autoBootstrapEnv: false, // Don't bootstrap again
+      encryptionKey: testEncryptionKey
+    });
+    await dbVerify.ready;
+
+    const auditLogs = dbVerify.get().securityAuditLogs;
     if (auditLogs && auditLogs.some(l => l.action === "KV_RESEED_OVERRIDE_USED")) {
-      passed++; console.log("[PASS] Test AUTH-KV-OVERRIDE-AUDIT Passed: Audit log for reseed override persisted");
+      passed++; console.log("[PASS] Test AUTH-KV-OVERRIDE-AUDIT Passed: Audit log for reseed override persisted to SQLite");
     } else {
-      failed++; console.error("[FAIL] Test AUTH-KV-OVERRIDE-AUDIT Failed: Audit log for reseed override not found");
+      failed++; console.error("[FAIL] Test AUTH-KV-OVERRIDE-AUDIT Failed: Audit log for reseed override not found after reload");
     }
 
   } catch (err: any) {
