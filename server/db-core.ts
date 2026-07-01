@@ -427,69 +427,71 @@ export class AegisDB {
     }
   }
 
-  private seedAndSave(sqliteDb: any, resolve: () => void, reject: (err: any) => void) {
-    try {
-      let initialUsers: any[] = [];
-      if (this.seedUsers) {
-        initialUsers = this.seedUsers;
-      } else if (this.autoBootstrapEnv) {
-        const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
-        const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-        if (seedUser && seedPass) {
-          initialUsers = [
-            {
-              username: seedUser,
-              passwordHash: hashPassword(seedPass),
-              role: "admin",
-              totpSecret: null,
-              isActive: true,
-              mustEnrollTotp: true
-            }
-          ];
-        }
-      }
-
-      const seedData = {
-        users: initialUsers,
-        sessions: [],
-        bots: this.getSeedBots(),
-        tradeLogs: this.getSeedTradeLogs(),
-        securityAuditLogs: this.getSeedSecurityLogs(),
-        riskSettings: {
-          maxDailyDrawdown: 8.0,
-          maxAccountDrawdown: 15.0,
-          globalKillSwitch: false,
-          maxLeverageLimit: 10,
-          dailyLossLimitUSD: 800,
-          restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
-          singleAssetMaxAllocationPercent: 40,
-          industryCryptoMaxPercent: 60,
-          autoMeltDrawdownThreshold: 12.0,
-          autoMeltSharpeThreshold: 0.8
-        },
-        ibConnectionMode: "web_api_proxy",
-        brokerAccounts: [],
-        orders: [],
-        fills: [],
-        mfaActionTokens: [],
-        preauthSessions: []
-      };
-      this.updateDataInPlace(seedData);
-
-      sqliteDb.run(
-        "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [JSON.stringify(this.data, null, 2)],
-        (err: any) => {
-          if (err) {
-            console.error("Failed to seed database in SQLite:", err);
-            return reject(err);
+  private async seedAndSave(sqliteDb: any): Promise<void> {
+    return new Promise<void>((res, rej) => {
+      try {
+        let initialUsers: any[] = [];
+        if (this.seedUsers) {
+          initialUsers = this.seedUsers;
+        } else if (this.autoBootstrapEnv) {
+          const seedUser = process.env.BOOTSTRAP_ADMIN_USER;
+          const seedPass = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+          if (seedUser && seedPass) {
+            initialUsers = [
+              {
+                username: seedUser,
+                passwordHash: hashPassword(seedPass),
+                role: "admin",
+                totpSecret: null,
+                isActive: true,
+                mustEnrollTotp: true
+              }
+            ];
           }
-          resolve();
         }
-      );
-    } catch (err) {
-      reject(err);
-    }
+
+        const seedData = {
+          users: initialUsers,
+          sessions: [],
+          bots: this.getSeedBots(),
+          tradeLogs: this.getSeedTradeLogs(),
+          securityAuditLogs: this.getSeedSecurityLogs(),
+          riskSettings: {
+            maxDailyDrawdown: 8.0,
+            maxAccountDrawdown: 15.0,
+            globalKillSwitch: false,
+            maxLeverageLimit: 10,
+            dailyLossLimitUSD: 800,
+            restrictedSymbols: ["SHIB/USDT", "DOGE/USDT"],
+            singleAssetMaxAllocationPercent: 40,
+            industryCryptoMaxPercent: 60,
+            autoMeltDrawdownThreshold: 12.0,
+            autoMeltSharpeThreshold: 0.8
+          },
+          ibConnectionMode: "web_api_proxy" as any,
+          brokerAccounts: [],
+          orders: [],
+          fills: [],
+          mfaActionTokens: [],
+          preauthSessions: []
+        };
+        this.updateDataInPlace(seedData);
+
+        sqliteDb.run(
+          "INSERT INTO aegis_kv (key, value) VALUES ('database_state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+          [JSON.stringify(this.data, null, 2)],
+          (err: any) => {
+            if (err) {
+              console.error("Failed to seed database in SQLite:", err);
+              return rej(err);
+            }
+            res();
+          }
+        );
+      } catch (err) {
+        rej(err);
+      }
+    });
   }
 
   private async initDatabaseAsync(): Promise<void> {
@@ -681,7 +683,8 @@ export class AegisDB {
                   { version: 5, sql: `ALTER TABLE orders ADD COLUMN cancelRequestedAt TEXT` },
                   { version: 6, sql: `ALTER TABLE orders ADD COLUMN cancelRetryCount INTEGER` },
                   { version: 7, sql: `ALTER TABLE orders ADD COLUMN lastBrokerStatus TEXT` },
-                  { version: 8, sql: `ALTER TABLE orders ADD COLUMN manualReviewRequired INTEGER DEFAULT 0` }
+                  { version: 8, sql: `ALTER TABLE orders ADD COLUMN manualReviewRequired INTEGER DEFAULT 0` },
+                  { version: 9, sql: `ALTER TABLE orders ADD COLUMN pollErrorCount INTEGER DEFAULT 0` }
                 ];
 
                 const appliedMigrations = await query(`SELECT version FROM schema_migrations`);
@@ -735,6 +738,7 @@ export class AegisDB {
                       lastError: r.lastError || undefined,
                       cancelRequestedAt: r.cancelRequestedAt || undefined,
                       cancelRetryCount: r.cancelRetryCount ? Number(r.cancelRetryCount) : undefined,
+                      pollErrorCount: r.pollErrorCount ? Number(r.pollErrorCount) : undefined,
                       lastBrokerStatus: r.lastBrokerStatus || undefined,
                       manualReviewRequired: r.manualReviewRequired === 1
                     }));
@@ -775,14 +779,14 @@ export class AegisDB {
                   resolve();
                 } catch (parseErr) {
                   console.error("Failed to parse SQLite state, fallback to seed:", parseErr);
-                  this.seedAndSave(sqliteDb, resolve, reject);
-                  // Even if fallback to seed, load structured
-                  await loadStructuredTradingTables().catch(e => console.error("Structured load failed after fallback", e));
+                  await this.seedAndSave(sqliteDb);
+                  await loadStructuredTradingTables();
+                  resolve();
                 }
               } else {
-                this.seedAndSave(sqliteDb, resolve, reject);
-                // Even if we seed, we must load structured orders/fills
-                await loadStructuredTradingTables().catch(e => console.error("Structured load failed after seed", e));
+                await this.seedAndSave(sqliteDb);
+                await loadStructuredTradingTables();
+                resolve();
               }
             });
           });
@@ -1189,8 +1193,8 @@ export class AegisDB {
     return new Promise((resolve, reject) => {
       if (this.sqliteDbConn) {
         this.sqliteDbConn.run(
-          "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, marketType, marginMode, positionSide, exchangeSymbol, side, type, price, quantity, status, createdAt, updatedAt, lastError) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.marketType || 'spot', ord.marginMode || null, ord.positionSide || null, ord.exchangeSymbol || null, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null],
+          "INSERT INTO orders (id, botId, broker, brokerAccountId, clientOrderId, brokerOrderId, symbol, marketType, marginMode, positionSide, exchangeSymbol, side, type, price, quantity, status, createdAt, updatedAt, lastError, pollErrorCount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [ord.id, ord.botId, ord.broker, ord.brokerAccountId, ord.clientOrderId, ord.brokerOrderId || null, ord.symbol, ord.marketType || 'spot', ord.marginMode || null, ord.positionSide || null, ord.exchangeSymbol || null, ord.side, ord.type, ord.price, ord.quantity, ord.status, ord.createdAt, ord.updatedAt, ord.lastError || null, ord.pollErrorCount || 0],
           (err) => {
             if (err) {
               if (err.message.includes("UNIQUE constraint failed")) {
@@ -1260,8 +1264,8 @@ export class AegisDB {
         if (this.sqliteDbConn) {
           const db = this;
           this.sqliteDbConn.run(
-            "UPDATE orders SET status = ?, brokerOrderId = ?, lastError = ?, updatedAt = ?, cancelRetryCount = ?, cancelRequestedAt = ?, lastBrokerStatus = ?, manualReviewRequired = ? WHERE clientOrderId = ?",
-            [ord.status, ord.brokerOrderId || null, ord.lastError || null, ord.updatedAt, ord.cancelRetryCount || 0, ord.cancelRequestedAt || null, ord.lastBrokerStatus || null, ord.manualReviewRequired ? 1 : 0, clientOrderId],
+            "UPDATE orders SET status = ?, brokerOrderId = ?, lastError = ?, updatedAt = ?, cancelRetryCount = ?, cancelRequestedAt = ?, pollErrorCount = ?, lastBrokerStatus = ?, manualReviewRequired = ? WHERE clientOrderId = ?",
+            [ord.status, ord.brokerOrderId || null, ord.lastError || null, ord.updatedAt, ord.cancelRetryCount || 0, ord.cancelRequestedAt || null, ord.pollErrorCount || 0, ord.lastBrokerStatus || null, ord.manualReviewRequired ? 1 : 0, clientOrderId],
             function (this: any, err: any) {
               if (err) return reject(err);
               if (this.changes !== 1) {

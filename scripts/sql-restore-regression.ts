@@ -1,19 +1,40 @@
-import { AegisDB } from "../server/db-core";
+import { AegisDB } from "../server/db-core.ts";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
+
+function hashDirectory(dirPath: string): string {
+  if (!fs.existsSync(dirPath)) return "NONE";
+  const files = fs.readdirSync(dirPath).sort();
+  const hashes = files.map(file => {
+    const fullPath = path.join(dirPath, file);
+    if (fs.statSync(fullPath).isDirectory()) {
+      return hashDirectory(fullPath);
+    }
+    return crypto.createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex");
+  });
+  return crypto.createHash("sha256").update(hashes.join("|")).digest("hex");
+}
 
 async function run() {
   console.log("Running SQL Restore Regression Tests...");
 
+  const dataDir = path.join(process.cwd(), "data");
+  const envPath = path.join(process.cwd(), ".env");
+  const initialDataHash = hashDirectory(dataDir);
+  const initialEnvHash = fs.existsSync(envPath) ? crypto.createHash("sha256").update(fs.readFileSync(envPath)).digest("hex") : "NONE";
+
   // Setup temporary dir
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aegis-sql-restore-"));
-  const dbFile = path.join(tmpDir, "aegis.sqlite");
+  const testEncryptionKey = crypto.randomBytes(32);
   
-  process.env.DB_STORAGE_PATH = dbFile;
-  process.env.DB_ENCRYPTION_KEY = "testkey_testkey_testkey_testkey_testkey_testkey";
-  
-  let db = new AegisDB();
+  let db = new AegisDB({
+    dbDir: tmpDir,
+    autoBootstrapEnv: false,
+    seedUsers: [],
+    encryptionKey: testEncryptionKey
+  });
   await db.ready;
   if (!(db as any).sqliteDbConn) {
     console.log("Native sqlite3 package is not active; skipping SQL tests.");
@@ -73,7 +94,12 @@ async function run() {
   });
 
   // Re-init AegisDB
-  db = new AegisDB();
+  db = new AegisDB({
+    dbDir: tmpDir,
+    autoBootstrapEnv: false,
+    seedUsers: [],
+    encryptionKey: testEncryptionKey
+  });
   await db.ready;
   
   const dbData2 = db.get();
@@ -108,7 +134,12 @@ async function run() {
     );
   });
 
-  db = new AegisDB();
+  db = new AegisDB({
+    dbDir: tmpDir,
+    autoBootstrapEnv: false,
+    seedUsers: [],
+    encryptionKey: testEncryptionKey
+  });
   await db.ready;
   
   const dbData3 = db.get();
@@ -118,6 +149,49 @@ async function run() {
     console.log("[PASS] Test SQL-RESTORE-1 Passed: Structured orders correctly override KV on load");
   } else {
     console.error("[FAIL] Test SQL-RESTORE-1 Failed: KV data was favored over structured", restoredOrder2);
+  }
+
+  // Test SQL-RESTORE-3: Corrupted schema should fail-fast in production
+  await new Promise<void>((resolve, reject) => {
+    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+
+  process.env.NODE_ENV = "production";
+  try {
+    const dbFail = new AegisDB({
+      dbDir: tmpDir,
+      autoBootstrapEnv: false,
+      seedUsers: [],
+      encryptionKey: testEncryptionKey
+    });
+    await dbFail.ready;
+    console.error("[FAIL] Test SQL-RESTORE-3 Failed: DB init succeeded despite missing orders table in production");
+  } catch (err: any) {
+    if (err.message && err.message.includes("no such table: orders")) {
+      console.log("[PASS] Test SQL-RESTORE-3 Passed: Missing structured table failed-fast in production");
+    } else {
+      console.error("[FAIL] Test SQL-RESTORE-3 Failed: Incorrect error thrown", err);
+    }
+  }
+  process.env.NODE_ENV = "development";
+
+  // Test SQL-ISOLATION-1
+  const finalDataHash = hashDirectory(dataDir);
+  const finalEnvHash = fs.existsSync(envPath) ? crypto.createHash("sha256").update(fs.readFileSync(envPath)).digest("hex") : "NONE";
+
+  if (finalDataHash === initialDataHash) {
+    console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root data/ directory unchanged");
+  } else {
+    console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root data/ directory was modified!");
+  }
+
+  if (finalEnvHash === initialEnvHash) {
+    console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root .env unchanged");
+  } else {
+    console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root .env was modified!");
   }
 
   console.log("SQL Restore Regression Tests Completed.");

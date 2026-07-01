@@ -173,6 +173,7 @@ export interface Order {
   exchangeSymbol?: string;
   cancelRequestedAt?: string;
   cancelRetryCount?: number;
+  pollErrorCount?: number;
   lastBrokerStatus?: string;
   manualReviewRequired?: boolean;
   symbol: string;

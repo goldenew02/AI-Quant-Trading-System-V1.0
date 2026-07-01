@@ -25,8 +25,13 @@ export function normalizeBrokerHttpError(err: unknown): BrokerError {
     if (status === 429) {
       return { type: "RATE_LIMITED", message: err.message, originalError: err };
     }
+    if (status === 408 || status === 425) {
+      return { type: "TIMEOUT", message: err.message, originalError: err };
+    }
+    // We cannot blindly assume 4xx is a business rejection (e.g. 409, 400).
+    // Adapters must inspect response bodies if they want to explicitly map to REJECTED.
     if (status && status >= 400 && status < 500) {
-      return { type: "REJECTED", message: err.message, originalError: err };
+      return { type: "UNKNOWN", message: err.message, originalError: err };
     }
     return { type: "UNKNOWN", message: err.message, originalError: err };
   }

@@ -911,7 +911,7 @@ setInterval(async () => {
     const orders = db.orders || [];
     const workingOrders = orders.filter(o => 
       ACTIVE_ORDER_STATUSES.includes(o.status as any) &&
-      !(o.status === "PENDING_UNKNOWN" && o.manualReviewRequired && o.lastBrokerStatus === "CLIENT_ORDER_LOOKUP_UNSUPPORTED")
+      !(o.status === "PENDING_UNKNOWN" && o.manualReviewRequired)
     );
     if (workingOrders.length === 0) return;
 
@@ -992,24 +992,28 @@ setInterval(async () => {
         }
       } catch (err: any) {
         console.error(`[ORDER POLLING ERROR] getOrder for ${ord.clientOrderId}: ${err.message}`);
-        const pollErrors = (ord as any).pollErrorCount || 0;
+        const pollErrors = ord.pollErrorCount || 0;
         if (pollErrors >= 3) {
           await dbInstance.updateOrderState(ord.clientOrderId, {
             status: "PENDING_UNKNOWN",
             manualReviewRequired: true,
             lastBrokerStatus: "ATTACHED_BROKER_ORDER_LOOKUP_FAILED",
-            lastError: err.message
+            lastError: err.message,
+            pollErrorCount: 0 // reset for next time it is manually resolved
           });
         } else {
-          // Increment pollErrorCount (we update it in-place and save)
-          (ord as any).pollErrorCount = pollErrors + 1;
+          await dbInstance.updateOrderState(ord.clientOrderId, {
+            pollErrorCount: pollErrors + 1
+          });
         }
         continue;
       }
 
       // Reset poll error count on success
-      if ((ord as any).pollErrorCount) {
-        delete (ord as any).pollErrorCount;
+      if (ord.pollErrorCount && ord.pollErrorCount > 0) {
+        await dbInstance.updateOrderState(ord.clientOrderId, {
+          pollErrorCount: 0
+        });
       }
 
       console.log(`[ORDER POLLING RESULT] Order ${ord.clientOrderId} status on broker is: ${updatedOrder.status}`);
@@ -1039,6 +1043,16 @@ setInterval(async () => {
              }
           }
         }
+        continue;
+      }
+
+      if (updatedOrder.status === "UNKNOWN") {
+        await dbInstance.updateOrderState(ord.clientOrderId, {
+          status: "PENDING_UNKNOWN",
+          manualReviewRequired: true,
+          lastBrokerStatus: "BROKER_ORDER_STATUS_UNKNOWN",
+          lastError: updatedOrder.error || "Broker order status query returned UNKNOWN"
+        });
         continue;
       }
 
