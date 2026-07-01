@@ -835,51 +835,51 @@ export class AegisDB {
                 return reject(selectErr);
               }
               
-              let parsedState: any;
+              try {
+                let parsedState: any;
 
-              if (row && row.value) {
-                try {
-                  parsedState = JSON.parse(row.value);
-                } catch (jsonErr) {
-                  console.error("Failed to parse SQLite state JSON:", jsonErr);
-                  if (hasDbState && process.env.NODE_ENV === "production") {
-                    if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
-                      console.warn("KV reseed override used due to JSON parse error.");
+                if (row && row.value) {
+                  try {
+                    parsedState = JSON.parse(row.value);
+                  } catch (jsonErr) {
+                    console.error("Failed to parse SQLite state JSON:", jsonErr);
+                    if (hasDbState && process.env.NODE_ENV === "production") {
+                      if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
+                        console.warn("KV reseed override used due to JSON parse error.");
+                        await this.seedAndSave(sqliteDb);
+                        parsedState = this.data;
+                        await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.", "127.0.0.1", { strictPersist: true });
+                      } else {
+                        return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
+                      }
+                    } else {
                       await this.seedAndSave(sqliteDb);
                       parsedState = this.data;
-                      await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
+                    }
+                  }
+                } else {
+                  if (hasDbState && process.env.NODE_ENV === "production") {
+                    if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
+                      console.warn("KV reseed override used due to missing database_state.");
+                      await this.seedAndSave(sqliteDb);
+                      parsedState = this.data;
+                      await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.", "127.0.0.1", { strictPersist: true });
                     } else {
-                      return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
+                      return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
                     }
                   } else {
                     await this.seedAndSave(sqliteDb);
                     parsedState = this.data;
                   }
                 }
-              } else {
-                if (hasDbState && process.env.NODE_ENV === "production") {
-                  if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
-                    console.warn("KV reseed override used due to missing database_state.");
-                    await this.seedAndSave(sqliteDb);
-                    parsedState = this.data;
-                    await this.appendSecurityLogAsync("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
-                  } else {
-                    return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
-                  }
-                } else {
-                  await this.seedAndSave(sqliteDb);
-                  parsedState = this.data;
-                }
-              }
 
-              this.updateDataInPlace(parsedState);
+                this.updateDataInPlace(parsedState);
 
-              try {
                 await loadStructuredTradingTables();
                 resolve();
-              } catch (structuredErr) {
-                console.error("Failed to load structured tables:", structuredErr);
-                reject(structuredErr);
+              } catch (err) {
+                console.error("Failed to initialize state from SQLite:", err);
+                reject(err);
               }
             });
           });
@@ -1086,7 +1086,7 @@ export class AegisDB {
     }
   }
 
-  public saveAsync(): Promise<void> {
+  public saveAsync(strictPersist: boolean = false): Promise<void> {
     const dataToSave = { ...this.data };
     if (isSqliteSupported) {
       delete (dataToSave as any).preauthSessions;
@@ -1117,6 +1117,9 @@ export class AegisDB {
         function (err: any) {
           if (err) {
             console.error("[Aegis DB] KV_SNAPSHOT_WRITE_FAILED:", err);
+            if (strictPersist) {
+              return reject(err);
+            }
             // We resolve because structured tables were successfully written
             resolve();
           } else {
@@ -1180,7 +1183,7 @@ export class AegisDB {
     }
   }
 
-  public async appendSecurityLogAsync(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
+  public async appendSecurityLogAsync(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1", opts: { strictPersist?: boolean } = {}) {
     const prev = this.data.securityAuditLogs.length > 0 ? this.data.securityAuditLogs[0].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
     const entry: SecurityAuditEntry = {
       id: "sec_" + Math.random().toString(36).substring(2, 11),
@@ -1196,7 +1199,7 @@ export class AegisDB {
     };
     entry.currentHash = computeSecurityHash(entry, prev);
     this.data.securityAuditLogs.unshift(entry);
-    await this.saveAsync();
+    await this.saveAsync(opts.strictPersist);
   }
 
   public appendSecurityLog(username: string, role: 'admin' | 'operator' | 'viewer', action: string, target: string, details: string, ip: string = "127.0.0.1") {
