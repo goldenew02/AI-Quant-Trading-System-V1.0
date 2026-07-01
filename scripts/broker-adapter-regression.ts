@@ -15,13 +15,10 @@ async function run() {
     const orderMock: Order = {
       id: "o1", botId: "b1", broker: "Binance" as BrokerType, brokerAccountId: "ba1",
       clientOrderId: "o1", symbol: "BTCUSDT", side: "BUY", type: "MKT", marketType: "spot",
-      quantity: 1, price: 0, status: "PENDING", createdAt: Date.now().toString(), updatedAt: Date.now().toString()
+      quantity: 1, price: 0, status: "PENDING", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
     };
 
-  const ba: any = {
-    id: "ba1", name: "b", broker: "Binance", apiKey: "a", apiSecret: "s",
-    isTestnet: true, capabilities: [], status: "ACTIVE", createdAt: 0, updatedAt: 0
-  };
+    const mockRes = (data: any, status: number = 200) => async () => ({ status, data }) as any;
 
   const binance = new BinanceAdapter();
   
@@ -131,26 +128,26 @@ async function run() {
   }
 
   // Test OKX 200 + code: 51008 -> REJECTED
-  brokerHttp.post = async () => { return { status: 200, data: { code: "51008", msg: "Order placing failed" } } as any; };
+  brokerHttp.post = mockRes({ code: "51008", msg: "Order placing failed" });
   res = await okx.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
   if (res.status === "REJECTED") passed++; else failed++; console.log(res.status === "REJECTED" ? "[PASS]" : "[FAIL]", "OKX 200 + 51008 -> REJECTED");
 
   // Test OKX 200 + code: 50000 -> UNKNOWN
-  brokerHttp.post = async () => { return { status: 200, data: { code: "50000", msg: "System error" } } as any; };
+  brokerHttp.post = mockRes({ code: "50000", msg: "System error" });
   res = await okx.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
   if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "OKX 200 + 50000 -> UNKNOWN");
 
   // Test Tiger 200 + NO order_id + System error msg -> UNKNOWN
   const { TigerAdapter } = await import("../server/brokers/tiger");
   const tiger = new TigerAdapter();
-  brokerHttp.post = async () => { return { status: 200, data: { message: "System busy" } } as any; };
+  brokerHttp.post = mockRes({ message: "System busy" });
   res = await tiger.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
   if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "Tiger 200 + NO order_id + System error msg -> UNKNOWN");
 
   // Test Longbridge 200 + NO order_id + Gateway msg -> UNKNOWN
   const { LongbridgeAdapter } = await import("../server/brokers/longbridge");
   const longbridge = new LongbridgeAdapter();
-  brokerHttp.post = async () => { return { status: 200, data: { message: "Gateway timeout" } } as any; };
+  brokerHttp.post = mockRes({ message: "Gateway timeout" });
   res = await longbridge.placeOrder(orderMock, "apiKey", "apiSecret", "", true);
   if (res.status === "UNKNOWN") passed++; else failed++; console.log(res.status === "UNKNOWN" ? "[PASS]" : "[FAIL]", "Longbridge 200 + NO order_id + Gateway msg -> UNKNOWN");
 

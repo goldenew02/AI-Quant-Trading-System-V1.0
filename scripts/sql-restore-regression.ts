@@ -58,6 +58,12 @@ async function run() {
     process.exit(1);
   }
 
+  function getTestSqliteConn(database: AegisDB): any {
+    const conn = (database as unknown as { sqliteDbConn?: any }).sqliteDbConn;
+    if (!conn) throw new Error("sqliteDbConn unavailable");
+    return conn;
+  }
+
   // Test SQL-RESTORE-2: Seed and then write orders/fills. Then drop KV and see if they come back.
   
   const testOrder = {
@@ -104,7 +110,7 @@ async function run() {
 
   // Corrupt KV store (drop database_state)
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run("DELETE FROM aegis_kv WHERE key = 'database_state'", (err: any) => {
+    getTestSqliteConn(db).run("DELETE FROM aegis_kv WHERE key = 'database_state'", (err: any) => {
       if (err) reject(err);
       else resolve();
     });
@@ -144,7 +150,7 @@ async function run() {
   kvOrder.manualReviewRequired = true; // Structured should be false
   
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run(
+    getTestSqliteConn(db).run(
       "UPDATE aegis_kv SET value = ? WHERE key = 'database_state'",
       [JSON.stringify(kvData)],
       (err: any) => err ? reject(err) : resolve()
@@ -170,11 +176,11 @@ async function run() {
 
   // Test SCHEMA-UPGRADE-1: Upgradeable old schema should pass
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+    getTestSqliteConn(db).run("DROP TABLE orders", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, symbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt TEXT, updatedAt TEXT)", (err2: any) => {
+      getTestSqliteConn(db).run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, symbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt TEXT, updatedAt TEXT)", (err2: any) => {
         if (err2) return reject(err2);
-        (db as any).sqliteDbConn.run("DELETE FROM schema_migrations", (err3: any) => {
+        getTestSqliteConn(db).run("DELETE FROM schema_migrations", (err3: any) => {
             if (err3) reject(err3);
             else resolve();
         });
@@ -199,9 +205,9 @@ async function run() {
   // Test SCHEMA-UPGRADE-2: Corrupted orders schema should fail-fast
   // Create table but without `clientOrderId` (a core column that no migration adds)
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+    getTestSqliteConn(db).run("DROP TABLE orders", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)", (err2: any) => {
+      getTestSqliteConn(db).run("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)", (err2: any) => {
         if (err2) reject(err2);
         else resolve();
       });
@@ -227,9 +233,9 @@ async function run() {
   
   // Restore orders table to valid state to test fills
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+    getTestSqliteConn(db).run("DROP TABLE orders", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, brokerOrderId TEXT, symbol TEXT, marketType TEXT, marginMode TEXT, positionSide TEXT, exchangeSymbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt INTEGER, updatedAt INTEGER, lastError TEXT, pollErrorCount INTEGER, cancelRetryCount INTEGER, cancelRequestedAt INTEGER, manualReviewRequired INTEGER, lastBrokerStatus TEXT)", (err2: any) => {
+      getTestSqliteConn(db).run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, brokerOrderId TEXT, symbol TEXT, marketType TEXT, marginMode TEXT, positionSide TEXT, exchangeSymbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt INTEGER, updatedAt INTEGER, lastError TEXT, pollErrorCount INTEGER, cancelRetryCount INTEGER, cancelRequestedAt INTEGER, manualReviewRequired INTEGER, lastBrokerStatus TEXT)", (err2: any) => {
         if (err2) reject(err2);
         else resolve();
       });
@@ -238,9 +244,9 @@ async function run() {
 
   // Test SCHEMA-VALIDATION-2: Corrupted fills schema should fail-fast in production
   await new Promise<void>((resolve, reject) => {
-    (db as any).sqliteDbConn.run("DROP TABLE fills", (err: any) => {
+    getTestSqliteConn(db).run("DROP TABLE fills", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE fills (id TEXT PRIMARY KEY, orderId TEXT)", (err2: any) => {
+      getTestSqliteConn(db).run("CREATE TABLE fills (id TEXT PRIMARY KEY, orderId TEXT)", (err2: any) => {
         if (err2) reject(err2);
         else resolve();
       });

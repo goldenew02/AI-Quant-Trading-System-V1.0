@@ -845,25 +845,31 @@ export class AegisDB {
                   if (hasDbState && process.env.NODE_ENV === "production") {
                     if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
                       console.warn("KV reseed override used due to JSON parse error.");
+                      await this.seedAndSave(sqliteDb);
+                      parsedState = this.data;
                       this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
                     } else {
                       return reject(new Error("KV_STATE_INVALID: database_state corrupted; restore from backup required"));
                     }
+                  } else {
+                    await this.seedAndSave(sqliteDb);
+                    parsedState = this.data;
                   }
-                  await this.seedAndSave(sqliteDb);
-                  parsedState = this.data;
                 }
               } else {
                 if (hasDbState && process.env.NODE_ENV === "production") {
                   if (process.env.ALLOW_KV_RESEED_ON_CORRUPTION === "true" && process.env.CONFIRM_KV_RESEED_RESETS_AUTH_STATE === "YES_I_UNDERSTAND") {
                     console.warn("KV reseed override used due to missing database_state.");
+                    await this.seedAndSave(sqliteDb);
+                    parsedState = this.data;
                     this.appendSecurityLog("system", "admin", "KV_RESEED_OVERRIDE_USED", "database_state", "KV reseed override used during production boot.");
                   } else {
                     return reject(new Error("KV_STATE_INVALID: database_state missing; restore from backup required"));
                   }
+                } else {
+                  await this.seedAndSave(sqliteDb);
+                  parsedState = this.data;
                 }
-                await this.seedAndSave(sqliteDb);
-                parsedState = this.data;
               }
 
               this.updateDataInPlace(parsedState);
