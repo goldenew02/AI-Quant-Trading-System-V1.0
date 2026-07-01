@@ -154,11 +154,11 @@ async function run() {
     failed++; console.error("[FAIL] Test SQL-RESTORE-1 Failed: KV data was favored over structured", restoredOrder2);
   }
 
-  // Test SQL-RESTORE-3: Corrupted schema should fail-fast in production
+  // Test SCHEMA-VALIDATION-1: Corrupted orders schema should fail-fast in production
   await new Promise<void>((resolve, reject) => {
     (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
       if (err) return reject(err);
-      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)", (err2: any) => {
+      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, clientOrderId TEXT, status TEXT)", (err2: any) => {
         if (err2) reject(err2);
         else resolve();
       });
@@ -174,14 +174,54 @@ async function run() {
       encryptionKey: testEncryptionKey
     });
     await dbFail.ready;
-    failed++; console.error("[FAIL] Test SQL-RESTORE-3 Failed: DB init succeeded despite missing columns in orders table");
+    failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-1 Failed: DB init succeeded despite missing marketType column in orders table");
   } catch (err: any) {
-    if (err.message && err.message.includes("STRUCTURED_SCHEMA_INVALID")) {
-      passed++; console.log("[PASS] Test SQL-RESTORE-3 Passed: Missing structured table columns failed-fast in production");
+    if (err.message && err.message.includes("STRUCTURED_SCHEMA_INVALID") && err.message.includes("orders")) {
+      passed++; console.log("[PASS] Test SCHEMA-VALIDATION-1 Passed: Missing structured table columns failed-fast in production");
     } else {
-      failed++; console.error("[FAIL] Test SQL-RESTORE-3 Failed: Incorrect error thrown", err);
+      failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-1 Failed: Incorrect error thrown", err);
     }
   }
+  
+  // Restore orders table to valid state to test fills
+  await new Promise<void>((resolve, reject) => {
+    (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
+      if (err) return reject(err);
+      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, botId TEXT, broker TEXT, brokerAccountId TEXT, clientOrderId TEXT, brokerOrderId TEXT, symbol TEXT, marketType TEXT, marginMode TEXT, positionSide TEXT, exchangeSymbol TEXT, side TEXT, type TEXT, price REAL, quantity REAL, status TEXT, createdAt INTEGER, updatedAt INTEGER, lastError TEXT, pollErrorCount INTEGER, cancelRetryCount INTEGER, cancelRequestedAt INTEGER, manualReviewRequired INTEGER, lastBrokerStatus TEXT)", (err2: any) => {
+        if (err2) reject(err2);
+        else resolve();
+      });
+    });
+  });
+
+  // Test SCHEMA-VALIDATION-2: Corrupted fills schema should fail-fast in production
+  await new Promise<void>((resolve, reject) => {
+    (db as any).sqliteDbConn.run("DROP TABLE fills", (err: any) => {
+      if (err) return reject(err);
+      (db as any).sqliteDbConn.run("CREATE TABLE fills (id TEXT PRIMARY KEY, orderId TEXT)", (err2: any) => {
+        if (err2) reject(err2);
+        else resolve();
+      });
+    });
+  });
+
+  try {
+    const dbFail2 = new AegisDB({
+      dbDir: tmpDir,
+      autoBootstrapEnv: false,
+      seedUsers: [],
+      encryptionKey: testEncryptionKey
+    });
+    await dbFail2.ready;
+    failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-2 Failed: DB init succeeded despite missing brokerFillId column in fills table");
+  } catch (err: any) {
+    if (err.message && err.message.includes("STRUCTURED_SCHEMA_INVALID") && err.message.includes("fills")) {
+      passed++; console.log("[PASS] Test SCHEMA-VALIDATION-2 Passed: Missing structured table columns in fills failed-fast in production");
+    } else {
+      failed++; console.error("[FAIL] Test SCHEMA-VALIDATION-2 Failed: Incorrect error thrown", err);
+    }
+  }
+
   process.env.NODE_ENV = "development";
 
   // Test SQL-ISOLATION-1
@@ -201,7 +241,11 @@ async function run() {
   }
 
   console.log(`SQL Restore Tests Completed: ${passed} passed, ${failed} failed.`);
-  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  if (failed === 0) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  } else {
+    console.log(`[INFO] Temp dir kept for debugging: ${tmpDir}`);
+  }
   process.exit(failed > 0 ? 1 : 0);
 }
 

@@ -128,8 +128,11 @@ export class TigerAdapter implements BrokerAdapter {
       if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
         const d = (err as any).response.data as any;
         if (d.code && d.code !== 0 && d.code !== "0") {
-          isRejected = true;
-          brokerErr.message = `[${d.code}] ${d.message || d.msg}`;
+          const msg = (d.message || d.msg || "").toLowerCase();
+          if (msg.includes("reject") || msg.includes("invalid") || msg.includes("balance") || msg.includes("margin") || msg.includes("insufficient") || msg.includes("exceed") || msg.includes("limit") || msg.includes("parameter")) {
+            isRejected = true;
+            brokerErr.message = `[${d.code}] ${d.message || d.msg}`;
+          }
         }
       }
 

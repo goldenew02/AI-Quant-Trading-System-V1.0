@@ -592,18 +592,45 @@ export class AegisDB {
           try {
             const tables = await query("SELECT name FROM sqlite_master WHERE type='table'");
             const tableNames = tables.map((t: any) => t.name);
-            const hasDbState = tableNames.includes('aegis_kv') || tableNames.includes('schema_migrations');
+            let hasDbState = false;
+            try {
+              const sqlitePath = path.join(this.dbDir, "aegis_secure.db");
+              if (fs.existsSync(sqlitePath) && fs.statSync(sqlitePath).size > 0) {
+                hasDbState = true;
+              } else {
+                hasDbState = tableNames.includes('aegis_kv') || tableNames.includes('schema_migrations');
+              }
+            } catch (e) {
+              hasDbState = tableNames.includes('aegis_kv') || tableNames.includes('schema_migrations');
+            }
             
             if (hasDbState && process.env.NODE_ENV === "production") {
               if (!tableNames.includes("orders") || !tableNames.includes("fills")) {
                 throw new Error("STRUCTURED_SCHEMA_INVALID: orders or fills table missing in an existing database");
               }
               const orderColumns = await query("PRAGMA table_info(orders)");
-              const requiredColumns = ["id", "clientOrderId", "status"];
+              const requiredOrderColumns = [
+                "id", "botId", "broker", "brokerAccountId", "clientOrderId",
+                "symbol", "marketType", "side", "type", "price", "quantity",
+                "status", "createdAt", "updatedAt",
+                "pollErrorCount", "manualReviewRequired", "lastBrokerStatus"
+              ];
               const colNames = orderColumns.map((c: any) => c.name);
-              for (const rc of requiredColumns) {
+              for (const rc of requiredOrderColumns) {
                 if (!colNames.includes(rc)) {
                   throw new Error(`STRUCTURED_SCHEMA_INVALID: orders table missing required column ${rc}`);
+                }
+              }
+
+              const fillColumns = await query("PRAGMA table_info(fills)");
+              const requiredFillColumns = [
+                "id", "orderId", "brokerFillId", "price", "quantity",
+                "fee", "feeCurrency", "timestamp"
+              ];
+              const fillColNames = fillColumns.map((c: any) => c.name);
+              for (const rc of requiredFillColumns) {
+                if (!fillColNames.includes(rc)) {
+                  throw new Error(`STRUCTURED_SCHEMA_INVALID: fills table missing required column ${rc}`);
                 }
               }
             }

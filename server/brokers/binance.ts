@@ -153,8 +153,15 @@ export class BinanceAdapter implements BrokerAdapter {
       
       if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
         const d = (err as any).response.data as any;
-        // Binance explicit business rejections often use specific codes like -2010 (New order rejected.)
-        if (d.code && (d.code === -2010 || d.code < -1000)) {
+        // Binance explicit business rejections whitelist
+        // -2010: New order rejected, -2011: Cancel rejected
+        // -1013: Filter failure, -2019: Margin insufficient
+        // -2013: No such order (when trying to cancel)
+        // -2014: API-key format invalid (auth error, also reject)
+        // -2015: Invalid API-key, IP, or permissions (auth error)
+        // -2022: ReduceOnly Order is rejected.
+        const rejectionCodes = [-2010, -2011, -1013, -2019, -2013, -2014, -2015, -2022];
+        if (d.code && rejectionCodes.includes(d.code)) {
           isRejected = true;
           brokerErr.message = `[${d.code}] ${d.msg}`;
         }

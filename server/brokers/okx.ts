@@ -147,9 +147,17 @@ export class OKXAdapter implements BrokerAdapter {
       
       if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
         const d = (err as any).response.data as any;
-        if (d.code && d.code !== "0") {
+        const codeStr = String(d.code);
+        // OKX business rejection codes (common ones)
+        // 51000: Parameter error, 51006: API signature error
+        // 51008: Order placing failed, 51014: Order not found
+        // 51015: Order already canceled, 51119: Order cannot be canceled
+        // 51121: Insufficient balance
+        // 58001: Incorrect trade password
+        const okxRejectionCodes = ["51000", "51006", "51008", "51014", "51015", "51119", "51121", "58001"];
+        if (codeStr && codeStr !== "0" && okxRejectionCodes.includes(codeStr)) {
           isRejected = true;
-          brokerErr.message = `[${d.code}] ${d.msg}`;
+          brokerErr.message = `[${codeStr}] ${d.msg}`;
         }
       }
 

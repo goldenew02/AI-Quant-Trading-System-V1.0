@@ -160,9 +160,12 @@ export class InteractiveBrokersAdapter implements BrokerAdapter {
       
       if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
         const d = (err as any).response.data as any;
-        if (d.error && typeof d.error === "string" && !d.error.includes("timeout")) {
-          isRejected = true;
-          brokerErr.message = d.error;
+        if (d.error && typeof d.error === "string") {
+          const errLower = d.error.toLowerCase();
+          if (errLower.includes("reject") || errLower.includes("invalid") || errLower.includes("margin") || errLower.includes("balance") || errLower.includes("unsupported")) {
+            isRejected = true;
+            brokerErr.message = d.error;
+          }
         }
       }
 
