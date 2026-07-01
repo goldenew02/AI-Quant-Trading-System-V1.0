@@ -20,6 +20,9 @@ function hashDirectory(dirPath: string): string {
 async function run() {
   console.log("Running SQL Restore Regression Tests...");
 
+  let passed = 0;
+  let failed = 0;
+
   const dataDir = path.join(process.cwd(), "data");
   const envPath = path.join(process.cwd(), ".env");
   const initialDataHash = hashDirectory(dataDir);
@@ -80,9 +83,9 @@ async function run() {
   // Verify inserted in memory
   const dbData1 = db.get();
   if (dbData1.orders.find((o: any) => o.id === testOrder.id)) {
-    console.log("[PASS] Test 0 Passed: Inserted test order to memory");
+    passed++; console.log("[PASS] Test 0 Passed: Inserted test order to memory");
   } else {
-    console.error("[FAIL] Test 0 Failed: Order not in memory");
+    failed++; console.error("[FAIL] Test 0 Failed: Order not in memory");
   }
 
   // Corrupt KV store (drop database_state)
@@ -107,15 +110,15 @@ async function run() {
   const restoredFill = dbData2.fills.find((f: any) => f.id === testFill.id);
 
   if (restoredOrder && restoredOrder.manualReviewRequired === true && restoredOrder.cancelRetryCount === 2) {
-    console.log("[PASS] Test SQL-RESTORE-2 Passed: KV missing, but structured orders restored successfully");
+    passed++; console.log("[PASS] Test SQL-RESTORE-2 Passed: KV missing, but structured orders restored successfully");
   } else {
-    console.error("[FAIL] Test SQL-RESTORE-2 Failed: Order not restored properly", restoredOrder);
+    failed++; console.error("[FAIL] Test SQL-RESTORE-2 Failed: Order not restored properly", restoredOrder);
   }
 
   if (restoredFill && restoredFill.price === 50000) {
-    console.log("[PASS] Test SQL-RESTORE-2 (Fills) Passed: KV missing, but structured fills restored successfully");
+    passed++; console.log("[PASS] Test SQL-RESTORE-2 (Fills) Passed: KV missing, but structured fills restored successfully");
   } else {
-    console.error("[FAIL] Test SQL-RESTORE-2 (Fills) Failed: Fill not restored properly", restoredFill);
+    failed++; console.error("[FAIL] Test SQL-RESTORE-2 (Fills) Failed: Fill not restored properly", restoredFill);
   }
   
   // Test SQL-RESTORE-1: Update order, let it save to KV, see if structured overrides KV on load
@@ -146,16 +149,19 @@ async function run() {
   const restoredOrder2 = dbData3.orders.find((o: any) => o.id === testOrder.id);
 
   if (restoredOrder2 && restoredOrder2.status === "WORKING" && restoredOrder2.manualReviewRequired === false) {
-    console.log("[PASS] Test SQL-RESTORE-1 Passed: Structured orders correctly override KV on load");
+    passed++; console.log("[PASS] Test SQL-RESTORE-1 Passed: Structured orders correctly override KV on load");
   } else {
-    console.error("[FAIL] Test SQL-RESTORE-1 Failed: KV data was favored over structured", restoredOrder2);
+    failed++; console.error("[FAIL] Test SQL-RESTORE-1 Failed: KV data was favored over structured", restoredOrder2);
   }
 
   // Test SQL-RESTORE-3: Corrupted schema should fail-fast in production
   await new Promise<void>((resolve, reject) => {
     (db as any).sqliteDbConn.run("DROP TABLE orders", (err: any) => {
-      if (err) reject(err);
-      else resolve();
+      if (err) return reject(err);
+      (db as any).sqliteDbConn.run("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)", (err2: any) => {
+        if (err2) reject(err2);
+        else resolve();
+      });
     });
   });
 
@@ -168,12 +174,12 @@ async function run() {
       encryptionKey: testEncryptionKey
     });
     await dbFail.ready;
-    console.error("[FAIL] Test SQL-RESTORE-3 Failed: DB init succeeded despite missing orders table in production");
+    failed++; console.error("[FAIL] Test SQL-RESTORE-3 Failed: DB init succeeded despite missing columns in orders table");
   } catch (err: any) {
-    if (err.message && err.message.includes("no such table: orders")) {
-      console.log("[PASS] Test SQL-RESTORE-3 Passed: Missing structured table failed-fast in production");
+    if (err.message && err.message.includes("STRUCTURED_SCHEMA_INVALID")) {
+      passed++; console.log("[PASS] Test SQL-RESTORE-3 Passed: Missing structured table columns failed-fast in production");
     } else {
-      console.error("[FAIL] Test SQL-RESTORE-3 Failed: Incorrect error thrown", err);
+      failed++; console.error("[FAIL] Test SQL-RESTORE-3 Failed: Incorrect error thrown", err);
     }
   }
   process.env.NODE_ENV = "development";
@@ -183,19 +189,20 @@ async function run() {
   const finalEnvHash = fs.existsSync(envPath) ? crypto.createHash("sha256").update(fs.readFileSync(envPath)).digest("hex") : "NONE";
 
   if (finalDataHash === initialDataHash) {
-    console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root data/ directory unchanged");
+    passed++; console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root data/ directory unchanged");
   } else {
-    console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root data/ directory was modified!");
+    failed++; console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root data/ directory was modified!");
   }
 
   if (finalEnvHash === initialEnvHash) {
-    console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root .env unchanged");
+    passed++; console.log("[PASS] Test SQL-ISOLATION-1 Passed: Root .env unchanged");
   } else {
-    console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root .env was modified!");
+    failed++; console.error("[FAIL] Test SQL-ISOLATION-1 Failed: Root .env was modified!");
   }
 
-  console.log("SQL Restore Regression Tests Completed.");
-  process.exit(0);
+  console.log(`SQL Restore Tests Completed: ${passed} passed, ${failed} failed.`);
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  process.exit(failed > 0 ? 1 : 0);
 }
 
 run().catch((e) => {

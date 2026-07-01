@@ -115,8 +115,21 @@ export class LongbridgeAdapter implements BrokerAdapter {
         error: res.data?.message || "Order rejected by Longbridge"
       };
     } catch (err: unknown) {
+      let isRejected = false;
       const brokerErr = normalizeBrokerHttpError(err);
-      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
+      
+      if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
+        const d = (err as any).response.data as any;
+        if (d.code && d.code !== 0 && d.code !== "0") {
+          isRejected = true;
+          brokerErr.message = `[${d.code}] ${d.message || d.msg}`;
+        }
+      }
+
+      if (!isRejected) {
+        isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
+      }
+
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,

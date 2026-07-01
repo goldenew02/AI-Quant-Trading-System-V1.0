@@ -148,8 +148,22 @@ export class BinanceAdapter implements BrokerAdapter {
         filledQuantity: data.executedQty ? parseFloat(data.executedQty) : 0
       };
     } catch (err: unknown) {
+      let isRejected = false;
       const brokerErr = normalizeBrokerHttpError(err);
-      const isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
+      
+      if (err && typeof err === 'object' && 'isAxiosError' in err && (err as any).response?.data) {
+        const d = (err as any).response.data as any;
+        // Binance explicit business rejections often use specific codes like -2010 (New order rejected.)
+        if (d.code && (d.code === -2010 || d.code < -1000)) {
+          isRejected = true;
+          brokerErr.message = `[${d.code}] ${d.msg}`;
+        }
+      }
+
+      if (!isRejected) {
+        isRejected = brokerErr.type === "REJECTED" || brokerErr.type === "AUTH_FAILURE";
+      }
+      
       return {
         brokerOrderId: "",
         clientOrderId: order.clientOrderId,

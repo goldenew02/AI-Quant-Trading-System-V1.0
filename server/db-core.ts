@@ -585,8 +585,35 @@ export class AegisDB {
         
         this.sqliteDbConn = sqliteDb;
         
-        sqliteDb.serialize(() => {
-          // Main KV table for schema fallback
+        const exec = (sql: string, params: any[] = []): Promise<void> => new Promise((res, rej) => sqliteDb.run(sql, params, e => e ? rej(e) : res()));
+        const query = (sql: string, params: any[] = []): Promise<any[]> => new Promise((res, rej) => sqliteDb.all(sql, params, (e, rows) => e ? rej(e) : res(rows)));
+
+        (async () => {
+          try {
+            const tables = await query("SELECT name FROM sqlite_master WHERE type='table'");
+            const tableNames = tables.map((t: any) => t.name);
+            const hasDbState = tableNames.includes('aegis_kv') || tableNames.includes('schema_migrations');
+            
+            if (hasDbState && process.env.NODE_ENV === "production") {
+              if (!tableNames.includes("orders") || !tableNames.includes("fills")) {
+                throw new Error("STRUCTURED_SCHEMA_INVALID: orders or fills table missing in an existing database");
+              }
+              const orderColumns = await query("PRAGMA table_info(orders)");
+              const requiredColumns = ["id", "clientOrderId", "status"];
+              const colNames = orderColumns.map((c: any) => c.name);
+              for (const rc of requiredColumns) {
+                if (!colNames.includes(rc)) {
+                  throw new Error(`STRUCTURED_SCHEMA_INVALID: orders table missing required column ${rc}`);
+                }
+              }
+            }
+          } catch (e) {
+            console.error("Schema validation failed:", e);
+            return reject(e);
+          }
+
+          sqliteDb.serialize(() => {
+            // Main KV table for schema fallback
           sqliteDb.run("CREATE TABLE IF NOT EXISTS aegis_kv (key TEXT PRIMARY KEY, value TEXT)", (createKvErr) => {
             if (createKvErr) {
               console.error("Failed to create aegis_kv table:", createKvErr);
@@ -791,9 +818,10 @@ export class AegisDB {
             });
           });
         });
-      });
+      })();
     });
-  }
+  });
+}
 
   private getSeedBots(): BotConfig[] {
     return [
@@ -1226,11 +1254,11 @@ export class AegisDB {
     "ORDER_INTENT_CREATED": ["PENDING", "REJECTED", "CANCEL_REQUESTED"],
     "PENDING": ["WORKING", "NEW", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCEL_REQUESTED", "CANCELED", "PENDING_UNKNOWN"],
     "PENDING_UNKNOWN": ["WORKING", "NEW", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCEL_REQUESTED", "CANCELED"],
-    "NEW": ["WORKING", "PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "REJECTED"],
-    "WORKING": ["PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED"],
-    "PARTIALLY_FILLED": ["FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED"],
-    "CANCEL_REQUESTED": ["CANCELED", "FILLED", "PARTIALLY_FILLED", "CANCEL_FAILED"],
-    "CANCEL_FAILED": ["CANCEL_REQUESTED", "WORKING", "PARTIALLY_FILLED", "FILLED", "CANCELED"],
+    "NEW": ["WORKING", "PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "REJECTED", "PENDING_UNKNOWN"],
+    "WORKING": ["PARTIALLY_FILLED", "FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED", "PENDING_UNKNOWN"],
+    "PARTIALLY_FILLED": ["FILLED", "CANCEL_REQUESTED", "CANCELED", "REJECTED", "PENDING_UNKNOWN"],
+    "CANCEL_REQUESTED": ["CANCELED", "FILLED", "PARTIALLY_FILLED", "CANCEL_FAILED", "PENDING_UNKNOWN"],
+    "CANCEL_FAILED": ["CANCEL_REQUESTED", "WORKING", "PARTIALLY_FILLED", "FILLED", "CANCELED", "PENDING_UNKNOWN"],
     "FILLED": [],
     "CANCELED": [],
     "REJECTED": []
