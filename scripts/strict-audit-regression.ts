@@ -28,58 +28,65 @@ async function runStrictAuditTests() {
     // We need to grab the sqlite db connection
     const sqliteConn = (db as any).sqliteDbConn;
     if (!sqliteConn) {
-      console.log("[SKIP] Native sqlite3 unavailable; Strict Audit tests cannot run.");
-      return;
+      if (process.env.ALLOW_SQL_RESTORE_TEST_SKIP === "true" && process.env.NODE_ENV !== "production") {
+        console.log("[SKIP] Native sqlite3 unavailable; Strict Audit tests skipped by explicit opt-in.");
+        process.exit(0);
+      }
+      console.error("[FAIL] Native sqlite3 unavailable; strict audit regression cannot run.");
+      process.exit(1);
     }
 
     const originalRun = sqliteConn.run.bind(sqliteConn);
 
-    // Mock run
-    sqliteConn.run = function(sql: string, params: any[], callback?: (err: Error | null) => void) {
-      if (typeof params === 'function') {
-        callback = params;
-        params = [];
-      }
-      if (sql.includes("INSERT INTO aegis_kv")) {
-        const mockError = new Error("Mocked KV Write Error");
-        if (callback) {
-          callback(mockError);
+    try {
+      // Mock run
+      sqliteConn.run = function(sql: string, params: any[], callback?: (err: Error | null) => void) {
+        if (typeof params === 'function') {
+          callback = params;
+          params = [];
         }
-        return this;
-      }
-      return originalRun(sql, params, callback);
-    };
+        if (sql.includes("INSERT INTO aegis_kv")) {
+          const mockError = new Error("Mocked KV Write Error");
+          if (callback) {
+            callback(mockError);
+          }
+          return this;
+        }
+        return originalRun(sql, params, callback);
+      };
 
-    // Test STRICT-AUDIT-1: strictPersist: true should reject
-    try {
-      await db.appendSecurityLogAsync("system", "admin", "TEST_ACTION", "test_target", "Test details", "127.0.0.1", { strictPersist: true });
-      failed++;
-      console.error("[FAIL] Test STRICT-AUDIT-1 Failed: strictPersist=true resolved instead of rejecting");
-    } catch (err: any) {
-      if (err.message === "Mocked KV Write Error") {
-        passed++;
-        console.log("[PASS] Test STRICT-AUDIT-1 Passed: strictPersist=true properly rejected on DB error");
-      } else {
+      // Test STRICT-AUDIT-1: strictPersist: true should reject
+      try {
+        await db.appendSecurityLogAsync("system", "admin", "TEST_ACTION", "test_target", "Test details", "127.0.0.1", { strictPersist: true });
         failed++;
-        console.error("[FAIL] Test STRICT-AUDIT-1 Failed: strictPersist=true rejected with wrong error:", err);
+        console.error("[FAIL] Test STRICT-AUDIT-1 Failed: strictPersist=true resolved instead of rejecting");
+      } catch (err: any) {
+        if (err.message === "Mocked KV Write Error") {
+          passed++;
+          console.log("[PASS] Test STRICT-AUDIT-1 Passed: strictPersist=true properly rejected on DB error");
+        } else {
+          failed++;
+          console.error("[FAIL] Test STRICT-AUDIT-1 Failed: strictPersist=true rejected with wrong error:", err);
+        }
       }
-    }
 
-    // Test STRICT-AUDIT-2: strictPersist: false should resolve
-    try {
-      await db.appendSecurityLogAsync("system", "admin", "TEST_ACTION_2", "test_target", "Test details 2", "127.0.0.1", { strictPersist: false });
-      passed++;
-      console.log("[PASS] Test STRICT-AUDIT-2 Passed: strictPersist=false properly resolved despite DB error");
-    } catch (err: any) {
-      failed++;
-      console.error("[FAIL] Test STRICT-AUDIT-2 Failed: strictPersist=false rejected instead of resolving:", err);
+      // Test STRICT-AUDIT-2: strictPersist: false should resolve
+      try {
+        await db.appendSecurityLogAsync("system", "admin", "TEST_ACTION_2", "test_target", "Test details 2", "127.0.0.1", { strictPersist: false });
+        passed++;
+        console.log("[PASS] Test STRICT-AUDIT-2 Passed: strictPersist=false properly resolved despite DB error");
+      } catch (err: any) {
+        failed++;
+        console.error("[FAIL] Test STRICT-AUDIT-2 Failed: strictPersist=false rejected instead of resolving:", err);
+      }
+    } finally {
+      // Restore original run
+      sqliteConn.run = originalRun;
     }
-
-    // Restore original run
-    sqliteConn.run = originalRun;
 
   } catch (err) {
-    console.error("Test setup failed", err);
+    failed++;
+    console.error("[FAIL] Test setup failed", err);
   }
 
   console.log(`Strict Audit Tests Completed: ${passed} passed, ${failed} failed.`);
@@ -91,4 +98,7 @@ async function runStrictAuditTests() {
   }
 }
 
-runStrictAuditTests().catch(console.error);
+runStrictAuditTests().catch((err) => {
+  console.error("[FAIL] Strict audit regression crashed", err);
+  process.exit(1);
+});
