@@ -12,11 +12,12 @@
     "auth-regression": "tsx scripts/auth-regression.ts",
     "auth-http-regression": "tsx scripts/auth-http-regression.ts",
     "auth-kv-regression": "tsx scripts/auth-kv-regression.ts",
+    "strict-audit-regression": "tsx scripts/strict-audit-regression.ts",
     "sql-restore-regression": "tsx scripts/sql-restore-regression.ts",
     "order-state-regression": "tsx scripts/order-state-regression.ts",
     "broker-adapter-regression": "tsx scripts/broker-adapter-regression.ts",
     "test:safety": "npm run order-state-regression && npm run broker-adapter-regression && npm run sql-restore-regression",
-    "test:auth": "npm run auth-regression && npm run auth-http-regression && npm run auth-kv-regression && npm run test:safety",
+    "test:auth": "npm run auth-regression && npm run auth-http-regression && npm run auth-kv-regression && npm run strict-audit-regression && npm run test:safety",
     "sync-admin-password": "tsx scripts/sync-admin-password.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
